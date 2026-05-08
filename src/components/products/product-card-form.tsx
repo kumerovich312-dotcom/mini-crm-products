@@ -1,6 +1,8 @@
 "use client";
 
-import { useState } from "react";
+import Link from "next/link";
+import { useEffect, useRef, useState } from "react";
+import type { LucideIcon } from "lucide-react";
 import {
   CheckCircle2,
   CircleDashed,
@@ -10,6 +12,7 @@ import {
   Play,
   Plus,
   Save,
+  Trash2,
   UploadCloud,
   X,
   XCircle,
@@ -24,50 +27,41 @@ import { cn } from "@/lib/utils";
 
 type ProductFormMode = "new" | "edit";
 type MediaStatus = "uploaded" | "processing" | "ready" | "failed";
+type MediaType = "photo" | "video";
 
-const mediaItems: Array<{
+type MediaItem = {
   id: string;
   name: string;
-  type: "photo" | "video";
+  type: MediaType;
   size: string;
   status: MediaStatus;
-  thumbClass: string;
-}> = [
-  {
-    id: "1",
-    name: "front-view.jpg",
-    type: "photo",
-    size: "1.8 MB",
-    status: "ready",
-    thumbClass: "bg-blue-100 text-blue-700",
-  },
-  {
-    id: "2",
-    name: "detail-shot.heic",
-    type: "photo",
-    size: "2.4 MB",
-    status: "processing",
-    thumbClass: "bg-indigo-100 text-indigo-700",
-  },
-  {
-    id: "3",
-    name: "product-video.mov",
-    type: "video",
-    size: "18.6 MB",
-    status: "uploaded",
-    thumbClass: "bg-slate-100 text-slate-700",
-  },
-  {
-    id: "4",
-    name: "old-photo.png",
-    type: "photo",
-    size: "920 KB",
-    status: "failed",
-    thumbClass: "bg-red-50 text-red-700",
-  },
-];
+  previewUrl?: string;
+};
 
-const statusView: Record<MediaStatus, { label: string; className: string; icon: typeof CheckCircle2 }> = {
+type ProductFormState = {
+  name: string;
+  sku: string;
+  category: string;
+  price: string;
+  stock: string;
+  status: string;
+  description: string;
+};
+
+type CustomFieldsState = {
+  assay: string;
+  weight: string;
+  size: string;
+  stone: string;
+};
+
+type VisibilityState = {
+  showInApi: boolean;
+  hidden: boolean;
+  draft: boolean;
+};
+
+const statusView: Record<MediaStatus, { label: string; className: string; icon: LucideIcon }> = {
   uploaded: {
     label: "uploaded",
     className: "bg-blue-50 text-blue-700",
@@ -90,15 +84,16 @@ const statusView: Record<MediaStatus, { label: string; className: string; icon: 
   },
 };
 
-const customFields = [
-  { label: "Проба", value: "585" },
-  { label: "Вес", value: "3.8 г" },
-  { label: "Размер", value: "17.5" },
-  { label: "Камень", value: "Фианит" },
-];
-
 const selectClass =
   "h-10 rounded-md border border-input bg-white px-3 text-sm text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring";
+
+function formatFileSize(size: number) {
+  if (size < 1024 * 1024) {
+    return `${Math.max(1, Math.round(size / 1024))} KB`;
+  }
+
+  return `${(size / 1024 / 1024).toFixed(1)} MB`;
+}
 
 function FieldLabel({ children, htmlFor }: { children: React.ReactNode; htmlFor?: string }) {
   return (
@@ -111,11 +106,13 @@ function FieldLabel({ children, htmlFor }: { children: React.ReactNode; htmlFor?
 function ToggleRow({
   title,
   description,
-  defaultChecked,
+  checked,
+  onChange,
 }: {
   title: string;
   description: string;
-  defaultChecked?: boolean;
+  checked: boolean;
+  onChange: (checked: boolean) => void;
 }) {
   return (
     <label className="flex cursor-pointer items-start justify-between gap-4 rounded-lg border bg-white p-4">
@@ -124,15 +121,20 @@ function ToggleRow({
         <span className="mt-1 block text-sm text-muted-foreground">{description}</span>
       </span>
       <input
+        checked={checked}
         className="mt-1 size-4 accent-blue-600"
-        defaultChecked={defaultChecked}
         type="checkbox"
+        onChange={(event) => onChange(event.target.checked)}
       />
     </label>
   );
 }
 
 export function ProductCardForm({ mode }: { mode: ProductFormMode }) {
+  const isEdit = mode === "edit";
+  const photoInputRef = useRef<HTMLInputElement>(null);
+  const videoInputRef = useRef<HTMLInputElement>(null);
+  const previewUrlsRef = useRef<Set<string>>(new Set());
   const [keywordInput, setKeywordInput] = useState("");
   const [keywords, setKeywords] = useState([
     "кольцо",
@@ -140,8 +142,65 @@ export function ProductCardForm({ mode }: { mode: ProductFormMode }) {
     "кольцо 585",
     "подарок девушке",
   ]);
+  const [media, setMedia] = useState<MediaItem[]>([
+    {
+      id: "mock-photo",
+      name: "front-view.jpg",
+      type: "photo",
+      size: "1.8 MB",
+      status: "ready",
+    },
+    {
+      id: "mock-video",
+      name: "product-video.mov",
+      type: "video",
+      size: "18.6 MB",
+      status: "uploaded",
+    },
+  ]);
+  const [form, setForm] = useState<ProductFormState>({
+    name: isEdit ? "Кольцо Classic" : "",
+    sku: isEdit ? "JWL-002-B8M2" : "JWL-001-A7K9",
+    category: "jewelry",
+    price: isEdit ? "31500" : "",
+    stock: isEdit ? "3" : "",
+    status: isEdit ? "active" : "draft",
+    description: isEdit
+      ? "Аккуратное золотое кольцо 585 пробы для повседневного образа и подарка."
+      : "",
+  });
+  const [customFields, setCustomFields] = useState<CustomFieldsState>({
+    assay: "585",
+    weight: "3.8 г",
+    size: "17.5",
+    stone: "Фианит",
+  });
+  const [visibility, setVisibility] = useState<VisibilityState>({
+    showInApi: true,
+    hidden: false,
+    draft: !isEdit,
+  });
 
-  const isEdit = mode === "edit";
+  useEffect(() => {
+    const previewUrls = previewUrlsRef.current;
+
+    return () => {
+      previewUrls.forEach((url) => URL.revokeObjectURL(url));
+      previewUrls.clear();
+    };
+  }, []);
+
+  function updateForm(field: keyof ProductFormState, value: string) {
+    setForm((current) => ({ ...current, [field]: value }));
+  }
+
+  function updateCustomField(field: keyof CustomFieldsState, value: string) {
+    setCustomFields((current) => ({ ...current, [field]: value }));
+  }
+
+  function updateVisibility(field: keyof VisibilityState, value: boolean) {
+    setVisibility((current) => ({ ...current, [field]: value }));
+  }
 
   function addKeyword() {
     const nextKeyword = keywordInput.trim();
@@ -158,29 +217,94 @@ export function ProductCardForm({ mode }: { mode: ProductFormMode }) {
     setKeywords((current) => current.filter((item) => item !== keyword));
   }
 
+  function addFiles(files: FileList | null, type: MediaType) {
+    if (!files?.length) {
+      return;
+    }
+
+    const nextMedia = Array.from(files).map((file) => {
+      const previewUrl = type === "photo" ? URL.createObjectURL(file) : undefined;
+
+      if (previewUrl) {
+        previewUrlsRef.current.add(previewUrl);
+      }
+
+      return {
+        id: `${file.name}-${file.lastModified}-${crypto.randomUUID()}`,
+        name: file.name,
+        type,
+        size: formatFileSize(file.size),
+        status: "uploaded" as const,
+        previewUrl,
+      };
+    });
+
+    setMedia((current) => [...nextMedia, ...current]);
+  }
+
+  function removeMedia(id: string) {
+    setMedia((current) => {
+      const item = current.find((mediaItem) => mediaItem.id === id);
+
+      if (item?.previewUrl) {
+        URL.revokeObjectURL(item.previewUrl);
+        previewUrlsRef.current.delete(item.previewUrl);
+      }
+
+      return current.filter((mediaItem) => mediaItem.id !== id);
+    });
+  }
+
+  function handleSave() {
+    alert("Товар сохранён локально. Подключение к базе будет позже.");
+  }
+
   return (
     <div className="grid gap-6 xl:grid-cols-[1fr_360px]">
       <div className="space-y-6">
         <Card>
           <CardHeader>
             <CardTitle>Фото и видео</CardTitle>
-            <CardDescription>Mock-загрузка медиа без отправки файлов на сервер.</CardDescription>
+            <CardDescription>Локальная mock-загрузка без отправки файлов на сервер.</CardDescription>
           </CardHeader>
           <CardContent className="space-y-5">
+            <input
+              ref={photoInputRef}
+              className="hidden"
+              type="file"
+              accept="image/jpeg,image/png,image/heic,image/webp"
+              multiple
+              onChange={(event) => {
+                addFiles(event.target.files, "photo");
+                event.target.value = "";
+              }}
+            />
+            <input
+              ref={videoInputRef}
+              className="hidden"
+              type="file"
+              accept="video/mp4,video/quicktime"
+              multiple
+              onChange={(event) => {
+                addFiles(event.target.files, "video");
+                event.target.value = "";
+              }}
+            />
+
             <div className="rounded-lg border border-dashed border-blue-200 bg-blue-50/50 p-6 text-center">
               <div className="mx-auto flex size-12 items-center justify-center rounded-lg bg-white text-primary shadow-soft">
                 <UploadCloud className="size-6" />
               </div>
               <h3 className="mt-4 text-sm font-semibold">Перетащите фото или видео сюда</h3>
               <p className="mt-1 text-sm text-muted-foreground">
-                JPG, PNG, HEIC, MP4, MOV. Обработка медиа будет подключена позже.
+                JPG, PNG, HEIC, WebP, MP4, MOV. Реальная обработка медиа будет подключена позже.
               </p>
               <div className="mt-4 flex flex-wrap justify-center gap-2">
-                <Button type="button">
+                <Button type="button" onClick={() => photoInputRef.current?.click()}>
                   <ImageIcon />
                   Загрузить фото
                 </Button>
-                <Button type="button" variant="outline">
+                <Button type="button" variant="outline" onClick={() => videoInputRef.current?.click()}>
                   <FileVideo />
                   Загрузить видео
                 </Button>
@@ -188,22 +312,39 @@ export function ProductCardForm({ mode }: { mode: ProductFormMode }) {
             </div>
 
             <div className="grid gap-3 md:grid-cols-2">
-              {mediaItems.map((item) => {
+              {media.map((item) => {
                 const StatusIcon = statusView[item.status].icon;
 
                 return (
                   <div key={item.id} className="flex gap-3 rounded-lg border bg-white p-3">
-                    <div
-                      className={cn(
-                        "relative flex size-16 shrink-0 items-center justify-center rounded-md",
-                        item.thumbClass,
+                    <div className="relative flex size-16 shrink-0 items-center justify-center overflow-hidden rounded-md bg-blue-50 text-blue-700">
+                      {item.previewUrl ? (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img alt={item.name} className="size-full object-cover" src={item.previewUrl} />
+                      ) : item.type === "photo" ? (
+                        <ImageIcon className="size-6" />
+                      ) : (
+                        <Play className="size-6" />
                       )}
-                    >
-                      {item.type === "photo" ? <ImageIcon className="size-6" /> : <Play className="size-6" />}
                     </div>
                     <div className="min-w-0 flex-1">
-                      <p className="truncate text-sm font-medium">{item.name}</p>
-                      <p className="mt-1 text-xs text-muted-foreground">{item.size}</p>
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="min-w-0">
+                          <p className="truncate text-sm font-medium">{item.name}</p>
+                          <p className="mt-1 text-xs text-muted-foreground">
+                            {item.type === "photo" ? "photo" : "video"} · {item.size}
+                          </p>
+                        </div>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          aria-label="Удалить медиа"
+                          onClick={() => removeMedia(item.id)}
+                        >
+                          <Trash2 />
+                        </Button>
+                      </div>
                       <Badge className={cn("mt-2 gap-1", statusView[item.status].className)}>
                         <StatusIcon className={cn("size-3", item.status === "processing" && "animate-spin")} />
                         {statusView[item.status].label}
@@ -224,15 +365,25 @@ export function ProductCardForm({ mode }: { mode: ProductFormMode }) {
           <CardContent className="grid gap-4 md:grid-cols-2">
             <div className="space-y-2 md:col-span-2">
               <FieldLabel htmlFor="name">Название</FieldLabel>
-              <Input id="name" defaultValue={isEdit ? "Кольцо Classic" : ""} placeholder="Например: Кольцо Classic" />
+              <Input
+                id="name"
+                value={form.name}
+                placeholder="Например: Кольцо Classic"
+                onChange={(event) => updateForm("name", event.target.value)}
+              />
             </div>
             <div className="space-y-2">
               <FieldLabel htmlFor="sku">SKU / Артикул</FieldLabel>
-              <Input id="sku" defaultValue={isEdit ? "JWL-002-B8M2" : "JWL-001-A7K9"} />
+              <Input id="sku" value={form.sku} onChange={(event) => updateForm("sku", event.target.value)} />
             </div>
             <div className="space-y-2">
               <FieldLabel htmlFor="category">Категория</FieldLabel>
-              <select className={selectClass} defaultValue="jewelry" id="category">
+              <select
+                className={selectClass}
+                id="category"
+                value={form.category}
+                onChange={(event) => updateForm("category", event.target.value)}
+              >
                 <option value="jewelry">Ювелирка</option>
                 <option value="tech">Техника</option>
                 <option value="accessories">Аксессуары</option>
@@ -240,15 +391,30 @@ export function ProductCardForm({ mode }: { mode: ProductFormMode }) {
             </div>
             <div className="space-y-2">
               <FieldLabel htmlFor="price">Цена</FieldLabel>
-              <Input id="price" defaultValue={isEdit ? "31500" : ""} placeholder="0" />
+              <Input
+                id="price"
+                value={form.price}
+                placeholder="0"
+                onChange={(event) => updateForm("price", event.target.value)}
+              />
             </div>
             <div className="space-y-2">
               <FieldLabel htmlFor="stock">Остаток</FieldLabel>
-              <Input id="stock" defaultValue={isEdit ? "3" : ""} placeholder="0" />
+              <Input
+                id="stock"
+                value={form.stock}
+                placeholder="0"
+                onChange={(event) => updateForm("stock", event.target.value)}
+              />
             </div>
             <div className="space-y-2 md:col-span-2">
               <FieldLabel htmlFor="status">Статус</FieldLabel>
-              <select className={selectClass} defaultValue={isEdit ? "active" : "draft"} id="status">
+              <select
+                className={selectClass}
+                id="status"
+                value={form.status}
+                onChange={(event) => updateForm("status", event.target.value)}
+              >
                 <option value="active">Активен</option>
                 <option value="hidden">Скрыт</option>
                 <option value="out_of_stock">Нет в наличии</option>
@@ -259,12 +425,9 @@ export function ProductCardForm({ mode }: { mode: ProductFormMode }) {
               <FieldLabel htmlFor="description">Описание</FieldLabel>
               <Textarea
                 id="description"
-                defaultValue={
-                  isEdit
-                    ? "Аккуратное золотое кольцо 585 пробы для повседневного образа и подарка."
-                    : ""
-                }
+                value={form.description}
                 placeholder="Краткое описание товара для каталога и API"
+                onChange={(event) => updateForm("description", event.target.value)}
               />
             </div>
           </CardContent>
@@ -276,12 +439,38 @@ export function ProductCardForm({ mode }: { mode: ProductFormMode }) {
             <CardDescription>Mock custom fields для карточки товара.</CardDescription>
           </CardHeader>
           <CardContent className="grid gap-4 md:grid-cols-2">
-            {customFields.map((field) => (
-              <div key={field.label} className="space-y-2">
-                <FieldLabel>{field.label}</FieldLabel>
-                <Input defaultValue={field.value} />
-              </div>
-            ))}
+            <div className="space-y-2">
+              <FieldLabel htmlFor="assay">Проба</FieldLabel>
+              <Input
+                id="assay"
+                value={customFields.assay}
+                onChange={(event) => updateCustomField("assay", event.target.value)}
+              />
+            </div>
+            <div className="space-y-2">
+              <FieldLabel htmlFor="weight">Вес</FieldLabel>
+              <Input
+                id="weight"
+                value={customFields.weight}
+                onChange={(event) => updateCustomField("weight", event.target.value)}
+              />
+            </div>
+            <div className="space-y-2">
+              <FieldLabel htmlFor="size">Размер</FieldLabel>
+              <Input
+                id="size"
+                value={customFields.size}
+                onChange={(event) => updateCustomField("size", event.target.value)}
+              />
+            </div>
+            <div className="space-y-2">
+              <FieldLabel htmlFor="stone">Камень</FieldLabel>
+              <Input
+                id="stone"
+                value={customFields.stone}
+                onChange={(event) => updateCustomField("stone", event.target.value)}
+              />
+            </div>
           </CardContent>
         </Card>
       </div>
@@ -336,21 +525,32 @@ export function ProductCardForm({ mode }: { mode: ProductFormMode }) {
             <ToggleRow
               title="Показывать в API"
               description="Товар доступен внешнему AI-боту через read-only API."
-              defaultChecked
+              checked={visibility.showInApi}
+              onChange={(checked) => updateVisibility("showInApi", checked)}
             />
-            <ToggleRow title="Скрыть товар" description="Товар не показывается в публичной выдаче." />
-            <ToggleRow title="Черновик" description="Карточка сохранена, но еще не готова к публикации." />
+            <ToggleRow
+              title="Скрыть товар"
+              description="Товар не показывается в публичной выдаче."
+              checked={visibility.hidden}
+              onChange={(checked) => updateVisibility("hidden", checked)}
+            />
+            <ToggleRow
+              title="Черновик"
+              description="Карточка сохранена, но еще не готова к публикации."
+              checked={visibility.draft}
+              onChange={(checked) => updateVisibility("draft", checked)}
+            />
           </CardContent>
         </Card>
 
         <Card>
           <CardContent className="flex flex-col gap-3 p-5">
-            <Button type="button">
+            <Button type="button" onClick={handleSave}>
               <Save />
-              {isEdit ? "Сохранить изменения" : "Создать товар"}
+              Сохранить
             </Button>
-            <Button type="button" variant="outline">
-              Сохранить как черновик
+            <Button asChild type="button" variant="outline">
+              <Link href="/dashboard/products">Отмена</Link>
             </Button>
           </CardContent>
         </Card>
