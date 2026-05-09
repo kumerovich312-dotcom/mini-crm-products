@@ -13,6 +13,17 @@ export interface Company {
   updated_at: string;
 }
 
+export interface Profile {
+  id: string;
+  user_id: string;
+  company_id: string;
+  email: string;
+  full_name: string | null;
+  role: "owner" | "admin" | "member";
+  created_at: string;
+  updated_at: string;
+}
+
 export interface Category {
   id: string;
   company_id: string;
@@ -101,6 +112,16 @@ export interface Database {
           updated_at?: string;
         };
         Update: Partial<Omit<Company, "id">>;
+        Relationships: [];
+      };
+      profiles: {
+        Row: Profile;
+        Insert: Omit<Profile, "id" | "created_at" | "updated_at"> & {
+          id?: string;
+          created_at?: string;
+          updated_at?: string;
+        };
+        Update: Partial<Omit<Profile, "id" | "user_id" | "company_id" | "created_at" | "updated_at">>;
         Relationships: [];
       };
       categories: {

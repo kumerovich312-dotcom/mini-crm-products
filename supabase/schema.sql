@@ -28,12 +28,14 @@ create table public.companies (
 
 create table public.profiles (
   id uuid primary key references auth.users(id) on delete cascade,
+  user_id uuid references auth.users(id) on delete cascade,
   company_id uuid not null references public.companies(id) on delete cascade,
   email text not null,
   full_name text,
   role text not null default 'owner',
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
+  constraint profiles_user_id_unique unique (user_id),
   constraint profiles_email_unique unique (email),
   constraint profiles_role_check check (role in ('owner', 'admin', 'member'))
 );
@@ -278,6 +280,12 @@ with check (
   )
 );
 
+create policy "authenticated users can create company"
+on public.companies
+for insert
+to authenticated
+with check (true);
+
 create policy "users can read profiles in own company"
 on public.profiles
 for select
@@ -290,12 +298,18 @@ using (
   )
 );
 
+create policy "users can create own profile"
+on public.profiles
+for insert
+to authenticated
+with check (user_id = auth.uid() or id = auth.uid());
+
 create policy "users can update own profile"
 on public.profiles
 for update
 to authenticated
-using (id = auth.uid())
-with check (id = auth.uid());
+using (id = auth.uid() or user_id = auth.uid())
+with check (id = auth.uid() or user_id = auth.uid());
 
 create policy "company access categories"
 on public.categories
