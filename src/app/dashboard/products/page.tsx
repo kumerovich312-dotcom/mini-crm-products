@@ -25,7 +25,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import { DEFAULT_COMPANY_ID } from "@/lib/constants";
+import { getCurrentCompanyId } from "@/lib/auth/get-current-company";
 import { supabase } from "@/lib/supabase/client";
 import { cn } from "@/lib/utils";
 import type { Category, Product, ProductMedia, ProductStatus } from "@/types/database";
@@ -69,6 +69,7 @@ function formatDate(value: string) {
 }
 
 export default function ProductsPage() {
+  const [companyId, setCompanyId] = useState<string | null>(null);
   const [products, setProducts] = useState<Product[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
   const [mediaByProductId, setMediaByProductId] = useState<Map<string, ProductMedia[]>>(new Map());
@@ -82,17 +83,29 @@ export default function ProductsPage() {
   const loadData = useCallback(async () => {
     setIsLoading(true);
     setPageError(null);
+    const currentCompanyId = await getCurrentCompanyId();
+
+    if (!currentCompanyId) {
+      setPageError("Компания текущего пользователя не найдена. Войдите заново.");
+      setProducts([]);
+      setCategories([]);
+      setMediaByProductId(new Map());
+      setIsLoading(false);
+      return;
+    }
+
+    setCompanyId(currentCompanyId);
 
     const [productsResult, categoriesResult] = await Promise.all([
       supabase
         .from("products")
         .select("*")
-        .eq("company_id", DEFAULT_COMPANY_ID)
+        .eq("company_id", currentCompanyId)
         .order("updated_at", { ascending: false }),
       supabase
         .from("categories")
         .select("*")
-        .eq("company_id", DEFAULT_COMPANY_ID)
+        .eq("company_id", currentCompanyId)
         .order("sort_order", { ascending: true }),
     ]);
 
@@ -112,7 +125,7 @@ export default function ProductsPage() {
       const { data: mediaData, error: mediaError } = await supabase
         .from("product_media")
         .select("*")
-        .eq("company_id", DEFAULT_COMPANY_ID)
+        .eq("company_id", currentCompanyId)
         .in(
           "product_id",
           nextProducts.map((product) => product.id),
@@ -171,13 +184,18 @@ export default function ProductsPage() {
   }, [categoryId, products, query, status, stockFilter]);
 
   async function hideProduct(product: Product) {
+    if (!companyId) {
+      setPageError("Компания текущего пользователя не найдена.");
+      return;
+    }
+
     setPageError(null);
 
     const { error } = await supabase
       .from("products")
       .update({ status: "hidden", is_visible_in_api: false })
       .eq("id", product.id)
-      .eq("company_id", DEFAULT_COMPANY_ID);
+      .eq("company_id", companyId);
 
     if (error) {
       setPageError(error.message);
@@ -188,13 +206,18 @@ export default function ProductsPage() {
   }
 
   async function deleteProduct(product: Product) {
+    if (!companyId) {
+      setPageError("Компания текущего пользователя не найдена.");
+      return;
+    }
+
     setPageError(null);
 
     const { error } = await supabase
       .from("products")
       .delete()
       .eq("id", product.id)
-      .eq("company_id", DEFAULT_COMPANY_ID);
+      .eq("company_id", companyId);
 
     if (error) {
       setPageError(error.message);
@@ -334,7 +357,7 @@ export default function ProductsPage() {
                       <td className="px-4 py-10" colSpan={10}>
                         <EmptyState
                           icon={PackageOpen}
-                          title="Товары не найдены"
+                          title={products.length === 0 ? "Товары пока не добавлены" : "Товары не найдены"}
                           description="Измените поиск или фильтры, либо добавьте первый товар."
                         />
                       </td>

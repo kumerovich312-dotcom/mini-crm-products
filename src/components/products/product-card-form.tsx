@@ -25,7 +25,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
-import { DEFAULT_COMPANY_ID } from "@/lib/constants";
+import { getCurrentCompanyId } from "@/lib/auth/get-current-company";
 import { supabase } from "@/lib/supabase/client";
 import { cn } from "@/lib/utils";
 import type { Category, CustomField, Product, ProductCustomValue, ProductMedia, ProductStatus } from "@/types/database";
@@ -254,12 +254,13 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
   const videoInputRef = useRef<HTMLInputElement>(null);
   const previewUrlsRef = useRef<Set<string>>(new Set());
   const [categories, setCategories] = useState<Category[]>([]);
+  const [companyId, setCompanyId] = useState<string | null>(null);
   const [companyPrefix, setCompanyPrefix] = useState(FALLBACK_COMPANY_PREFIX);
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [pageError, setPageError] = useState<string | null>(null);
   const [keywordInput, setKeywordInput] = useState("");
-  const [keywords, setKeywords] = useState(["кольцо", "золотое кольцо", "кольцо 585", "подарок девушке"]);
+  const [keywords, setKeywords] = useState<string[]>([]);
   const [customFieldDefinitions, setCustomFieldDefinitions] = useState<CustomField[]>([]);
   const [customFieldValues, setCustomFieldValues] = useState<CustomFieldValuesState>({});
   const [customFieldErrors, setCustomFieldErrors] = useState<Record<string, string>>({});
@@ -279,6 +280,10 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
 
   const buildUniqueSku = useCallback(
     async (categoryId: string, prefix = companyPrefix) => {
+      if (!companyId) {
+        return "";
+      }
+
       const category = categories.find((item) => item.id === categoryId);
 
       if (!category) {
@@ -290,7 +295,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
         const query = supabase
           .from("products")
           .select("id")
-          .eq("company_id", DEFAULT_COMPANY_ID)
+          .eq("company_id", companyId)
           .eq("sku", candidate);
 
         const { data, error } = productId ? await query.neq("id", productId) : await query;
@@ -302,24 +307,34 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
 
       return `${prefix}-${category.code}-${generateProductCode(4)}`;
     },
-    [categories, companyPrefix, productId],
+    [categories, companyId, companyPrefix, productId],
   );
 
   const loadData = useCallback(async () => {
     setIsLoading(true);
     setPageError(null);
 
+    const currentCompanyId = await getCurrentCompanyId();
+
+    if (!currentCompanyId) {
+      setPageError("Компания текущего пользователя не найдена. Войдите заново.");
+      setIsLoading(false);
+      return;
+    }
+
+    setCompanyId(currentCompanyId);
+
     const [companyResult, categoriesResult, customFieldsResult] = await Promise.all([
-      supabase.from("companies").select("sku_prefix").eq("id", DEFAULT_COMPANY_ID).maybeSingle(),
+      supabase.from("companies").select("sku_prefix").eq("id", currentCompanyId).maybeSingle(),
       supabase
         .from("categories")
         .select("*")
-        .eq("company_id", DEFAULT_COMPANY_ID)
+        .eq("company_id", currentCompanyId)
         .order("sort_order", { ascending: true }),
       supabase
         .from("custom_fields")
         .select("*")
-        .eq("company_id", DEFAULT_COMPANY_ID)
+        .eq("company_id", currentCompanyId)
         .order("sort_order", { ascending: true }),
     ]);
 
@@ -358,7 +373,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
       const { data, error } = await supabase
         .from("products")
         .select("*")
-        .eq("company_id", DEFAULT_COMPANY_ID)
+        .eq("company_id", currentCompanyId)
         .eq("id", productId)
         .maybeSingle();
 
@@ -388,7 +403,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
       const { data: customValuesData, error: customValuesError } = await supabase
         .from("product_custom_values")
         .select("*")
-        .eq("company_id", DEFAULT_COMPANY_ID)
+        .eq("company_id", currentCompanyId)
         .eq("product_id", productId);
 
       if (customValuesError) {
@@ -414,7 +429,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
       const { data: mediaData, error: mediaError } = await supabase
         .from("product_media")
         .select("*")
-        .eq("company_id", DEFAULT_COMPANY_ID)
+        .eq("company_id", currentCompanyId)
         .eq("product_id", productId)
         .order("sort_order", { ascending: true });
 
@@ -517,7 +532,11 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
   }
 
   async function uploadMediaFile(file: File, type: MediaType, productIdForMedia: string, sortOrder: number) {
-    const filePath = `${DEFAULT_COMPANY_ID}/${productIdForMedia}/${Date.now()}-${sanitizeFileName(file.name)}`;
+    if (!companyId) {
+      return { error: "Компания текущего пользователя не найдена." };
+    }
+
+    const filePath = `${companyId}/${productIdForMedia}/${Date.now()}-${sanitizeFileName(file.name)}`;
     const { error: uploadError } = await supabase.storage.from(MEDIA_BUCKET).upload(filePath, file, {
       contentType: file.type || undefined,
       upsert: false,
@@ -532,7 +551,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
     const originalUrl = publicUrlData.publicUrl;
 
     const mediaPayload = {
-      company_id: DEFAULT_COMPANY_ID,
+      company_id: companyId,
       product_id: productIdForMedia,
       media_type: type,
       type,
@@ -682,6 +701,11 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
   }
 
   async function removeMedia(id: string) {
+    if (!companyId) {
+      setPageError("Компания текущего пользователя не найдена.");
+      return;
+    }
+
     const itemToRemove = media.find((mediaItem) => mediaItem.id === id);
 
     if (!itemToRemove) {
@@ -695,7 +719,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
         .from("product_media")
         .delete()
         .eq("id", id)
-        .eq("company_id", DEFAULT_COMPANY_ID);
+        .eq("company_id", companyId);
 
       if (error) {
         console.error(error);
@@ -727,10 +751,15 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
   }
 
   async function validateSkuUnique() {
+    if (!companyId) {
+      setPageError("Компания текущего пользователя не найдена.");
+      return false;
+    }
+
     const query = supabase
       .from("products")
       .select("id")
-      .eq("company_id", DEFAULT_COMPANY_ID)
+      .eq("company_id", companyId)
       .eq("sku", form.sku.trim());
 
     const { data, error } = productId ? await query.neq("id", productId) : await query;
@@ -780,7 +809,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
     const value = customFieldValues[field.id];
 
     return {
-      company_id: DEFAULT_COMPANY_ID,
+      company_id: companyId,
       product_id: productIdForValues,
       custom_field_id: field.id,
       value_text: field.field_type === "text" || field.field_type === "select" ? String(value ?? "").trim() : null,
@@ -791,6 +820,10 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
   }
 
   async function saveCustomFieldValues(productIdForValues: string) {
+    if (!companyId) {
+      return "Компания текущего пользователя не найдена.";
+    }
+
     for (const field of customFieldDefinitions) {
       const value = customFieldValues[field.id];
       const isEmpty = isEmptyCustomFieldValue(field, value);
@@ -799,7 +832,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
         const { error } = await supabase
           .from("product_custom_values")
           .delete()
-          .eq("company_id", DEFAULT_COMPANY_ID)
+          .eq("company_id", companyId)
           .eq("product_id", productIdForValues)
           .eq("custom_field_id", field.id);
 
@@ -814,7 +847,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
       const { data: existingValue, error: existingError } = await supabase
         .from("product_custom_values")
         .select("id")
-        .eq("company_id", DEFAULT_COMPANY_ID)
+        .eq("company_id", companyId)
         .eq("product_id", productIdForValues)
         .eq("custom_field_id", field.id)
         .maybeSingle();
@@ -830,7 +863,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
             .from("product_custom_values")
             .update(payload)
             .eq("id", existingValue.id)
-            .eq("company_id", DEFAULT_COMPANY_ID)
+            .eq("company_id", companyId)
         : await supabase.from("product_custom_values").insert(payload);
 
       if (saveResult.error) {
@@ -845,6 +878,11 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
   async function handleSave() {
     setPageError(null);
     setCustomFieldErrors({});
+
+    if (!companyId) {
+      setPageError("Компания текущего пользователя не найдена.");
+      return;
+    }
 
     if (!form.name.trim()) {
       setPageError("Название товара не должно быть пустым.");
@@ -878,7 +916,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
     const nextStatus = form.status;
     const canShowInApi = nextStatus === "active" || nextStatus === "out_of_stock";
     const payload = {
-      company_id: DEFAULT_COMPANY_ID,
+      company_id: companyId,
       category_id: form.categoryId,
       name: form.name.trim(),
       sku: form.sku.trim().toUpperCase(),
@@ -896,7 +934,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
             .from("products")
             .update(payload)
             .eq("id", productId)
-            .eq("company_id", DEFAULT_COMPANY_ID)
+            .eq("company_id", companyId)
             .select("id")
             .single()
         : await supabase.from("products").insert(payload).select("id").single();

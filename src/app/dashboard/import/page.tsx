@@ -18,7 +18,7 @@ import { PageHeader } from "@/components/page-header";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { DEFAULT_COMPANY_ID } from "@/lib/constants";
+import { getCurrentCompanyId } from "@/lib/auth/get-current-company";
 import { supabase } from "@/lib/supabase/client";
 import type { Category, CustomField, Product, ProductStatus } from "@/types/database";
 
@@ -145,6 +145,7 @@ export default function ImportPage() {
   const [defaultCategoryId, setDefaultCategoryId] = useState("");
   const [categories, setCategories] = useState<Category[]>([]);
   const [customFields, setCustomFields] = useState<CustomField[]>([]);
+  const [companyId, setCompanyId] = useState<string | null>(null);
   const [companyPrefix, setCompanyPrefix] = useState("JWL");
   const [existingProducts, setExistingProducts] = useState<Product[]>([]);
   const [validationErrors, setValidationErrors] = useState<ImportErrorItem[]>([]);
@@ -184,11 +185,23 @@ export default function ImportPage() {
   }, [categoryColumn, categoryMapping, defaultCategoryId, fileCategories]);
 
   const loadReferenceData = useCallback(async () => {
+    const currentCompanyId = await getCurrentCompanyId();
+
+    if (!currentCompanyId) {
+      setPageError("Компания текущего пользователя не найдена. Войдите заново.");
+      setCategories([]);
+      setCustomFields([]);
+      setExistingProducts([]);
+      return;
+    }
+
+    setCompanyId(currentCompanyId);
+
     const [companyResult, categoriesResult, customFieldsResult, productsResult] = await Promise.all([
-      supabase.from("companies").select("sku_prefix").eq("id", DEFAULT_COMPANY_ID).maybeSingle(),
-      supabase.from("categories").select("*").eq("company_id", DEFAULT_COMPANY_ID).order("sort_order", { ascending: true }),
-      supabase.from("custom_fields").select("*").eq("company_id", DEFAULT_COMPANY_ID).order("sort_order", { ascending: true }),
-      supabase.from("products").select("*").eq("company_id", DEFAULT_COMPANY_ID),
+      supabase.from("companies").select("sku_prefix").eq("id", currentCompanyId).maybeSingle(),
+      supabase.from("categories").select("*").eq("company_id", currentCompanyId).order("sort_order", { ascending: true }),
+      supabase.from("custom_fields").select("*").eq("company_id", currentCompanyId).order("sort_order", { ascending: true }),
+      supabase.from("products").select("*").eq("company_id", currentCompanyId),
     ]);
 
     const error = companyResult.error ?? categoriesResult.error ?? customFieldsResult.error ?? productsResult.error;
@@ -264,7 +277,12 @@ export default function ImportPage() {
   }
 
   async function refreshExistingProducts() {
-    const { data, error } = await supabase.from("products").select("*").eq("company_id", DEFAULT_COMPANY_ID);
+    if (!companyId) {
+      setPageError("Компания текущего пользователя не найдена.");
+      return existingProducts;
+    }
+
+    const { data, error } = await supabase.from("products").select("*").eq("company_id", companyId);
 
     if (error) {
       console.error(error);
@@ -372,6 +390,10 @@ export default function ImportPage() {
   }
 
   async function saveCustomValues(productId: string, row: ImportRow) {
+    if (!companyId) {
+      throw new Error("Компания текущего пользователя не найдена.");
+    }
+
     for (const field of customFields) {
       const column = findMappedColumn(mapping, `custom_field:${field.key}`);
       const rawValue = getCell(row, column);
@@ -381,7 +403,7 @@ export default function ImportPage() {
       }
 
       const payload = {
-        company_id: DEFAULT_COMPANY_ID,
+        company_id: companyId,
         product_id: productId,
         custom_field_id: field.id,
         value_text: field.field_type === "text" || field.field_type === "select" ? rawValue : null,
@@ -392,7 +414,7 @@ export default function ImportPage() {
       const { data: existingValue, error: existingError } = await supabase
         .from("product_custom_values")
         .select("id")
-        .eq("company_id", DEFAULT_COMPANY_ID)
+        .eq("company_id", companyId)
         .eq("product_id", productId)
         .eq("custom_field_id", field.id)
         .maybeSingle();
@@ -406,7 +428,7 @@ export default function ImportPage() {
             .from("product_custom_values")
             .update(payload)
             .eq("id", existingValue.id)
-            .eq("company_id", DEFAULT_COMPANY_ID)
+            .eq("company_id", companyId)
         : await supabase.from("product_custom_values").insert(payload);
 
       if (result.error) {
@@ -416,6 +438,11 @@ export default function ImportPage() {
   }
 
   async function runImport() {
+    if (!companyId) {
+      setPageError("Компания текущего пользователя не найдена.");
+      return;
+    }
+
     if (hasUnmappedCategories) {
       alert("Есть несопоставленные категории. Выберите категорию в системе для каждой категории из файла.");
       return;
@@ -441,7 +468,7 @@ export default function ImportPage() {
     const importResult = await supabase
       .from("imports")
       .insert({
-        company_id: DEFAULT_COMPANY_ID,
+        company_id: companyId,
         file_name: selectedFile?.name ?? "import",
         status: "validating",
         total_rows: rows.length,
@@ -479,7 +506,7 @@ export default function ImportPage() {
         ? rawStatus
         : "active";
       const payload = {
-        company_id: DEFAULT_COMPANY_ID,
+        company_id: companyId,
         category_id: category?.id ?? null,
         name: getCell(row, nameColumn),
         sku,
@@ -495,7 +522,7 @@ export default function ImportPage() {
             .from("products")
             .update(payload)
             .eq("id", existingProduct.id)
-            .eq("company_id", DEFAULT_COMPANY_ID)
+            .eq("company_id", companyId)
             .select("id, sku")
             .single()
         : await supabase.from("products").insert(payload).select("id, sku").single();
@@ -525,7 +552,7 @@ export default function ImportPage() {
     if (errors.length > 0) {
       await supabase.from("import_errors").insert(
         errors.map((error) => ({
-          company_id: DEFAULT_COMPANY_ID,
+          company_id: companyId,
           import_id: importId,
           row_number: error.row,
           field_name: error.field,
@@ -547,7 +574,7 @@ export default function ImportPage() {
         updated_products: updatedRows,
       })
       .eq("id", importId)
-      .eq("company_id", DEFAULT_COMPANY_ID);
+      .eq("company_id", companyId);
 
     setResult({
       totalRows: rows.length,

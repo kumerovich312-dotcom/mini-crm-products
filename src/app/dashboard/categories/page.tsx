@@ -20,10 +20,9 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { getCurrentCompanyId } from "@/lib/auth/get-current-company";
 import { supabase } from "@/lib/supabase/client";
 import type { Category } from "@/types/database";
-
-const DEFAULT_COMPANY_ID = "718f1a81-3a75-4484-901a-6054936be72c";
 
 type CategoryStatus = "active" | "inactive";
 
@@ -58,6 +57,7 @@ function mapCategoryStatus(category: Category): CategoryStatus {
 }
 
 export default function CategoriesPage() {
+  const [companyId, setCompanyId] = useState<string | null>(null);
   const [categories, setCategories] = useState<CategoryItem[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
@@ -77,11 +77,21 @@ export default function CategoriesPage() {
   const loadCategories = useCallback(async () => {
     setIsLoading(true);
     setPageError(null);
+    const currentCompanyId = await getCurrentCompanyId();
+
+    if (!currentCompanyId) {
+      setPageError("Компания текущего пользователя не найдена. Войдите заново.");
+      setCategories([]);
+      setIsLoading(false);
+      return;
+    }
+
+    setCompanyId(currentCompanyId);
 
     const { data, error } = await supabase
       .from("categories")
       .select("*")
-      .eq("company_id", DEFAULT_COMPANY_ID)
+      .eq("company_id", currentCompanyId)
       .order("sort_order", { ascending: true });
 
     if (error) {
@@ -97,7 +107,7 @@ export default function CategoriesPage() {
         const { count } = await supabase
           .from("products")
           .select("id", { count: "exact", head: true })
-          .eq("company_id", DEFAULT_COMPANY_ID)
+          .eq("company_id", currentCompanyId)
           .eq("category_id", category.id);
 
         return {
@@ -149,6 +159,11 @@ export default function CategoriesPage() {
   }
 
   function validateForm() {
+    if (!companyId) {
+      setPageError("Компания текущего пользователя не найдена.");
+      return false;
+    }
+
     const nextErrors: Partial<Record<keyof CategoryForm, string>> = {};
     const normalizedCode = form.code.trim();
 
@@ -163,7 +178,7 @@ export default function CategoriesPage() {
     }
 
     const duplicateCode = categories.some(
-      (category) => category.id !== editingId && category.company_id === DEFAULT_COMPANY_ID && category.code === normalizedCode,
+      (category) => category.id !== editingId && category.company_id === companyId && category.code === normalizedCode,
     );
 
     if (duplicateCode) {
@@ -183,6 +198,13 @@ export default function CategoriesPage() {
       return;
     }
 
+    const currentCompanyId = companyId;
+
+    if (!currentCompanyId) {
+      setPageError("Компания текущего пользователя не найдена.");
+      return;
+    }
+
     setIsSaving(true);
     setPageError(null);
 
@@ -198,9 +220,9 @@ export default function CategoriesPage() {
           .from("categories")
           .update(payload)
           .eq("id", editingId)
-          .eq("company_id", DEFAULT_COMPANY_ID)
+          .eq("company_id", currentCompanyId)
       : await supabase.from("categories").insert({
-          company_id: DEFAULT_COMPANY_ID,
+          company_id: currentCompanyId,
           ...payload,
         });
 
@@ -216,9 +238,14 @@ export default function CategoriesPage() {
   }
 
   async function deleteCategory(id: string) {
+    if (!companyId) {
+      setPageError("Компания текущего пользователя не найдена.");
+      return;
+    }
+
     setPageError(null);
 
-    const { error } = await supabase.from("categories").delete().eq("id", id).eq("company_id", DEFAULT_COMPANY_ID);
+    const { error } = await supabase.from("categories").delete().eq("id", id).eq("company_id", companyId);
 
     if (error) {
       setPageError(error.message);
@@ -229,13 +256,18 @@ export default function CategoriesPage() {
   }
 
   async function toggleStatus(category: CategoryItem) {
+    if (!companyId) {
+      setPageError("Компания текущего пользователя не найдена.");
+      return;
+    }
+
     setPageError(null);
 
     const { error } = await supabase
       .from("categories")
       .update({ is_active: !category.is_active })
       .eq("id", category.id)
-      .eq("company_id", DEFAULT_COMPANY_ID);
+      .eq("company_id", companyId);
 
     if (error) {
       setPageError(error.message);
@@ -246,6 +278,11 @@ export default function CategoriesPage() {
   }
 
   async function moveCategory(category: CategoryItem, direction: "up" | "down") {
+    if (!companyId) {
+      setPageError("Компания текущего пользователя не найдена.");
+      return;
+    }
+
     const index = sortedCategories.findIndex((item) => item.id === category.id);
     const swapIndex = direction === "up" ? index - 1 : index + 1;
     const swapCategory = sortedCategories[swapIndex];
@@ -260,13 +297,13 @@ export default function CategoriesPage() {
       .from("categories")
       .update({ sort_order: swapCategory.sort_order })
       .eq("id", category.id)
-      .eq("company_id", DEFAULT_COMPANY_ID);
+      .eq("company_id", companyId);
 
     const secondUpdate = supabase
       .from("categories")
       .update({ sort_order: category.sort_order })
       .eq("id", swapCategory.id)
-      .eq("company_id", DEFAULT_COMPANY_ID);
+      .eq("company_id", companyId);
 
     const [firstResult, secondResult] = await Promise.all([firstUpdate, secondUpdate]);
     const error = firstResult.error ?? secondResult.error;

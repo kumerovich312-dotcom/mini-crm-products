@@ -8,7 +8,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import { DEFAULT_COMPANY_ID } from "@/lib/constants";
+import { getCurrentCompanyId } from "@/lib/auth/get-current-company";
 import { supabase } from "@/lib/supabase/client";
 import type { CustomField as DatabaseCustomField, CustomFieldType } from "@/types/database";
 
@@ -83,6 +83,7 @@ function getFriendlyErrorMessage(message: string) {
 }
 
 export default function CustomFieldsPage() {
+  const [companyId, setCompanyId] = useState<string | null>(null);
   const [fields, setFields] = useState<DatabaseCustomField[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
@@ -108,10 +109,21 @@ export default function CustomFieldsPage() {
     setIsLoading(true);
     setPageError(null);
 
+    const currentCompanyId = await getCurrentCompanyId();
+
+    if (!currentCompanyId) {
+      setFields([]);
+      setPageError("Компания текущего пользователя не найдена. Войдите заново.");
+      setIsLoading(false);
+      return;
+    }
+
+    setCompanyId(currentCompanyId);
+
     const { data, error } = await supabase
       .from("custom_fields")
       .select("*")
-      .eq("company_id", DEFAULT_COMPANY_ID)
+      .eq("company_id", currentCompanyId)
       .order("sort_order", { ascending: true });
 
     if (error) {
@@ -216,6 +228,11 @@ export default function CustomFieldsPage() {
   }
 
   async function saveField() {
+    if (!companyId) {
+      showError("Компания текущего пользователя не найдена.");
+      return;
+    }
+
     if (!validateForm()) {
       return;
     }
@@ -239,9 +256,9 @@ export default function CustomFieldsPage() {
           .from("custom_fields")
           .update(payload)
           .eq("id", editingId)
-          .eq("company_id", DEFAULT_COMPANY_ID)
+          .eq("company_id", companyId)
       : await supabase.from("custom_fields").insert({
-          company_id: DEFAULT_COMPANY_ID,
+          company_id: companyId,
           ...payload,
         });
 
@@ -257,13 +274,18 @@ export default function CustomFieldsPage() {
   }
 
   async function deleteField(id: string) {
+    if (!companyId) {
+      showError("Компания текущего пользователя не найдена.");
+      return;
+    }
+
     if (!window.confirm("Удалить пользовательское поле?")) {
       return;
     }
 
     setPageError(null);
 
-    const { error } = await supabase.from("custom_fields").delete().eq("id", id).eq("company_id", DEFAULT_COMPANY_ID);
+    const { error } = await supabase.from("custom_fields").delete().eq("id", id).eq("company_id", companyId);
 
     if (error) {
       showError(error.message);
@@ -274,13 +296,18 @@ export default function CustomFieldsPage() {
   }
 
   async function toggleRequired(field: DatabaseCustomField) {
+    if (!companyId) {
+      showError("Компания текущего пользователя не найдена.");
+      return;
+    }
+
     setPageError(null);
 
     const { error } = await supabase
       .from("custom_fields")
       .update({ is_required: !field.is_required })
       .eq("id", field.id)
-      .eq("company_id", DEFAULT_COMPANY_ID);
+      .eq("company_id", companyId);
 
     if (error) {
       showError(error.message);
@@ -291,13 +318,18 @@ export default function CustomFieldsPage() {
   }
 
   async function toggleShowInApi(field: DatabaseCustomField) {
+    if (!companyId) {
+      showError("Компания текущего пользователя не найдена.");
+      return;
+    }
+
     setPageError(null);
 
     const { error } = await supabase
       .from("custom_fields")
       .update({ is_visible_in_api: !field.is_visible_in_api })
       .eq("id", field.id)
-      .eq("company_id", DEFAULT_COMPANY_ID);
+      .eq("company_id", companyId);
 
     if (error) {
       showError(error.message);
@@ -379,7 +411,7 @@ export default function CustomFieldsPage() {
                   {!isLoading && sortedFields.length === 0 ? (
                     <tr>
                       <td className="px-4 py-10 text-center text-muted-foreground" colSpan={8}>
-                        Пользовательские поля пока не добавлены
+                        Поля пока не добавлены
                       </td>
                     </tr>
                   ) : null}
