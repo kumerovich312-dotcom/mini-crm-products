@@ -71,6 +71,19 @@ export interface CustomField {
   updated_at: string;
 }
 
+export interface ProductCustomValue {
+  id: string;
+  company_id: string;
+  product_id: string;
+  custom_field_id: string;
+  value_text: string | null;
+  value_number: number | null;
+  value_boolean: boolean | null;
+  value_date: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface Database {
   public: {
     Tables: {
@@ -122,6 +135,16 @@ export interface Database {
           updated_at?: string;
         };
         Update: Partial<Omit<CustomField, "id" | "company_id" | "created_at" | "updated_at">>;
+        Relationships: [];
+      };
+      product_custom_values: {
+        Row: ProductCustomValue;
+        Insert: Omit<ProductCustomValue, "id" | "created_at" | "updated_at"> & {
+          id?: string;
+          created_at?: string;
+          updated_at?: string;
+        };
+        Update: Partial<Omit<ProductCustomValue, "id" | "company_id" | "product_id" | "custom_field_id" | "created_at" | "updated_at">>;
         Relationships: [];
       };
     };

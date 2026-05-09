@@ -111,7 +111,10 @@ create table public.product_custom_values (
   company_id uuid not null references public.companies(id) on delete cascade,
   product_id uuid not null references public.products(id) on delete cascade,
   custom_field_id uuid not null references public.custom_fields(id) on delete cascade,
-  value jsonb,
+  value_text text,
+  value_number numeric(12, 2),
+  value_boolean boolean,
+  value_date date,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   constraint product_custom_values_unique unique (product_id, custom_field_id)

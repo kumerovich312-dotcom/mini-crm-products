@@ -25,11 +25,11 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
+import { DEFAULT_COMPANY_ID } from "@/lib/constants";
 import { supabase } from "@/lib/supabase/client";
 import { cn } from "@/lib/utils";
-import type { Category, Product, ProductStatus } from "@/types/database";
+import type { Category, CustomField, Product, ProductCustomValue, ProductStatus } from "@/types/database";
 
-const DEFAULT_COMPANY_ID = "718f1a81-3a75-4484-901a-6054936be72c";
 const FALLBACK_COMPANY_PREFIX = "JWL";
 
 type ProductFormMode = "new" | "edit";
@@ -55,12 +55,8 @@ type ProductFormState = {
   description: string;
 };
 
-type CustomFieldsState = {
-  assay: string;
-  weight: string;
-  size: string;
-  stone: string;
-};
+type CustomFieldValue = string | boolean;
+type CustomFieldValuesState = Record<string, CustomFieldValue>;
 
 type VisibilityState = {
   showInApi: boolean;
@@ -143,6 +139,38 @@ function ToggleRow({
   );
 }
 
+function getFieldOptions(field: CustomField) {
+  if (!Array.isArray(field.options)) {
+    return [];
+  }
+
+  return field.options.filter((option): option is string => typeof option === "string");
+}
+
+function getCustomFieldInputId(field: CustomField) {
+  return `custom-field-${field.id}`;
+}
+
+function isEmptyCustomFieldValue(field: CustomField, value: CustomFieldValue | undefined) {
+  if (field.field_type === "boolean") {
+    return value === undefined;
+  }
+
+  return String(value ?? "").trim() === "";
+}
+
+function getProductCustomValue(field: CustomField, row: ProductCustomValue): CustomFieldValue {
+  if (field.field_type === "number") {
+    return row.value_number === null ? "" : String(row.value_number);
+  }
+
+  if (field.field_type === "boolean") {
+    return Boolean(row.value_boolean);
+  }
+
+  return row.value_text ?? "";
+}
+
 export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; productId?: string }) {
   const router = useRouter();
   const isEdit = mode === "edit";
@@ -156,6 +184,9 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
   const [pageError, setPageError] = useState<string | null>(null);
   const [keywordInput, setKeywordInput] = useState("");
   const [keywords, setKeywords] = useState(["кольцо", "золотое кольцо", "кольцо 585", "подарок девушке"]);
+  const [customFieldDefinitions, setCustomFieldDefinitions] = useState<CustomField[]>([]);
+  const [customFieldValues, setCustomFieldValues] = useState<CustomFieldValuesState>({});
+  const [customFieldErrors, setCustomFieldErrors] = useState<Record<string, string>>({});
   const [media, setMedia] = useState<MediaItem[]>([
     {
       id: "mock-photo",
@@ -180,12 +211,6 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
     stock: "0",
     status: isEdit ? "active" : "draft",
     description: "",
-  });
-  const [customFields, setCustomFields] = useState<CustomFieldsState>({
-    assay: "585",
-    weight: "3.8 г",
-    size: "17.5",
-    stone: "Фианит",
   });
   const [visibility, setVisibility] = useState<VisibilityState>({
     showInApi: true,
@@ -225,10 +250,15 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
     setIsLoading(true);
     setPageError(null);
 
-    const [companyResult, categoriesResult] = await Promise.all([
+    const [companyResult, categoriesResult, customFieldsResult] = await Promise.all([
       supabase.from("companies").select("sku_prefix").eq("id", DEFAULT_COMPANY_ID).maybeSingle(),
       supabase
         .from("categories")
+        .select("*")
+        .eq("company_id", DEFAULT_COMPANY_ID)
+        .order("sort_order", { ascending: true }),
+      supabase
+        .from("custom_fields")
         .select("*")
         .eq("company_id", DEFAULT_COMPANY_ID)
         .order("sort_order", { ascending: true }),
@@ -236,17 +266,34 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
 
     const nextPrefix = companyResult.data?.sku_prefix ?? FALLBACK_COMPANY_PREFIX;
     const nextCategories = ((categoriesResult.data ?? []) as Category[]) ?? [];
+    const nextCustomFields = ((customFieldsResult.data ?? []) as CustomField[]) ?? [];
+    const defaultCustomValues = nextCustomFields.reduce<CustomFieldValuesState>((acc, field) => {
+      if (field.field_type === "boolean") {
+        acc[field.id] = false;
+      }
+
+      return acc;
+    }, {});
 
     if (companyResult.error) {
+      console.error(companyResult.error);
       setPageError(companyResult.error.message);
     }
 
     if (categoriesResult.error) {
+      console.error(categoriesResult.error);
       setPageError(categoriesResult.error.message);
+    }
+
+    if (customFieldsResult.error) {
+      console.error(customFieldsResult.error);
+      setPageError("Не удалось загрузить пользовательские поля. Попробуйте обновить страницу.");
     }
 
     setCompanyPrefix(nextPrefix);
     setCategories(nextCategories);
+    setCustomFieldDefinitions(nextCustomFields);
+    setCustomFieldValues(defaultCustomValues);
 
     if (isEdit && productId) {
       const { data, error } = await supabase
@@ -257,6 +304,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
         .maybeSingle();
 
       if (error) {
+        console.error(error);
         setPageError(error.message);
       }
 
@@ -278,6 +326,32 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
           hidden: product.status === "hidden",
           draft: product.status === "draft",
         });
+      }
+
+      const { data: customValuesData, error: customValuesError } = await supabase
+        .from("product_custom_values")
+        .select("*")
+        .eq("company_id", DEFAULT_COMPANY_ID)
+        .eq("product_id", productId);
+
+      if (customValuesError) {
+        console.error(customValuesError);
+        setPageError("Не удалось загрузить значения пользовательских полей.");
+      }
+
+      if (customValuesData) {
+        const rows = customValuesData as ProductCustomValue[];
+        const nextValues = rows.reduce<CustomFieldValuesState>((acc, row) => {
+          const field = nextCustomFields.find((item) => item.id === row.custom_field_id);
+
+          if (field) {
+            acc[field.id] = getProductCustomValue(field, row);
+          }
+
+          return acc;
+        }, { ...defaultCustomValues });
+
+        setCustomFieldValues(nextValues);
       }
     }
 
@@ -312,8 +386,9 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
     setForm((current) => ({ ...current, [field]: value }));
   }
 
-  function updateCustomField(field: keyof CustomFieldsState, value: string) {
-    setCustomFields((current) => ({ ...current, [field]: value }));
+  function updateCustomField(fieldId: string, value: CustomFieldValue) {
+    setCustomFieldValues((current) => ({ ...current, [fieldId]: value }));
+    setCustomFieldErrors((current) => ({ ...current, [fieldId]: "" }));
   }
 
   function updateVisibility(field: keyof VisibilityState, value: boolean) {
@@ -400,8 +475,108 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
     return !data || data.length === 0;
   }
 
+  function validateCustomFields() {
+    const nextErrors: Record<string, string> = {};
+
+    customFieldDefinitions.forEach((field) => {
+      const value = customFieldValues[field.id];
+      const isEmpty = isEmptyCustomFieldValue(field, value);
+
+      if (field.is_required && isEmpty) {
+        nextErrors[field.id] = "Обязательное поле";
+        return;
+      }
+
+      if (isEmpty) {
+        return;
+      }
+
+      if (field.field_type === "number" && Number.isNaN(Number(value))) {
+        nextErrors[field.id] = "Введите число";
+      }
+
+      if (field.field_type === "select") {
+        const options = getFieldOptions(field);
+
+        if (!options.includes(String(value))) {
+          nextErrors[field.id] = "Выберите значение из списка";
+        }
+      }
+    });
+
+    setCustomFieldErrors(nextErrors);
+    return Object.keys(nextErrors).length === 0;
+  }
+
+  function buildCustomValuePayload(field: CustomField, productIdForValues: string) {
+    const value = customFieldValues[field.id];
+
+    return {
+      company_id: DEFAULT_COMPANY_ID,
+      product_id: productIdForValues,
+      custom_field_id: field.id,
+      value_text: field.field_type === "text" || field.field_type === "select" ? String(value ?? "").trim() : null,
+      value_number: field.field_type === "number" ? Number(value) : null,
+      value_boolean: field.field_type === "boolean" ? Boolean(value) : null,
+      value_date: null,
+    };
+  }
+
+  async function saveCustomFieldValues(productIdForValues: string) {
+    for (const field of customFieldDefinitions) {
+      const value = customFieldValues[field.id];
+      const isEmpty = isEmptyCustomFieldValue(field, value);
+
+      if (isEmpty) {
+        const { error } = await supabase
+          .from("product_custom_values")
+          .delete()
+          .eq("company_id", DEFAULT_COMPANY_ID)
+          .eq("product_id", productIdForValues)
+          .eq("custom_field_id", field.id);
+
+        if (error) {
+          console.error(error);
+          return "Не удалось очистить значение пользовательского поля.";
+        }
+
+        continue;
+      }
+
+      const { data: existingValue, error: existingError } = await supabase
+        .from("product_custom_values")
+        .select("id")
+        .eq("company_id", DEFAULT_COMPANY_ID)
+        .eq("product_id", productIdForValues)
+        .eq("custom_field_id", field.id)
+        .maybeSingle();
+
+      if (existingError) {
+        console.error(existingError);
+        return "Не удалось проверить значение пользовательского поля.";
+      }
+
+      const payload = buildCustomValuePayload(field, productIdForValues);
+      const saveResult = existingValue
+        ? await supabase
+            .from("product_custom_values")
+            .update(payload)
+            .eq("id", existingValue.id)
+            .eq("company_id", DEFAULT_COMPANY_ID)
+        : await supabase.from("product_custom_values").insert(payload);
+
+      if (saveResult.error) {
+        console.error(saveResult.error);
+        return "Не удалось сохранить значения пользовательских полей.";
+      }
+    }
+
+    return null;
+  }
+
   async function handleSave() {
     setPageError(null);
+    setCustomFieldErrors({});
 
     if (!form.name.trim()) {
       setPageError("Название товара не должно быть пустым.");
@@ -415,6 +590,11 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
 
     if (!form.sku.trim()) {
       setPageError("SKU не должен быть пустым.");
+      return;
+    }
+
+    if (!validateCustomFields()) {
+      setPageError("Проверьте пользовательские поля.");
       return;
     }
 
@@ -441,22 +621,41 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
       api_visible: visibility.showInApi && !visibility.hidden,
     };
 
-    const result =
+    const productResult =
       isEdit && productId
         ? await supabase
             .from("products")
             .update(payload)
             .eq("id", productId)
             .eq("company_id", DEFAULT_COMPANY_ID)
-        : await supabase.from("products").insert(payload);
+            .select("id")
+            .single()
+        : await supabase.from("products").insert(payload).select("id").single();
 
-    setIsSaving(false);
-
-    if (result.error) {
-      setPageError(result.error.message);
+    if (productResult.error) {
+      console.error(productResult.error);
+      setPageError(productResult.error.message);
+      setIsSaving(false);
       return;
     }
 
+    const savedProductId = productResult.data?.id ?? productId;
+
+    if (!savedProductId) {
+      setPageError("Не удалось определить ID сохраненного товара.");
+      setIsSaving(false);
+      return;
+    }
+
+    const customValuesError = await saveCustomFieldValues(savedProductId);
+
+    if (customValuesError) {
+      setPageError(customValuesError);
+      setIsSaving(false);
+      return;
+    }
+
+    setIsSaving(false);
     router.push("/dashboard/products");
   }
 
@@ -651,41 +850,84 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
         <Card>
           <CardHeader>
             <CardTitle>Дополнительные поля</CardTitle>
-            <CardDescription>Пока отображаются mock-поля, сохранение значений будет следующим этапом.</CardDescription>
+            <CardDescription>Поля загружаются из настроек пользовательских полей.</CardDescription>
           </CardHeader>
           <CardContent className="grid gap-4 md:grid-cols-2">
-            <div className="space-y-2">
-              <FieldLabel htmlFor="assay">Проба</FieldLabel>
-              <Input
-                id="assay"
-                value={customFields.assay}
-                onChange={(event) => updateCustomField("assay", event.target.value)}
-              />
-            </div>
-            <div className="space-y-2">
-              <FieldLabel htmlFor="weight">Вес</FieldLabel>
-              <Input
-                id="weight"
-                value={customFields.weight}
-                onChange={(event) => updateCustomField("weight", event.target.value)}
-              />
-            </div>
-            <div className="space-y-2">
-              <FieldLabel htmlFor="size">Размер</FieldLabel>
-              <Input
-                id="size"
-                value={customFields.size}
-                onChange={(event) => updateCustomField("size", event.target.value)}
-              />
-            </div>
-            <div className="space-y-2">
-              <FieldLabel htmlFor="stone">Камень</FieldLabel>
-              <Input
-                id="stone"
-                value={customFields.stone}
-                onChange={(event) => updateCustomField("stone", event.target.value)}
-              />
-            </div>
+            {isLoading ? (
+              <div className="md:col-span-2">
+                <span className="inline-flex items-center gap-2 text-sm text-muted-foreground">
+                  <Loader2 className="size-4 animate-spin" />
+                  Загрузка пользовательских полей
+                </span>
+              </div>
+            ) : null}
+            {!isLoading && customFieldDefinitions.length === 0 ? (
+              <p className="text-sm text-muted-foreground md:col-span-2">
+                Пользовательские поля пока не настроены.
+              </p>
+            ) : null}
+            {!isLoading
+              ? customFieldDefinitions.map((field) => {
+                  const inputId = getCustomFieldInputId(field);
+                  const error = customFieldErrors[field.id];
+                  const options = getFieldOptions(field);
+                  const value = customFieldValues[field.id];
+                  const shouldShowUnit = Boolean(field.unit) && ["number", "text"].includes(field.field_type);
+
+                  return (
+                    <div key={field.id} className="space-y-2">
+                      <FieldLabel htmlFor={inputId}>
+                        {field.name}
+                        {field.is_required ? <span className="text-red-600"> *</span> : null}
+                      </FieldLabel>
+                      {field.field_type === "text" ? (
+                        <Input
+                          id={inputId}
+                          value={String(value ?? "")}
+                          onChange={(event) => updateCustomField(field.id, event.target.value)}
+                        />
+                      ) : null}
+                      {field.field_type === "number" ? (
+                        <Input
+                          id={inputId}
+                          type="number"
+                          value={String(value ?? "")}
+                          onChange={(event) => updateCustomField(field.id, event.target.value)}
+                        />
+                      ) : null}
+                      {field.field_type === "select" ? (
+                        <select
+                          id={inputId}
+                          className={selectClass}
+                          value={String(value ?? "")}
+                          onChange={(event) => updateCustomField(field.id, event.target.value)}
+                        >
+                          <option value="">Выберите значение</option>
+                          {options.map((option) => (
+                            <option key={option} value={option}>
+                              {option}
+                            </option>
+                          ))}
+                        </select>
+                      ) : null}
+                      {field.field_type === "boolean" ? (
+                        <label className="flex h-10 cursor-pointer items-center gap-2 rounded-md border bg-white px-3 text-sm">
+                          <input
+                            id={inputId}
+                            type="checkbox"
+                            className="size-4 accent-blue-600"
+                            checked={Boolean(value)}
+                            onChange={(event) => updateCustomField(field.id, event.target.checked)}
+                          />
+                          Да
+                        </label>
+                      ) : null}
+                      {shouldShowUnit ? <p className="text-xs text-muted-foreground">Единица: {field.unit}</p> : null}
+                      {error ? <p className="text-xs text-red-600">{error}</p> : null}
+                    </div>
+                  );
+                })
+              : null}
           </CardContent>
         </Card>
       </div>
