@@ -175,7 +175,7 @@ export default function ProductsPage() {
 
     const { error } = await supabase
       .from("products")
-      .update({ status: "hidden", api_visible: false })
+      .update({ status: "hidden", is_visible_in_api: false })
       .eq("id", product.id)
       .eq("company_id", DEFAULT_COMPANY_ID);
 

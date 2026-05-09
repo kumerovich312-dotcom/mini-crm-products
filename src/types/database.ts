@@ -35,7 +35,7 @@ export interface Product {
   status: ProductStatus;
   description: string | null;
   keywords: string[];
-  api_visible: boolean;
+  is_visible_in_api: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -71,7 +71,7 @@ export interface CustomField {
   unit: string | null;
   options: unknown;
   is_required: boolean;
-  api_visible: boolean;
+  is_visible_in_api: boolean;
   sort_order: number;
   created_at: string;
   updated_at: string;

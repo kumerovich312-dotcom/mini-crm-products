@@ -35,7 +35,7 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
       .select("*")
       .eq("company_id", DEFAULT_COMPANY_ID)
       .eq("id", id)
-      .eq("api_visible", true)
+      .eq("is_visible_in_api", true)
       .maybeSingle(),
     supabaseServer.from("categories").select("*").eq("company_id", DEFAULT_COMPANY_ID),
     supabaseServer
@@ -44,7 +44,7 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
       .eq("company_id", DEFAULT_COMPANY_ID)
       .eq("product_id", id)
       .order("sort_order", { ascending: true }),
-    supabaseServer.from("custom_fields").select("*").eq("company_id", DEFAULT_COMPANY_ID).eq("api_visible", true),
+    supabaseServer.from("custom_fields").select("*").eq("company_id", DEFAULT_COMPANY_ID).eq("is_visible_in_api", true),
     supabaseServer.from("product_custom_values").select("*").eq("company_id", DEFAULT_COMPANY_ID).eq("product_id", id),
   ]);
 

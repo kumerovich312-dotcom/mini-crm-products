@@ -381,7 +381,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
         });
         setKeywords(product.keywords);
         setVisibility({
-          showInApi: product.status === "hidden" || product.status === "draft" ? false : product.api_visible,
+          showInApi: product.status === "hidden" || product.status === "draft" ? false : product.is_visible_in_api,
         });
       }
 
@@ -887,7 +887,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
       status: nextStatus,
       description: form.description.trim() || null,
       keywords,
-      api_visible: canShowInApi ? visibility.showInApi : false,
+      is_visible_in_api: canShowInApi ? visibility.showInApi : false,
     };
 
     const productResult =

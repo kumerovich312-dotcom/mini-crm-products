@@ -129,11 +129,11 @@ export async function GET(request: Request) {
       .from("products")
       .select("*")
       .eq("company_id", DEFAULT_COMPANY_ID)
-      .eq("api_visible", true)
+      .eq("is_visible_in_api", true)
       .order("updated_at", { ascending: false }),
     supabaseServer.from("categories").select("*").eq("company_id", DEFAULT_COMPANY_ID),
     supabaseServer.from("product_media").select("*").eq("company_id", DEFAULT_COMPANY_ID).order("sort_order", { ascending: true }),
-    supabaseServer.from("custom_fields").select("*").eq("company_id", DEFAULT_COMPANY_ID).eq("api_visible", true),
+    supabaseServer.from("custom_fields").select("*").eq("company_id", DEFAULT_COMPANY_ID).eq("is_visible_in_api", true),
     supabaseServer.from("product_custom_values").select("*").eq("company_id", DEFAULT_COMPANY_ID),
   ]);
 

@@ -144,7 +144,7 @@ export default function CustomFieldsPage() {
       type: field.field_type,
       unit: field.unit ?? "",
       required: field.is_required,
-      showInApi: field.api_visible,
+      showInApi: field.is_visible_in_api,
       order: String(field.sort_order),
       optionsText: getFieldOptions(field).join("\n"),
     });
@@ -230,7 +230,7 @@ export default function CustomFieldsPage() {
       unit: form.unit.trim() || null,
       options: form.type === "select" ? parseOptions() : [],
       is_required: form.required,
-      api_visible: form.showInApi,
+      is_visible_in_api: form.showInApi,
       sort_order: Number(form.order),
     };
 
@@ -295,7 +295,7 @@ export default function CustomFieldsPage() {
 
     const { error } = await supabase
       .from("custom_fields")
-      .update({ api_visible: !field.api_visible })
+      .update({ is_visible_in_api: !field.is_visible_in_api })
       .eq("id", field.id)
       .eq("company_id", DEFAULT_COMPANY_ID);
 
@@ -403,7 +403,7 @@ export default function CustomFieldsPage() {
                           <td className="px-4 py-3">{fieldTypeLabels[field.field_type]}</td>
                           <td className="px-4 py-3 text-muted-foreground">{field.unit || "—"}</td>
                           <td className="px-4 py-3">{boolBadge(field.is_required, "Да", "Нет")}</td>
-                          <td className="px-4 py-3">{boolBadge(field.api_visible, "Да", "Нет")}</td>
+                          <td className="px-4 py-3">{boolBadge(field.is_visible_in_api, "Да", "Нет")}</td>
                           <td className="px-4 py-3">{field.sort_order}</td>
                           <td className="px-4 py-3">
                             <div className="flex justify-end gap-1">

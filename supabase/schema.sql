@@ -63,7 +63,7 @@ create table public.products (
   status text not null default 'draft',
   description text,
   keywords text[] not null default '{}',
-  api_visible boolean not null default true,
+  is_visible_in_api boolean not null default true,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   constraint products_company_sku_unique unique (company_id, sku),
@@ -103,7 +103,7 @@ create table public.custom_fields (
   unit text,
   options jsonb,
   is_required boolean not null default false,
-  api_visible boolean not null default true,
+  is_visible_in_api boolean not null default true,
   sort_order integer not null default 0,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
@@ -184,7 +184,7 @@ create index categories_company_sort_order_idx on public.categories(company_id, 
 create index products_company_id_idx on public.products(company_id);
 create index products_company_category_id_idx on public.products(company_id, category_id);
 create index products_company_status_idx on public.products(company_id, status);
-create index products_company_api_visible_idx on public.products(company_id, api_visible);
+create index products_company_is_visible_in_api_idx on public.products(company_id, is_visible_in_api);
 create index products_keywords_gin_idx on public.products using gin(keywords);
 create index product_media_company_product_id_idx on public.product_media(company_id, product_id);
 create index custom_fields_company_id_idx on public.custom_fields(company_id);
