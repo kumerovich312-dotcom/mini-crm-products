@@ -121,6 +121,7 @@ export async function GET(request: Request) {
   const categoryId = searchParams.get("category_id")?.trim() ?? "";
   const inStock = searchParams.get("in_stock") === "true";
   const status = searchParams.get("status")?.trim() ?? "";
+  const includeDrafts = searchParams.get("include_drafts") === "true";
   const limit = parseLimit(searchParams.get("limit"));
 
   const [productsResult, categoriesResult, mediaResult, customFieldsResult, customValuesResult] = await Promise.all([
@@ -129,7 +130,6 @@ export async function GET(request: Request) {
       .select("*")
       .eq("company_id", DEFAULT_COMPANY_ID)
       .eq("api_visible", true)
-      .neq("status", "hidden")
       .order("updated_at", { ascending: false }),
     supabaseServer.from("categories").select("*").eq("company_id", DEFAULT_COMPANY_ID),
     supabaseServer.from("product_media").select("*").eq("company_id", DEFAULT_COMPANY_ID).order("sort_order", { ascending: true }),
@@ -161,7 +161,13 @@ export async function GET(request: Request) {
     .filter((product) => !categoryId || product.category_id === categoryId)
     .filter((product) => !category || (product.category_id ? matchingCategoryIds.includes(product.category_id) : false))
     .filter((product) => !inStock || product.stock > 0)
-    .filter((product) => !status || (status !== "hidden" && product.status === status))
+    .filter((product) => {
+      if (status) {
+        return status !== "hidden" && (status !== "draft" || includeDrafts) && product.status === status;
+      }
+
+      return product.status === "active" || (includeDrafts && product.status === "draft");
+    })
     .filter((product) => {
       if (!query) {
         return true;

@@ -72,8 +72,6 @@ type CustomFieldValuesState = Record<string, CustomFieldValue>;
 
 type VisibilityState = {
   showInApi: boolean;
-  hidden: boolean;
-  draft: boolean;
 };
 
 const statusView: Record<MediaStatus, { label: string; className: string; icon: LucideIcon }> = {
@@ -168,15 +166,22 @@ function ToggleRow({
   title,
   description,
   checked,
+  disabled = false,
   onChange,
 }: {
   title: string;
   description: string;
   checked: boolean;
+  disabled?: boolean;
   onChange: (checked: boolean) => void;
 }) {
   return (
-    <label className="flex cursor-pointer items-start justify-between gap-4 rounded-lg border bg-white p-4">
+    <label
+      className={cn(
+        "flex cursor-pointer items-start justify-between gap-4 rounded-lg border bg-white p-4",
+        disabled && "cursor-not-allowed bg-slate-50 text-muted-foreground opacity-70",
+      )}
+    >
       <span>
         <span className="block text-sm font-medium">{title}</span>
         <span className="mt-1 block text-sm text-muted-foreground">{description}</span>
@@ -184,6 +189,7 @@ function ToggleRow({
       <input
         checked={checked}
         className="mt-1 size-4 accent-blue-600"
+        disabled={disabled}
         type="checkbox"
         onChange={(event) => onChange(event.target.checked)}
       />
@@ -268,9 +274,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
     description: "",
   });
   const [visibility, setVisibility] = useState<VisibilityState>({
-    showInApi: true,
-    hidden: false,
-    draft: !isEdit,
+    showInApi: isEdit,
   });
 
   const buildUniqueSku = useCallback(
@@ -377,9 +381,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
         });
         setKeywords(product.keywords);
         setVisibility({
-          showInApi: product.api_visible,
-          hidden: product.status === "hidden",
-          draft: product.status === "draft",
+          showInApi: product.status === "hidden" || product.status === "draft" ? false : product.api_visible,
         });
       }
 
@@ -455,6 +457,14 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
 
   function updateForm(field: keyof ProductFormState, value: string) {
     setForm((current) => ({ ...current, [field]: value }));
+
+    if (field === "status") {
+      const nextStatus = value as ProductStatus;
+
+      setVisibility((current) => ({
+        showInApi: nextStatus === "hidden" || nextStatus === "draft" ? false : current.showInApi,
+      }));
+    }
   }
 
   function updateCustomField(fieldId: string, value: CustomFieldValue) {
@@ -462,8 +472,29 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
     setCustomFieldErrors((current) => ({ ...current, [fieldId]: "" }));
   }
 
-  function updateVisibility(field: keyof VisibilityState, value: boolean) {
-    setVisibility((current) => ({ ...current, [field]: value }));
+  function updateVisibility(field: keyof VisibilityState | "hidden" | "draft", value: boolean) {
+    if (field === "hidden") {
+      setVisibility((current) => ({
+        showInApi: value ? false : current.showInApi,
+      }));
+      setForm((current) => ({ ...current, status: value ? "hidden" : "active" }));
+      return;
+    }
+
+    if (field === "draft") {
+      setVisibility((current) => ({
+        showInApi: value ? false : current.showInApi,
+      }));
+      setForm((current) => ({ ...current, status: value ? "draft" : "active" }));
+      return;
+    }
+
+    if (form.status === "hidden" || form.status === "draft") {
+      setVisibility((current) => ({ ...current, showInApi: false }));
+      return;
+    }
+
+    setVisibility((current) => ({ ...current, showInApi: value }));
   }
 
   function addKeyword() {
@@ -844,7 +875,8 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
 
     setIsSaving(true);
 
-    const nextStatus: ProductStatus = visibility.draft ? "draft" : visibility.hidden ? "hidden" : form.status;
+    const nextStatus = form.status;
+    const canShowInApi = nextStatus === "active" || nextStatus === "out_of_stock";
     const payload = {
       company_id: DEFAULT_COMPANY_ID,
       category_id: form.categoryId,
@@ -855,7 +887,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
       status: nextStatus,
       description: form.description.trim() || null,
       keywords,
-      api_visible: visibility.showInApi && !visibility.hidden,
+      api_visible: canShowInApi ? visibility.showInApi : false,
     };
 
     const productResult =
@@ -1226,20 +1258,25 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
           <CardContent className="space-y-3">
             <ToggleRow
               title="Показывать в API"
-              description="Товар доступен внешнему AI-боту через read-only API."
-              checked={visibility.showInApi}
+              description={
+                form.status === "hidden" || form.status === "draft"
+                  ? "Доступно только для активных товаров и товаров без остатка."
+                  : "Товар доступен внешнему AI-боту через read-only API."
+              }
+              checked={visibility.showInApi && form.status !== "hidden" && form.status !== "draft"}
+              disabled={form.status === "hidden" || form.status === "draft"}
               onChange={(checked) => updateVisibility("showInApi", checked)}
             />
             <ToggleRow
               title="Скрыть товар"
-              description="Товар не показывается в публичной выдаче."
-              checked={visibility.hidden}
+              description="Скрытый товар не доступен в каталоге и API."
+              checked={form.status === "hidden"}
               onChange={(checked) => updateVisibility("hidden", checked)}
             />
             <ToggleRow
               title="Черновик"
-              description="Карточка сохранена, но еще не готова к публикации."
-              checked={visibility.draft}
+              description="Черновик не доступен в API до публикации."
+              checked={form.status === "draft"}
               onChange={(checked) => updateVisibility("draft", checked)}
             />
           </CardContent>
