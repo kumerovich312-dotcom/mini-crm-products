@@ -28,9 +28,18 @@ import { Textarea } from "@/components/ui/textarea";
 import { DEFAULT_COMPANY_ID } from "@/lib/constants";
 import { supabase } from "@/lib/supabase/client";
 import { cn } from "@/lib/utils";
-import type { Category, CustomField, Product, ProductCustomValue, ProductStatus } from "@/types/database";
+import type { Category, CustomField, Product, ProductCustomValue, ProductMedia, ProductStatus } from "@/types/database";
 
 const FALLBACK_COMPANY_PREFIX = "JWL";
+const MEDIA_BUCKET = "product-media";
+const MAX_PHOTO_SIZE = 20 * 1024 * 1024;
+const MAX_VIDEO_SIZE = 300 * 1024 * 1024;
+const MAX_PHOTOS = 10;
+const MAX_VIDEOS = 3;
+const PHOTO_MIME_TYPES = ["image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"];
+const VIDEO_MIME_TYPES = ["video/mp4", "video/quicktime"];
+const PHOTO_EXTENSIONS = [".jpg", ".jpeg", ".png", ".webp", ".heic"];
+const VIDEO_EXTENSIONS = [".mp4", ".mov"];
 
 type ProductFormMode = "new" | "edit";
 type MediaStatus = "uploaded" | "processing" | "ready" | "failed";
@@ -42,7 +51,10 @@ type MediaItem = {
   type: MediaType;
   size: string;
   status: MediaStatus;
+  source: "existing" | "pending";
+  file?: File;
   previewUrl?: string;
+  originalUrl?: string;
 };
 
 type ProductFormState = {
@@ -96,6 +108,46 @@ function formatFileSize(size: number) {
   }
 
   return `${(size / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function getFileExtension(fileName: string) {
+  const dotIndex = fileName.lastIndexOf(".");
+
+  return dotIndex === -1 ? "" : fileName.slice(dotIndex).toLowerCase();
+}
+
+function sanitizeFileName(fileName: string) {
+  const normalized = fileName.trim().replace(/\s+/g, "-");
+
+  return normalized.replace(/[^a-zA-Z0-9._-]/g, "-");
+}
+
+function isSupportedFile(file: File, type: MediaType) {
+  const extension = getFileExtension(file.name);
+
+  if (type === "photo") {
+    return PHOTO_MIME_TYPES.includes(file.type) || PHOTO_EXTENSIONS.includes(extension);
+  }
+
+  return VIDEO_MIME_TYPES.includes(file.type) || VIDEO_EXTENSIONS.includes(extension);
+}
+
+function getFileLimitError(file: File, type: MediaType) {
+  if (!isSupportedFile(file, type)) {
+    return type === "photo"
+      ? "Формат фото не поддерживается. Разрешены jpg, jpeg, png, webp, heic."
+      : "Формат видео не поддерживается. Разрешены mp4 и mov.";
+  }
+
+  if (type === "photo" && file.size > MAX_PHOTO_SIZE) {
+    return "Фото слишком большое. Максимальный размер фото — 20 MB.";
+  }
+
+  if (type === "video" && file.size > MAX_VIDEO_SIZE) {
+    return "Видео слишком большое. Максимальный размер видео — 300 MB.";
+  }
+
+  return null;
 }
 
 function generateProductCode(length = 4) {
@@ -171,6 +223,24 @@ function getProductCustomValue(field: CustomField, row: ProductCustomValue): Cus
   return row.value_text ?? "";
 }
 
+function mapProductMedia(row: ProductMedia): MediaItem {
+  const mediaType = row.media_type ?? row.type ?? "photo";
+  const mediaUrl = row.processed_url ?? row.optimized_url ?? row.original_url;
+  const mediaSize = row.file_size_bytes ?? row.original_size;
+  const mediaStatus = row.status ?? row.processing_status ?? "ready";
+
+  return {
+    id: row.id,
+    name: row.file_name ?? "media",
+    type: mediaType,
+    size: mediaSize ? formatFileSize(mediaSize) : "unknown",
+    status: mediaStatus,
+    source: "existing",
+    previewUrl: row.thumbnail_url ?? mediaUrl,
+    originalUrl: row.original_url,
+  };
+}
+
 export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; productId?: string }) {
   const router = useRouter();
   const isEdit = mode === "edit";
@@ -187,22 +257,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
   const [customFieldDefinitions, setCustomFieldDefinitions] = useState<CustomField[]>([]);
   const [customFieldValues, setCustomFieldValues] = useState<CustomFieldValuesState>({});
   const [customFieldErrors, setCustomFieldErrors] = useState<Record<string, string>>({});
-  const [media, setMedia] = useState<MediaItem[]>([
-    {
-      id: "mock-photo",
-      name: "media-placeholder.webp",
-      type: "photo",
-      size: "placeholder",
-      status: "ready",
-    },
-    {
-      id: "mock-video",
-      name: "video-placeholder.mp4",
-      type: "video",
-      size: "placeholder",
-      status: "uploaded",
-    },
-  ]);
+  const [media, setMedia] = useState<MediaItem[]>([]);
   const [form, setForm] = useState<ProductFormState>({
     name: "",
     sku: "",
@@ -353,6 +408,22 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
 
         setCustomFieldValues(nextValues);
       }
+
+      const { data: mediaData, error: mediaError } = await supabase
+        .from("product_media")
+        .select("*")
+        .eq("company_id", DEFAULT_COMPANY_ID)
+        .eq("product_id", productId)
+        .order("sort_order", { ascending: true });
+
+      if (mediaError) {
+        console.error(mediaError);
+        setPageError("Не удалось загрузить медиа товара.");
+      }
+
+      if (mediaData) {
+        setMedia(((mediaData ?? []) as ProductMedia[]).map(mapProductMedia));
+      }
     }
 
     if (!isEdit && nextCategories[0]) {
@@ -410,12 +481,125 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
     setKeywords((current) => current.filter((item) => item !== keyword));
   }
 
-  function addFiles(files: FileList | null, type: MediaType) {
+  function getMediaCount(type: MediaType) {
+    return media.filter((item) => item.type === type).length;
+  }
+
+  async function uploadMediaFile(file: File, type: MediaType, productIdForMedia: string, sortOrder: number) {
+    const filePath = `${DEFAULT_COMPANY_ID}/${productIdForMedia}/${Date.now()}-${sanitizeFileName(file.name)}`;
+    const { error: uploadError } = await supabase.storage.from(MEDIA_BUCKET).upload(filePath, file, {
+      contentType: file.type || undefined,
+      upsert: false,
+    });
+
+    if (uploadError) {
+      console.error(uploadError);
+      return { error: "Не удалось загрузить файл в Supabase Storage." };
+    }
+
+    const { data: publicUrlData } = supabase.storage.from(MEDIA_BUCKET).getPublicUrl(filePath);
+    const originalUrl = publicUrlData.publicUrl;
+
+    const mediaPayload = {
+      company_id: DEFAULT_COMPANY_ID,
+      product_id: productIdForMedia,
+      media_type: type,
+      type,
+      original_url: originalUrl,
+      processed_url: originalUrl,
+      optimized_url: originalUrl,
+      thumbnail_url: type === "photo" ? originalUrl : null,
+      file_name: file.name,
+      mime_type: file.type || null,
+      file_size_bytes: file.size,
+      original_size: file.size,
+      optimized_size: file.size,
+      status: "ready",
+      processing_status: "ready",
+      sort_order: sortOrder,
+    };
+
+    const { data, error: insertError } = await supabase
+      .from("product_media")
+      .insert(mediaPayload)
+      .select("*")
+      .single();
+
+    if (insertError) {
+      console.error("product_media insert error", {
+        message: insertError.message,
+        details: insertError.details,
+        hint: insertError.hint,
+        code: insertError.code,
+      });
+      return { error: insertError.message || "Не удалось сохранить запись медиа" };
+    }
+
+    return { media: mapProductMedia(data as ProductMedia) };
+  }
+
+  async function uploadPendingMedia(productIdForMedia: string) {
+    const pendingMedia = media.filter((item) => item.source === "pending" && item.file);
+
+    for (let index = 0; index < pendingMedia.length; index += 1) {
+      const item = pendingMedia[index];
+
+      if (!item.file) {
+        continue;
+      }
+
+      setMedia((current) =>
+        current.map((mediaItem) => (mediaItem.id === item.id ? { ...mediaItem, status: "processing" } : mediaItem)),
+      );
+
+      const result = await uploadMediaFile(item.file, item.type, productIdForMedia, index);
+
+      if (result.error) {
+        setMedia((current) =>
+          current.map((mediaItem) => (mediaItem.id === item.id ? { ...mediaItem, status: "failed" } : mediaItem)),
+        );
+        return result.error;
+      }
+
+      if (item.previewUrl) {
+        URL.revokeObjectURL(item.previewUrl);
+        previewUrlsRef.current.delete(item.previewUrl);
+      }
+
+      if (result.media) {
+        setMedia((current) => current.map((mediaItem) => (mediaItem.id === item.id ? result.media : mediaItem)));
+      }
+    }
+
+    return null;
+  }
+
+  async function addFiles(files: FileList | null, type: MediaType) {
     if (!files?.length) {
       return;
     }
 
-    const nextMedia = Array.from(files).map((file) => {
+    setPageError(null);
+
+    const selectedFiles = Array.from(files);
+    const limit = type === "photo" ? MAX_PHOTOS : MAX_VIDEOS;
+    const currentCount = getMediaCount(type);
+
+    if (currentCount + selectedFiles.length > limit) {
+      setPageError(type === "photo" ? "Можно загрузить не больше 10 фото." : "Можно загрузить не больше 3 видео.");
+      return;
+    }
+
+    for (const file of selectedFiles) {
+      const error = getFileLimitError(file, type);
+
+      if (error) {
+        setPageError(error);
+        return;
+      }
+    }
+
+    const nextMedia = selectedFiles.map((file) => {
       const previewUrl = type === "photo" ? URL.createObjectURL(file) : undefined;
 
       if (previewUrl) {
@@ -428,14 +612,67 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
         type,
         size: formatFileSize(file.size),
         status: "uploaded" as const,
+        source: "pending" as const,
+        file,
         previewUrl,
       };
     });
 
     setMedia((current) => [...nextMedia, ...current]);
+
+    if (isEdit && productId) {
+      for (let index = 0; index < nextMedia.length; index += 1) {
+        const item = nextMedia[index];
+
+        setMedia((current) =>
+          current.map((mediaItem) => (mediaItem.id === item.id ? { ...mediaItem, status: "processing" } : mediaItem)),
+        );
+
+        const result = await uploadMediaFile(item.file, item.type, productId, currentCount + index);
+
+        if (result.error) {
+          setPageError(result.error);
+          setMedia((current) =>
+            current.map((mediaItem) => (mediaItem.id === item.id ? { ...mediaItem, status: "failed" } : mediaItem)),
+          );
+          return;
+        }
+
+        if (item.previewUrl) {
+          URL.revokeObjectURL(item.previewUrl);
+          previewUrlsRef.current.delete(item.previewUrl);
+        }
+
+        if (result.media) {
+          setMedia((current) => current.map((mediaItem) => (mediaItem.id === item.id ? result.media : mediaItem)));
+        }
+      }
+    }
   }
 
-  function removeMedia(id: string) {
+  async function removeMedia(id: string) {
+    const itemToRemove = media.find((mediaItem) => mediaItem.id === id);
+
+    if (!itemToRemove) {
+      return;
+    }
+
+    if (itemToRemove.source === "existing") {
+      setPageError(null);
+
+      const { error } = await supabase
+        .from("product_media")
+        .delete()
+        .eq("id", id)
+        .eq("company_id", DEFAULT_COMPANY_ID);
+
+      if (error) {
+        console.error(error);
+        setPageError("Не удалось удалить медиа.");
+        return;
+      }
+    }
+
     setMedia((current) => {
       const item = current.find((mediaItem) => mediaItem.id === id);
 
@@ -655,6 +892,14 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
       return;
     }
 
+    const mediaError = await uploadPendingMedia(savedProductId);
+
+    if (mediaError) {
+      setPageError(mediaError);
+      setIsSaving(false);
+      return;
+    }
+
     setIsSaving(false);
     router.push("/dashboard/products");
   }
@@ -671,17 +916,17 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
         <Card>
           <CardHeader>
             <CardTitle>Фото и видео</CardTitle>
-            <CardDescription>Медиа пока остаются локальными placeholder-карточками без upload.</CardDescription>
+            <CardDescription>Файлы загружаются в Supabase Storage после сохранения товара.</CardDescription>
           </CardHeader>
           <CardContent className="space-y-5">
             <input
               ref={photoInputRef}
               className="hidden"
               type="file"
-              accept="image/jpeg,image/png,image/heic,image/webp"
+              accept="image/jpeg,image/png,image/webp,image/heic,image/heif,.jpg,.jpeg,.png,.webp,.heic"
               multiple
               onChange={(event) => {
-                addFiles(event.target.files, "photo");
+                void addFiles(event.target.files, "photo");
                 event.target.value = "";
               }}
             />
@@ -689,10 +934,10 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
               ref={videoInputRef}
               className="hidden"
               type="file"
-              accept="video/mp4,video/quicktime"
+              accept="video/mp4,video/quicktime,.mp4,.mov"
               multiple
               onChange={(event) => {
-                addFiles(event.target.files, "video");
+                void addFiles(event.target.files, "video");
                 event.target.value = "";
               }}
             />
@@ -703,7 +948,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
               </div>
               <h3 className="mt-4 text-sm font-semibold">Перетащите фото или видео сюда</h3>
               <p className="mt-1 text-sm text-muted-foreground">
-                Файлы показываются локально. Реальное хранение медиа будет подключено позже.
+                Фото до 20 MB, видео до 300 MB. До 10 фото и до 3 видео на товар.
               </p>
               <div className="mt-4 flex flex-wrap justify-center gap-2">
                 <Button type="button" onClick={() => photoInputRef.current?.click()}>
@@ -746,7 +991,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
                           variant="ghost"
                           size="icon"
                           aria-label="Удалить медиа"
-                          onClick={() => removeMedia(item.id)}
+                          onClick={() => void removeMedia(item.id)}
                         >
                           <Trash2 />
                         </Button>

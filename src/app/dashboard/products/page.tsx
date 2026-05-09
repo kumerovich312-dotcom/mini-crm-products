@@ -11,6 +11,7 @@ import {
   ImageIcon,
   Loader2,
   PackageOpen,
+  Play,
   Plus,
   RotateCcw,
   Search,
@@ -24,11 +25,10 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { DEFAULT_COMPANY_ID } from "@/lib/constants";
 import { supabase } from "@/lib/supabase/client";
 import { cn } from "@/lib/utils";
-import type { Category, Product, ProductStatus } from "@/types/database";
-
-const DEFAULT_COMPANY_ID = "718f1a81-3a75-4484-901a-6054936be72c";
+import type { Category, Product, ProductMedia, ProductStatus } from "@/types/database";
 
 const statusMap: Record<ProductStatus, { label: string; className: string }> = {
   active: {
@@ -71,6 +71,7 @@ function formatDate(value: string) {
 export default function ProductsPage() {
   const [products, setProducts] = useState<Product[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
+  const [mediaByProductId, setMediaByProductId] = useState<Map<string, ProductMedia[]>>(new Map());
   const [isLoading, setIsLoading] = useState(true);
   const [pageError, setPageError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
@@ -103,8 +104,38 @@ export default function ProductsPage() {
       setPageError(categoriesResult.error.message);
     }
 
-    setProducts(((productsResult.data ?? []) as Product[]) ?? []);
+    const nextProducts = ((productsResult.data ?? []) as Product[]) ?? [];
+    setProducts(nextProducts);
     setCategories(((categoriesResult.data ?? []) as Category[]) ?? []);
+
+    if (nextProducts.length > 0) {
+      const { data: mediaData, error: mediaError } = await supabase
+        .from("product_media")
+        .select("*")
+        .eq("company_id", DEFAULT_COMPANY_ID)
+        .in(
+          "product_id",
+          nextProducts.map((product) => product.id),
+        )
+        .order("sort_order", { ascending: true });
+
+      if (mediaError) {
+        setPageError(mediaError.message);
+      }
+
+      const nextMediaByProductId = new Map<string, ProductMedia[]>();
+
+      ((mediaData ?? []) as ProductMedia[]).forEach((mediaItem) => {
+        const productMedia = nextMediaByProductId.get(mediaItem.product_id) ?? [];
+        productMedia.push(mediaItem);
+        nextMediaByProductId.set(mediaItem.product_id, productMedia);
+      });
+
+      setMediaByProductId(nextMediaByProductId);
+    } else {
+      setMediaByProductId(new Map());
+    }
+
     setIsLoading(false);
   }, []);
 
@@ -312,17 +343,35 @@ export default function ProductsPage() {
                   {!isLoading
                     ? filteredProducts.map((product) => {
                         const statusView = statusMap[product.status];
+                        const productMedia = mediaByProductId.get(product.id) ?? [];
+                        const firstPhoto = productMedia.find((item) => (item.media_type ?? item.type) === "photo");
+                        const firstPhotoUrl =
+                          firstPhoto?.thumbnail_url ??
+                          firstPhoto?.processed_url ??
+                          firstPhoto?.optimized_url ??
+                          firstPhoto?.original_url;
+                        const hasVideo = productMedia.some((item) => (item.media_type ?? item.type) === "video");
 
                         return (
                           <tr key={product.id} className="border-t align-middle hover:bg-slate-50/70">
                             <td className="px-4 py-3">
-                              <div className="flex size-12 items-center justify-center rounded-md bg-blue-50 text-blue-700">
-                                <ImageIcon className="size-5" />
+                              <div className="flex size-12 items-center justify-center overflow-hidden rounded-md bg-blue-50 text-blue-700">
+                                {firstPhotoUrl ? (
+                                  // eslint-disable-next-line @next/next/no-img-element
+                                  <img alt={product.name} className="size-full object-cover" src={firstPhotoUrl} />
+                                ) : (
+                                  <ImageIcon className="size-5" />
+                                )}
                               </div>
                             </td>
                             <td className="px-4 py-3">
-                              <div className="flex size-9 items-center justify-center rounded-md bg-slate-100 text-muted-foreground">
-                                <VideoOff className="size-4" />
+                              <div
+                                className={cn(
+                                  "flex size-9 items-center justify-center rounded-md",
+                                  hasVideo ? "bg-blue-50 text-blue-700" : "bg-slate-100 text-muted-foreground",
+                                )}
+                              >
+                                {hasVideo ? <Play className="size-4" /> : <VideoOff className="size-4" />}
                               </div>
                             </td>
                             <td className="px-4 py-3 font-mono text-xs text-muted-foreground">{product.sku}</td>
