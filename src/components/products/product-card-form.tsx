@@ -1,7 +1,8 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 import type { LucideIcon } from "lucide-react";
 import {
   CheckCircle2,
@@ -11,6 +12,7 @@ import {
   Loader2,
   Play,
   Plus,
+  RefreshCw,
   Save,
   Trash2,
   UploadCloud,
@@ -23,7 +25,12 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
+import { supabase } from "@/lib/supabase/client";
 import { cn } from "@/lib/utils";
+import type { Category, Product, ProductStatus } from "@/types/database";
+
+const DEFAULT_COMPANY_ID = "718f1a81-3a75-4484-901a-6054936be72c";
+const FALLBACK_COMPANY_PREFIX = "JWL";
 
 type ProductFormMode = "new" | "edit";
 type MediaStatus = "uploaded" | "processing" | "ready" | "failed";
@@ -41,10 +48,10 @@ type MediaItem = {
 type ProductFormState = {
   name: string;
   sku: string;
-  category: string;
+  categoryId: string;
   price: string;
   stock: string;
-  status: string;
+  status: ProductStatus;
   description: string;
 };
 
@@ -95,6 +102,12 @@ function formatFileSize(size: number) {
   return `${(size / 1024 / 1024).toFixed(1)} MB`;
 }
 
+function generateProductCode(length = 4) {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+  return Array.from({ length }, () => alphabet[Math.floor(Math.random() * alphabet.length)]).join("");
+}
+
 function FieldLabel({ children, htmlFor }: { children: React.ReactNode; htmlFor?: string }) {
   return (
     <label className="text-sm font-medium text-foreground" htmlFor={htmlFor}>
@@ -130,44 +143,43 @@ function ToggleRow({
   );
 }
 
-export function ProductCardForm({ mode }: { mode: ProductFormMode }) {
+export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; productId?: string }) {
+  const router = useRouter();
   const isEdit = mode === "edit";
   const photoInputRef = useRef<HTMLInputElement>(null);
   const videoInputRef = useRef<HTMLInputElement>(null);
   const previewUrlsRef = useRef<Set<string>>(new Set());
+  const [categories, setCategories] = useState<Category[]>([]);
+  const [companyPrefix, setCompanyPrefix] = useState(FALLBACK_COMPANY_PREFIX);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isSaving, setIsSaving] = useState(false);
+  const [pageError, setPageError] = useState<string | null>(null);
   const [keywordInput, setKeywordInput] = useState("");
-  const [keywords, setKeywords] = useState([
-    "кольцо",
-    "золотое кольцо",
-    "кольцо 585",
-    "подарок девушке",
-  ]);
+  const [keywords, setKeywords] = useState(["кольцо", "золотое кольцо", "кольцо 585", "подарок девушке"]);
   const [media, setMedia] = useState<MediaItem[]>([
     {
       id: "mock-photo",
-      name: "front-view.jpg",
+      name: "media-placeholder.webp",
       type: "photo",
-      size: "1.8 MB",
+      size: "placeholder",
       status: "ready",
     },
     {
       id: "mock-video",
-      name: "product-video.mov",
+      name: "video-placeholder.mp4",
       type: "video",
-      size: "18.6 MB",
+      size: "placeholder",
       status: "uploaded",
     },
   ]);
   const [form, setForm] = useState<ProductFormState>({
-    name: isEdit ? "Кольцо Classic" : "",
-    sku: isEdit ? "JWL-002-B8M2" : "JWL-001-A7K9",
-    category: "jewelry",
-    price: isEdit ? "31500" : "",
-    stock: isEdit ? "3" : "",
+    name: "",
+    sku: "",
+    categoryId: "",
+    price: "",
+    stock: "0",
     status: isEdit ? "active" : "draft",
-    description: isEdit
-      ? "Аккуратное золотое кольцо 585 пробы для повседневного образа и подарка."
-      : "",
+    description: "",
   });
   const [customFields, setCustomFields] = useState<CustomFieldsState>({
     assay: "585",
@@ -180,6 +192,112 @@ export function ProductCardForm({ mode }: { mode: ProductFormMode }) {
     hidden: false,
     draft: !isEdit,
   });
+
+  const buildUniqueSku = useCallback(
+    async (categoryId: string, prefix = companyPrefix) => {
+      const category = categories.find((item) => item.id === categoryId);
+
+      if (!category) {
+        return "";
+      }
+
+      for (let attempt = 0; attempt < 10; attempt += 1) {
+        const candidate = `${prefix}-${category.code}-${generateProductCode(4)}`;
+        const query = supabase
+          .from("products")
+          .select("id")
+          .eq("company_id", DEFAULT_COMPANY_ID)
+          .eq("sku", candidate);
+
+        const { data, error } = productId ? await query.neq("id", productId) : await query;
+
+        if (!error && (!data || data.length === 0)) {
+          return candidate;
+        }
+      }
+
+      return `${prefix}-${category.code}-${generateProductCode(4)}`;
+    },
+    [categories, companyPrefix, productId],
+  );
+
+  const loadData = useCallback(async () => {
+    setIsLoading(true);
+    setPageError(null);
+
+    const [companyResult, categoriesResult] = await Promise.all([
+      supabase.from("companies").select("sku_prefix").eq("id", DEFAULT_COMPANY_ID).maybeSingle(),
+      supabase
+        .from("categories")
+        .select("*")
+        .eq("company_id", DEFAULT_COMPANY_ID)
+        .order("sort_order", { ascending: true }),
+    ]);
+
+    const nextPrefix = companyResult.data?.sku_prefix ?? FALLBACK_COMPANY_PREFIX;
+    const nextCategories = ((categoriesResult.data ?? []) as Category[]) ?? [];
+
+    if (companyResult.error) {
+      setPageError(companyResult.error.message);
+    }
+
+    if (categoriesResult.error) {
+      setPageError(categoriesResult.error.message);
+    }
+
+    setCompanyPrefix(nextPrefix);
+    setCategories(nextCategories);
+
+    if (isEdit && productId) {
+      const { data, error } = await supabase
+        .from("products")
+        .select("*")
+        .eq("company_id", DEFAULT_COMPANY_ID)
+        .eq("id", productId)
+        .maybeSingle();
+
+      if (error) {
+        setPageError(error.message);
+      }
+
+      if (data) {
+        const product = data as Product;
+
+        setForm({
+          name: product.name,
+          sku: product.sku,
+          categoryId: product.category_id ?? "",
+          price: String(product.price),
+          stock: String(product.stock),
+          status: product.status,
+          description: product.description ?? "",
+        });
+        setKeywords(product.keywords);
+        setVisibility({
+          showInApi: product.api_visible,
+          hidden: product.status === "hidden",
+          draft: product.status === "draft",
+        });
+      }
+    }
+
+    if (!isEdit && nextCategories[0]) {
+      const category = nextCategories[0];
+      const candidate = `${nextPrefix}-${category.code}-${generateProductCode(4)}`;
+
+      setForm((current) => ({
+        ...current,
+        categoryId: category.id,
+        sku: current.sku || candidate,
+      }));
+    }
+
+    setIsLoading(false);
+  }, [isEdit, productId]);
+
+  useEffect(() => {
+    void loadData();
+  }, [loadData]);
 
   useEffect(() => {
     const previewUrls = previewUrlsRef.current;
@@ -255,17 +373,106 @@ export function ProductCardForm({ mode }: { mode: ProductFormMode }) {
     });
   }
 
-  function handleSave() {
-    alert("Товар сохранён локально. Подключение к базе будет позже.");
+  async function regenerateSku() {
+    if (!form.categoryId) {
+      setPageError("Выберите категорию для генерации артикула.");
+      return;
+    }
+
+    const nextSku = await buildUniqueSku(form.categoryId);
+    setForm((current) => ({ ...current, sku: nextSku }));
+  }
+
+  async function validateSkuUnique() {
+    const query = supabase
+      .from("products")
+      .select("id")
+      .eq("company_id", DEFAULT_COMPANY_ID)
+      .eq("sku", form.sku.trim());
+
+    const { data, error } = productId ? await query.neq("id", productId) : await query;
+
+    if (error) {
+      setPageError(error.message);
+      return false;
+    }
+
+    return !data || data.length === 0;
+  }
+
+  async function handleSave() {
+    setPageError(null);
+
+    if (!form.name.trim()) {
+      setPageError("Название товара не должно быть пустым.");
+      return;
+    }
+
+    if (!form.categoryId) {
+      setPageError("Выберите категорию товара.");
+      return;
+    }
+
+    if (!form.sku.trim()) {
+      setPageError("SKU не должен быть пустым.");
+      return;
+    }
+
+    const isSkuUnique = await validateSkuUnique();
+
+    if (!isSkuUnique) {
+      setPageError("SKU уже используется внутри компании.");
+      return;
+    }
+
+    setIsSaving(true);
+
+    const nextStatus: ProductStatus = visibility.draft ? "draft" : visibility.hidden ? "hidden" : form.status;
+    const payload = {
+      company_id: DEFAULT_COMPANY_ID,
+      category_id: form.categoryId,
+      name: form.name.trim(),
+      sku: form.sku.trim().toUpperCase(),
+      price: Number(form.price) || 0,
+      stock: Number(form.stock) || 0,
+      status: nextStatus,
+      description: form.description.trim() || null,
+      keywords,
+      api_visible: visibility.showInApi && !visibility.hidden,
+    };
+
+    const result =
+      isEdit && productId
+        ? await supabase
+            .from("products")
+            .update(payload)
+            .eq("id", productId)
+            .eq("company_id", DEFAULT_COMPANY_ID)
+        : await supabase.from("products").insert(payload);
+
+    setIsSaving(false);
+
+    if (result.error) {
+      setPageError(result.error.message);
+      return;
+    }
+
+    router.push("/dashboard/products");
   }
 
   return (
     <div className="grid gap-6 xl:grid-cols-[1fr_360px]">
       <div className="space-y-6">
+        {pageError ? (
+          <Card className="border-red-100 bg-red-50">
+            <CardContent className="p-5 text-sm text-red-700">{pageError}</CardContent>
+          </Card>
+        ) : null}
+
         <Card>
           <CardHeader>
             <CardTitle>Фото и видео</CardTitle>
-            <CardDescription>Локальная mock-загрузка без отправки файлов на сервер.</CardDescription>
+            <CardDescription>Медиа пока остаются локальными placeholder-карточками без upload.</CardDescription>
           </CardHeader>
           <CardContent className="space-y-5">
             <input
@@ -297,7 +504,7 @@ export function ProductCardForm({ mode }: { mode: ProductFormMode }) {
               </div>
               <h3 className="mt-4 text-sm font-semibold">Перетащите фото или видео сюда</h3>
               <p className="mt-1 text-sm text-muted-foreground">
-                JPG, PNG, HEIC, WebP, MP4, MOV. Реальная обработка медиа будет подключена позже.
+                Файлы показываются локально. Реальное хранение медиа будет подключено позже.
               </p>
               <div className="mt-4 flex flex-wrap justify-center gap-2">
                 <Button type="button" onClick={() => photoInputRef.current?.click()}>
@@ -332,7 +539,7 @@ export function ProductCardForm({ mode }: { mode: ProductFormMode }) {
                         <div className="min-w-0">
                           <p className="truncate text-sm font-medium">{item.name}</p>
                           <p className="mt-1 text-xs text-muted-foreground">
-                            {item.type === "photo" ? "photo" : "video"} · {item.size}
+                            {item.type} · {item.size}
                           </p>
                         </div>
                         <Button
@@ -374,19 +581,27 @@ export function ProductCardForm({ mode }: { mode: ProductFormMode }) {
             </div>
             <div className="space-y-2">
               <FieldLabel htmlFor="sku">SKU / Артикул</FieldLabel>
-              <Input id="sku" value={form.sku} onChange={(event) => updateForm("sku", event.target.value)} />
+              <div className="flex gap-2">
+                <Input id="sku" value={form.sku} onChange={(event) => updateForm("sku", event.target.value)} />
+                <Button type="button" variant="outline" size="icon" onClick={() => void regenerateSku()}>
+                  <RefreshCw />
+                </Button>
+              </div>
             </div>
             <div className="space-y-2">
               <FieldLabel htmlFor="category">Категория</FieldLabel>
               <select
                 className={selectClass}
                 id="category"
-                value={form.category}
-                onChange={(event) => updateForm("category", event.target.value)}
+                value={form.categoryId}
+                onChange={(event) => updateForm("categoryId", event.target.value)}
               >
-                <option value="jewelry">Ювелирка</option>
-                <option value="tech">Техника</option>
-                <option value="accessories">Аксессуары</option>
+                <option value="">Выберите категорию</option>
+                {categories.map((category) => (
+                  <option key={category.id} value={category.id}>
+                    {category.name} ({category.code})
+                  </option>
+                ))}
               </select>
             </div>
             <div className="space-y-2">
@@ -413,7 +628,7 @@ export function ProductCardForm({ mode }: { mode: ProductFormMode }) {
                 className={selectClass}
                 id="status"
                 value={form.status}
-                onChange={(event) => updateForm("status", event.target.value)}
+                onChange={(event) => updateForm("status", event.target.value as ProductStatus)}
               >
                 <option value="active">Активен</option>
                 <option value="hidden">Скрыт</option>
@@ -436,7 +651,7 @@ export function ProductCardForm({ mode }: { mode: ProductFormMode }) {
         <Card>
           <CardHeader>
             <CardTitle>Дополнительные поля</CardTitle>
-            <CardDescription>Mock custom fields для карточки товара.</CardDescription>
+            <CardDescription>Пока отображаются mock-поля, сохранение значений будет следующим этапом.</CardDescription>
           </CardHeader>
           <CardContent className="grid gap-4 md:grid-cols-2">
             <div className="space-y-2">
@@ -545,8 +760,8 @@ export function ProductCardForm({ mode }: { mode: ProductFormMode }) {
 
         <Card>
           <CardContent className="flex flex-col gap-3 p-5">
-            <Button type="button" onClick={handleSave}>
-              <Save />
+            <Button type="button" onClick={() => void handleSave()} disabled={isSaving || isLoading}>
+              {isSaving ? <Loader2 className="animate-spin" /> : <Save />}
               Сохранить
             </Button>
             <Button asChild type="button" variant="outline">

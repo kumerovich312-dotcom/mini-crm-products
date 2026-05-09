@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ArrowDown,
   ArrowUp,
@@ -8,6 +8,7 @@ import {
   Hash,
   Info,
   Layers3,
+  Loader2,
   Plus,
   Power,
   Trash2,
@@ -19,16 +20,15 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { supabase } from "@/lib/supabase/client";
+import type { Category } from "@/types/database";
+
+const DEFAULT_COMPANY_ID = "718f1a81-3a75-4484-901a-6054936be72c";
 
 type CategoryStatus = "active" | "inactive";
 
-type Category = {
-  id: string;
-  name: string;
-  code: string;
+type CategoryItem = Category & {
   productsCount: number;
-  order: number;
-  status: CategoryStatus;
 };
 
 type CategoryForm = {
@@ -37,15 +37,6 @@ type CategoryForm = {
   order: string;
   status: CategoryStatus;
 };
-
-const initialCategories: Category[] = [
-  { id: "rings", name: "Кольца", code: "001", productsCount: 28, order: 1, status: "active" },
-  { id: "earrings", name: "Серьги", code: "002", productsCount: 34, order: 2, status: "active" },
-  { id: "chains", name: "Цепочки", code: "003", productsCount: 16, order: 3, status: "active" },
-  { id: "bracelets", name: "Браслеты", code: "004", productsCount: 22, order: 4, status: "active" },
-  { id: "smartphones", name: "Смартфоны", code: "005", productsCount: 11, order: 5, status: "inactive" },
-  { id: "accessories", name: "Аксессуары", code: "006", productsCount: 17, order: 6, status: "active" },
-];
 
 const emptyForm: CategoryForm = {
   name: "",
@@ -62,19 +53,67 @@ function statusLabel(status: CategoryStatus) {
   return status === "active" ? "Активна" : "Выключена";
 }
 
+function mapCategoryStatus(category: Category): CategoryStatus {
+  return category.is_active ? "active" : "inactive";
+}
+
 export default function CategoriesPage() {
-  const [categories, setCategories] = useState(initialCategories);
+  const [categories, setCategories] = useState<CategoryItem[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isSaving, setIsSaving] = useState(false);
+  const [pageError, setPageError] = useState<string | null>(null);
   const [isDialogOpen, setIsDialogOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [form, setForm] = useState<CategoryForm>(emptyForm);
   const [errors, setErrors] = useState<Partial<Record<keyof CategoryForm, string>>>({});
 
   const sortedCategories = useMemo(
-    () => [...categories].sort((first, second) => first.order - second.order),
+    () => [...categories].sort((first, second) => first.sort_order - second.sort_order),
     [categories],
   );
 
   const isEditing = editingId !== null;
+
+  const loadCategories = useCallback(async () => {
+    setIsLoading(true);
+    setPageError(null);
+
+    const { data, error } = await supabase
+      .from("categories")
+      .select("*")
+      .eq("company_id", DEFAULT_COMPANY_ID)
+      .order("sort_order", { ascending: true });
+
+    if (error) {
+      setPageError(error.message);
+      setCategories([]);
+      setIsLoading(false);
+      return;
+    }
+
+    const categoryRows = (data ?? []) as Category[];
+    const categoriesWithCounts = await Promise.all(
+      categoryRows.map(async (category) => {
+        const { count } = await supabase
+          .from("products")
+          .select("id", { count: "exact", head: true })
+          .eq("company_id", DEFAULT_COMPANY_ID)
+          .eq("category_id", category.id);
+
+        return {
+          ...category,
+          productsCount: count ?? 0,
+        };
+      }),
+    );
+
+    setCategories(categoriesWithCounts);
+    setIsLoading(false);
+  }, []);
+
+  useEffect(() => {
+    void loadCategories();
+  }, [loadCategories]);
 
   function openCreateDialog() {
     setEditingId(null);
@@ -86,13 +125,13 @@ export default function CategoriesPage() {
     setIsDialogOpen(true);
   }
 
-  function openEditDialog(category: Category) {
+  function openEditDialog(category: CategoryItem) {
     setEditingId(category.id);
     setForm({
       name: category.name,
       code: category.code,
-      order: String(category.order),
-      status: category.status,
+      order: String(category.sort_order),
+      status: mapCategoryStatus(category),
     });
     setErrors({});
     setIsDialogOpen(true);
@@ -111,7 +150,6 @@ export default function CategoriesPage() {
 
   function validateForm() {
     const nextErrors: Partial<Record<keyof CategoryForm, string>> = {};
-    const normalizedName = form.name.trim().toLowerCase();
     const normalizedCode = form.code.trim();
 
     if (!form.name.trim()) {
@@ -124,16 +162,9 @@ export default function CategoriesPage() {
       nextErrors.code = "Код должен быть в формате 001, 002, 003";
     }
 
-    const duplicateName = categories.some(
-      (category) => category.id !== editingId && category.name.trim().toLowerCase() === normalizedName,
-    );
     const duplicateCode = categories.some(
-      (category) => category.id !== editingId && category.code === normalizedCode,
+      (category) => category.id !== editingId && category.company_id === DEFAULT_COMPANY_ID && category.code === normalizedCode,
     );
-
-    if (duplicateName) {
-      nextErrors.name = "Категория с таким названием уже есть";
-    }
 
     if (duplicateCode) {
       nextErrors.code = "Категория с таким кодом уже есть";
@@ -147,66 +178,105 @@ export default function CategoriesPage() {
     return Object.keys(nextErrors).length === 0;
   }
 
-  function saveCategory() {
+  async function saveCategory() {
     if (!validateForm()) {
       return;
     }
 
-    const nextCategory = {
+    setIsSaving(true);
+    setPageError(null);
+
+    const payload = {
       name: form.name.trim(),
       code: form.code.trim(),
-      order: Number(form.order),
-      status: form.status,
+      sort_order: Number(form.order),
+      is_active: form.status === "active",
     };
 
-    if (editingId) {
-      setCategories((current) =>
-        current.map((category) => (category.id === editingId ? { ...category, ...nextCategory } : category)),
-      );
-    } else {
-      setCategories((current) => [
-        ...current,
-        {
-          id: crypto.randomUUID(),
-          productsCount: 0,
-          ...nextCategory,
-        },
-      ]);
+    const result = editingId
+      ? await supabase
+          .from("categories")
+          .update(payload)
+          .eq("id", editingId)
+          .eq("company_id", DEFAULT_COMPANY_ID)
+      : await supabase.from("categories").insert({
+          company_id: DEFAULT_COMPANY_ID,
+          ...payload,
+        });
+
+    if (result.error) {
+      setPageError(result.error.message);
+      setIsSaving(false);
+      return;
     }
 
     closeDialog();
+    await loadCategories();
+    setIsSaving(false);
   }
 
-  function deleteCategory(id: string) {
-    setCategories((current) => current.filter((category) => category.id !== id));
+  async function deleteCategory(id: string) {
+    setPageError(null);
+
+    const { error } = await supabase.from("categories").delete().eq("id", id).eq("company_id", DEFAULT_COMPANY_ID);
+
+    if (error) {
+      setPageError(error.message);
+      return;
+    }
+
+    await loadCategories();
   }
 
-  function toggleStatus(id: string) {
-    setCategories((current) =>
-      current.map((category) =>
-        category.id === id
-          ? { ...category, status: category.status === "active" ? "inactive" : "active" }
-          : category,
-      ),
-    );
+  async function toggleStatus(category: CategoryItem) {
+    setPageError(null);
+
+    const { error } = await supabase
+      .from("categories")
+      .update({ is_active: !category.is_active })
+      .eq("id", category.id)
+      .eq("company_id", DEFAULT_COMPANY_ID);
+
+    if (error) {
+      setPageError(error.message);
+      return;
+    }
+
+    await loadCategories();
   }
 
-  function moveCategory(id: string, direction: "up" | "down") {
-    setCategories((current) => {
-      const ordered = [...current].sort((first, second) => first.order - second.order);
-      const index = ordered.findIndex((category) => category.id === id);
-      const swapIndex = direction === "up" ? index - 1 : index + 1;
+  async function moveCategory(category: CategoryItem, direction: "up" | "down") {
+    const index = sortedCategories.findIndex((item) => item.id === category.id);
+    const swapIndex = direction === "up" ? index - 1 : index + 1;
+    const swapCategory = sortedCategories[swapIndex];
 
-      if (index < 0 || swapIndex < 0 || swapIndex >= ordered.length) {
-        return current;
-      }
+    if (!swapCategory) {
+      return;
+    }
 
-      const currentOrder = ordered[index].order;
-      ordered[index].order = ordered[swapIndex].order;
-      ordered[swapIndex].order = currentOrder;
+    setPageError(null);
 
-      return ordered;
-    });
+    const firstUpdate = supabase
+      .from("categories")
+      .update({ sort_order: swapCategory.sort_order })
+      .eq("id", category.id)
+      .eq("company_id", DEFAULT_COMPANY_ID);
+
+    const secondUpdate = supabase
+      .from("categories")
+      .update({ sort_order: category.sort_order })
+      .eq("id", swapCategory.id)
+      .eq("company_id", DEFAULT_COMPANY_ID);
+
+    const [firstResult, secondResult] = await Promise.all([firstUpdate, secondUpdate]);
+    const error = firstResult.error ?? secondResult.error;
+
+    if (error) {
+      setPageError(error.message);
+      return;
+    }
+
+    await loadCategories();
   }
 
   return (
@@ -238,6 +308,12 @@ export default function CategoriesPage() {
         </CardContent>
       </Card>
 
+      {pageError ? (
+        <Card className="mb-6 border-red-100 bg-red-50">
+          <CardContent className="p-5 text-sm text-red-700">{pageError}</CardContent>
+        </Card>
+      ) : null}
+
       <Card>
         <CardHeader>
           <div className="flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
@@ -245,7 +321,7 @@ export default function CategoriesPage() {
               <CardTitle>Список категорий</CardTitle>
               <CardDescription>Всего категорий: {categories.length}</CardDescription>
             </div>
-            <Badge className="w-fit bg-blue-50 text-blue-700">Mock data</Badge>
+            <Badge className="w-fit bg-blue-50 text-blue-700">Supabase</Badge>
           </div>
         </CardHeader>
         <CardContent>
@@ -263,73 +339,96 @@ export default function CategoriesPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {sortedCategories.map((category) => (
-                    <tr key={category.id} className="border-t hover:bg-slate-50/70">
-                      <td className="px-4 py-3">
-                        <div className="flex items-center gap-3">
-                          <div className="flex size-9 items-center justify-center rounded-md bg-accent text-accent-foreground">
-                            <Layers3 className="size-4" />
-                          </div>
-                          <span className="font-medium">{category.name}</span>
-                        </div>
-                      </td>
-                      <td className="px-4 py-3">
-                        <span className="inline-flex items-center gap-2 font-mono text-xs text-muted-foreground">
-                          <Hash className="size-3" />
-                          {category.code}
+                  {isLoading ? (
+                    <tr>
+                      <td className="px-4 py-8 text-center text-muted-foreground" colSpan={6}>
+                        <span className="inline-flex items-center gap-2">
+                          <Loader2 className="size-4 animate-spin" />
+                          Загрузка категорий
                         </span>
                       </td>
-                      <td className="px-4 py-3">{category.productsCount}</td>
-                      <td className="px-4 py-3">{category.order}</td>
-                      <td className="px-4 py-3">
-                        <Badge className={statusClass(category.status)}>{statusLabel(category.status)}</Badge>
-                      </td>
-                      <td className="px-4 py-3">
-                        <div className="flex justify-end gap-1">
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            aria-label="Выше"
-                            onClick={() => moveCategory(category.id, "up")}
-                          >
-                            <ArrowUp />
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            aria-label="Ниже"
-                            onClick={() => moveCategory(category.id, "down")}
-                          >
-                            <ArrowDown />
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            aria-label="Включить или выключить"
-                            onClick={() => toggleStatus(category.id)}
-                          >
-                            <Power />
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            aria-label="Редактировать"
-                            onClick={() => openEditDialog(category)}
-                          >
-                            <Edit3 />
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            aria-label="Удалить"
-                            onClick={() => deleteCategory(category.id)}
-                          >
-                            <Trash2 />
-                          </Button>
-                        </div>
+                    </tr>
+                  ) : null}
+                  {!isLoading && sortedCategories.length === 0 ? (
+                    <tr>
+                      <td className="px-4 py-8 text-center text-muted-foreground" colSpan={6}>
+                        Категории пока не добавлены
                       </td>
                     </tr>
-                  ))}
+                  ) : null}
+                  {!isLoading
+                    ? sortedCategories.map((category) => {
+                        const status = mapCategoryStatus(category);
+
+                        return (
+                          <tr key={category.id} className="border-t hover:bg-slate-50/70">
+                            <td className="px-4 py-3">
+                              <div className="flex items-center gap-3">
+                                <div className="flex size-9 items-center justify-center rounded-md bg-accent text-accent-foreground">
+                                  <Layers3 className="size-4" />
+                                </div>
+                                <span className="font-medium">{category.name}</span>
+                              </div>
+                            </td>
+                            <td className="px-4 py-3">
+                              <span className="inline-flex items-center gap-2 font-mono text-xs text-muted-foreground">
+                                <Hash className="size-3" />
+                                {category.code}
+                              </span>
+                            </td>
+                            <td className="px-4 py-3">{category.productsCount}</td>
+                            <td className="px-4 py-3">{category.sort_order}</td>
+                            <td className="px-4 py-3">
+                              <Badge className={statusClass(status)}>{statusLabel(status)}</Badge>
+                            </td>
+                            <td className="px-4 py-3">
+                              <div className="flex justify-end gap-1">
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  aria-label="Выше"
+                                  onClick={() => void moveCategory(category, "up")}
+                                >
+                                  <ArrowUp />
+                                </Button>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  aria-label="Ниже"
+                                  onClick={() => void moveCategory(category, "down")}
+                                >
+                                  <ArrowDown />
+                                </Button>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  aria-label="Включить или выключить"
+                                  onClick={() => void toggleStatus(category)}
+                                >
+                                  <Power />
+                                </Button>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  aria-label="Редактировать"
+                                  onClick={() => openEditDialog(category)}
+                                >
+                                  <Edit3 />
+                                </Button>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  aria-label="Удалить"
+                                  onClick={() => void deleteCategory(category.id)}
+                                >
+                                  <Trash2 />
+                                </Button>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })
+                    : null}
                 </tbody>
               </table>
             </div>
@@ -405,10 +504,13 @@ export default function CategoriesPage() {
               </label>
             </div>
             <div className="flex justify-end gap-2 border-t p-5">
-              <Button variant="outline" onClick={closeDialog}>
+              <Button variant="outline" onClick={closeDialog} disabled={isSaving}>
                 Отмена
               </Button>
-              <Button onClick={saveCategory}>{isEditing ? "Сохранить" : "Добавить"}</Button>
+              <Button onClick={() => void saveCategory()} disabled={isSaving}>
+                {isSaving ? <Loader2 className="animate-spin" /> : null}
+                {isEditing ? "Сохранить" : "Добавить"}
+              </Button>
             </div>
           </div>
         </div>

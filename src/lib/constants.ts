@@ -1,0 +1,1 @@
+export const DEFAULT_COMPANY_ID = "718f1a81-3a75-4484-901a-6054936be72c";

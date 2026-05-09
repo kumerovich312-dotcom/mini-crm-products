@@ -76,19 +76,56 @@ export interface Database {
     Tables: {
       companies: {
         Row: Company;
+        Insert: Omit<Company, "id" | "created_at" | "updated_at"> & {
+          id?: string;
+          created_at?: string;
+          updated_at?: string;
+        };
+        Update: Partial<Omit<Company, "id">>;
+        Relationships: [];
       };
       categories: {
         Row: Category;
+        Insert: Omit<Category, "id" | "created_at" | "updated_at"> & {
+          id?: string;
+          created_at?: string;
+          updated_at?: string;
+        };
+        Update: Partial<Omit<Category, "id" | "company_id" | "created_at" | "updated_at">>;
+        Relationships: [];
       };
       products: {
         Row: Product;
+        Insert: Omit<Product, "id" | "created_at" | "updated_at"> & {
+          id?: string;
+          created_at?: string;
+          updated_at?: string;
+        };
+        Update: Partial<Omit<Product, "id" | "company_id" | "created_at" | "updated_at">>;
+        Relationships: [];
       };
       product_media: {
         Row: ProductMedia;
+        Insert: Omit<ProductMedia, "id" | "created_at" | "updated_at"> & {
+          id?: string;
+          created_at?: string;
+          updated_at?: string;
+        };
+        Update: Partial<Omit<ProductMedia, "id" | "company_id" | "created_at" | "updated_at">>;
+        Relationships: [];
       };
       custom_fields: {
         Row: CustomField;
+        Insert: Omit<CustomField, "id" | "created_at" | "updated_at"> & {
+          id?: string;
+          created_at?: string;
+          updated_at?: string;
+        };
+        Update: Partial<Omit<CustomField, "id" | "company_id" | "created_at" | "updated_at">>;
+        Relationships: [];
       };
     };
+    Views: Record<string, never>;
+    Functions: Record<string, never>;
   };
 }

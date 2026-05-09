@@ -1,4 +1,7 @@
+"use client";
+
 import Link from "next/link";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Download,
   Edit3,
@@ -6,13 +9,12 @@ import {
   EyeOff,
   FileSpreadsheet,
   ImageIcon,
-  MoreHorizontal,
+  Loader2,
   PackageOpen,
   Plus,
   RotateCcw,
   Search,
   Trash2,
-  Video,
   VideoOff,
 } from "lucide-react";
 
@@ -22,95 +24,11 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { supabase } from "@/lib/supabase/client";
 import { cn } from "@/lib/utils";
+import type { Category, Product, ProductStatus } from "@/types/database";
 
-type ProductStatus = "active" | "hidden" | "out_of_stock" | "draft";
-
-const products: Array<{
-  sku: string;
-  name: string;
-  category: string;
-  price: string;
-  stock: number;
-  status: ProductStatus;
-  updatedAt: string;
-  hasVideo: boolean;
-  keywords: string[];
-  thumbnailClass: string;
-}> = [
-  {
-    sku: "JWL-001-A7K9",
-    name: "Серьги Aurora",
-    category: "Ювелирка",
-    price: "24 900 ₸",
-    stock: 8,
-    status: "active",
-    updatedAt: "Сегодня, 12:40",
-    hasVideo: true,
-    keywords: ["серьги", "золото", "aurora"],
-    thumbnailClass: "bg-blue-100 text-blue-700",
-  },
-  {
-    sku: "JWL-002-B8M2",
-    name: "Браслет Line",
-    category: "Ювелирка",
-    price: "27 400 ₸",
-    stock: 2,
-    status: "active",
-    updatedAt: "Сегодня, 11:10",
-    hasVideo: false,
-    keywords: ["браслет", "минимализм"],
-    thumbnailClass: "bg-indigo-100 text-indigo-700",
-  },
-  {
-    sku: "TEC-005-X4P1",
-    name: "Смарт-часы Fit Pro",
-    category: "Техника",
-    price: "46 900 ₸",
-    stock: 0,
-    status: "out_of_stock",
-    updatedAt: "Вчера, 18:25",
-    hasVideo: true,
-    keywords: ["часы", "fitness", "bluetooth"],
-    thumbnailClass: "bg-cyan-100 text-cyan-700",
-  },
-  {
-    sku: "ACC-003-Q9R5",
-    name: "Кожаный ремешок",
-    category: "Аксессуары",
-    price: "8 500 ₸",
-    stock: 14,
-    status: "hidden",
-    updatedAt: "07.05.2026",
-    hasVideo: false,
-    keywords: ["ремешок", "кожа"],
-    thumbnailClass: "bg-slate-100 text-slate-600",
-  },
-  {
-    sku: "TEC-006-M2C7",
-    name: "Портативная колонка Mini",
-    category: "Техника",
-    price: "18 900 ₸",
-    stock: 5,
-    status: "draft",
-    updatedAt: "06.05.2026",
-    hasVideo: true,
-    keywords: ["колонка", "звук", "portable"],
-    thumbnailClass: "bg-sky-100 text-sky-700",
-  },
-  {
-    sku: "ACC-004-L6N3",
-    name: "Футляр Travel Case",
-    category: "Аксессуары",
-    price: "6 900 ₸",
-    stock: 21,
-    status: "active",
-    updatedAt: "05.05.2026",
-    hasVideo: false,
-    keywords: ["футляр", "чехол", "travel"],
-    thumbnailClass: "bg-emerald-100 text-emerald-700",
-  },
-];
+const DEFAULT_COMPANY_ID = "718f1a81-3a75-4484-901a-6054936be72c";
 
 const statusMap: Record<ProductStatus, { label: string; className: string }> = {
   active: {
@@ -134,7 +52,134 @@ const statusMap: Record<ProductStatus, { label: string; className: string }> = {
 const filterSelectClass =
   "h-10 rounded-md border border-input bg-white px-3 text-sm text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring";
 
+function formatPrice(price: number) {
+  return new Intl.NumberFormat("ru-RU", {
+    maximumFractionDigits: 0,
+  }).format(price);
+}
+
+function formatDate(value: string) {
+  return new Intl.DateTimeFormat("ru-RU", {
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(value));
+}
+
 export default function ProductsPage() {
+  const [products, setProducts] = useState<Product[]>([]);
+  const [categories, setCategories] = useState<Category[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [pageError, setPageError] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+  const [categoryId, setCategoryId] = useState("");
+  const [status, setStatus] = useState("");
+  const [stockFilter, setStockFilter] = useState("");
+
+  const loadData = useCallback(async () => {
+    setIsLoading(true);
+    setPageError(null);
+
+    const [productsResult, categoriesResult] = await Promise.all([
+      supabase
+        .from("products")
+        .select("*")
+        .eq("company_id", DEFAULT_COMPANY_ID)
+        .order("updated_at", { ascending: false }),
+      supabase
+        .from("categories")
+        .select("*")
+        .eq("company_id", DEFAULT_COMPANY_ID)
+        .order("sort_order", { ascending: true }),
+    ]);
+
+    if (productsResult.error) {
+      setPageError(productsResult.error.message);
+    }
+
+    if (categoriesResult.error) {
+      setPageError(categoriesResult.error.message);
+    }
+
+    setProducts(((productsResult.data ?? []) as Product[]) ?? []);
+    setCategories(((categoriesResult.data ?? []) as Category[]) ?? []);
+    setIsLoading(false);
+  }, []);
+
+  useEffect(() => {
+    void loadData();
+  }, [loadData]);
+
+  const categoryMap = useMemo(
+    () => new Map(categories.map((category) => [category.id, category.name])),
+    [categories],
+  );
+
+  const filteredProducts = useMemo(() => {
+    const normalizedQuery = query.trim().toLowerCase();
+
+    return products.filter((product) => {
+      const matchesQuery =
+        !normalizedQuery ||
+        product.name.toLowerCase().includes(normalizedQuery) ||
+        product.sku.toLowerCase().includes(normalizedQuery) ||
+        product.keywords.some((keyword) => keyword.toLowerCase().includes(normalizedQuery));
+
+      const matchesCategory = !categoryId || product.category_id === categoryId;
+      const matchesStatus = !status || product.status === status;
+      const matchesStock =
+        !stockFilter ||
+        (stockFilter === "in_stock" && product.stock > 3) ||
+        (stockFilter === "low_stock" && product.stock > 0 && product.stock <= 3) ||
+        (stockFilter === "out_of_stock" && product.stock === 0);
+
+      return matchesQuery && matchesCategory && matchesStatus && matchesStock;
+    });
+  }, [categoryId, products, query, status, stockFilter]);
+
+  async function hideProduct(product: Product) {
+    setPageError(null);
+
+    const { error } = await supabase
+      .from("products")
+      .update({ status: "hidden", api_visible: false })
+      .eq("id", product.id)
+      .eq("company_id", DEFAULT_COMPANY_ID);
+
+    if (error) {
+      setPageError(error.message);
+      return;
+    }
+
+    await loadData();
+  }
+
+  async function deleteProduct(product: Product) {
+    setPageError(null);
+
+    const { error } = await supabase
+      .from("products")
+      .delete()
+      .eq("id", product.id)
+      .eq("company_id", DEFAULT_COMPANY_ID);
+
+    if (error) {
+      setPageError(error.message);
+      return;
+    }
+
+    await loadData();
+  }
+
+  function resetFilters() {
+    setQuery("");
+    setCategoryId("");
+    setStatus("");
+    setStockFilter("");
+  }
+
   return (
     <>
       <PageHeader
@@ -163,42 +208,63 @@ export default function ProductsPage() {
         }
       />
 
+      {pageError ? (
+        <Card className="mb-6 border-red-100 bg-red-50">
+          <CardContent className="p-5 text-sm text-red-700">{pageError}</CardContent>
+        </Card>
+      ) : null}
+
       <Card>
         <CardHeader>
           <div className="flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
             <div>
               <CardTitle>Рабочая таблица каталога</CardTitle>
-              <CardDescription>Найдено товаров: {products.length}</CardDescription>
+              <CardDescription>Найдено товаров: {filteredProducts.length}</CardDescription>
             </div>
-            <Badge className="w-fit bg-blue-50 text-blue-700">Mock data</Badge>
+            <Badge className="w-fit bg-blue-50 text-blue-700">Supabase</Badge>
           </div>
         </CardHeader>
         <CardContent>
           <div className="grid gap-3 lg:grid-cols-[1.4fr_0.8fr_0.8fr_0.8fr_auto]">
             <div className="relative">
               <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-              <Input className="pl-9" placeholder="Поиск по названию, SKU и ключевым словам" />
+              <Input
+                className="pl-9"
+                placeholder="Поиск по названию, SKU и ключевым словам"
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+              />
             </div>
-            <select className={filterSelectClass} defaultValue="">
+            <select
+              className={filterSelectClass}
+              value={categoryId}
+              onChange={(event) => setCategoryId(event.target.value)}
+            >
               <option value="">Все категории</option>
-              <option value="jewelry">Ювелирка</option>
-              <option value="tech">Техника</option>
-              <option value="accessories">Аксессуары</option>
+              {categories.map((category) => (
+                <option key={category.id} value={category.id}>
+                  {category.name}
+                </option>
+              ))}
             </select>
-            <select className={filterSelectClass} defaultValue="">
+            <select className={filterSelectClass} value={status} onChange={(event) => setStatus(event.target.value)}>
               <option value="">Все статусы</option>
               <option value="active">Активен</option>
               <option value="hidden">Скрыт</option>
               <option value="out_of_stock">Нет в наличии</option>
               <option value="draft">Черновик</option>
             </select>
-            <select className={filterSelectClass} defaultValue="">
+            <select
+              className={filterSelectClass}
+              value={stockFilter}
+              onChange={(event) => setStockFilter(event.target.value)}
+            >
               <option value="">Любое наличие</option>
               <option value="in_stock">В наличии</option>
               <option value="low_stock">Мало в наличии</option>
               <option value="out_of_stock">Нет в наличии</option>
             </select>
-            <Button variant="outline">
+            <Button variant="outline" onClick={resetFilters}>
               <RotateCcw />
               Сбросить
             </Button>
@@ -222,130 +288,126 @@ export default function ProductsPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {products.map((product) => {
-                    const status = statusMap[product.status];
+                  {isLoading ? (
+                    <tr>
+                      <td className="px-4 py-10 text-center text-muted-foreground" colSpan={10}>
+                        <span className="inline-flex items-center gap-2">
+                          <Loader2 className="size-4 animate-spin" />
+                          Загрузка товаров
+                        </span>
+                      </td>
+                    </tr>
+                  ) : null}
+                  {!isLoading && filteredProducts.length === 0 ? (
+                    <tr>
+                      <td className="px-4 py-10" colSpan={10}>
+                        <EmptyState
+                          icon={PackageOpen}
+                          title="Товары не найдены"
+                          description="Измените поиск или фильтры, либо добавьте первый товар."
+                        />
+                      </td>
+                    </tr>
+                  ) : null}
+                  {!isLoading
+                    ? filteredProducts.map((product) => {
+                        const statusView = statusMap[product.status];
 
-                    return (
-                      <tr key={product.sku} className="border-t align-middle hover:bg-slate-50/70">
-                        <td className="px-4 py-3">
-                          <div
-                            className={cn(
-                              "flex size-12 items-center justify-center rounded-md text-xs font-semibold",
-                              product.thumbnailClass,
-                            )}
-                          >
-                            <ImageIcon className="size-5" />
-                          </div>
-                        </td>
-                        <td className="px-4 py-3">
-                          <div
-                            className={cn(
-                              "flex size-9 items-center justify-center rounded-md",
-                              product.hasVideo
-                                ? "bg-blue-50 text-blue-700"
-                                : "bg-slate-100 text-muted-foreground",
-                            )}
-                            title={product.hasVideo ? "Видео добавлено" : "Видео нет"}
-                          >
-                            {product.hasVideo ? <Video className="size-4" /> : <VideoOff className="size-4" />}
-                          </div>
-                        </td>
-                        <td className="px-4 py-3 font-mono text-xs text-muted-foreground">{product.sku}</td>
-                        <td className="px-4 py-3">
-                          <div>
-                            <p className="font-medium">{product.name}</p>
-                            <p className="mt-1 max-w-56 truncate text-xs text-muted-foreground">
-                              {product.keywords.join(", ")}
-                            </p>
-                          </div>
-                        </td>
-                        <td className="px-4 py-3">{product.category}</td>
-                        <td className="px-4 py-3 font-medium">{product.price}</td>
-                        <td className="px-4 py-3">
-                          <span
-                            className={cn(
-                              "font-medium",
-                              product.stock === 0 && "text-red-700",
-                              product.stock > 0 && product.stock <= 3 && "text-amber-700",
-                            )}
-                          >
-                            {product.stock}
-                          </span>
-                        </td>
-                        <td className="px-4 py-3">
-                          <Badge className={status.className}>{status.label}</Badge>
-                        </td>
-                        <td className="px-4 py-3 text-muted-foreground">{product.updatedAt}</td>
-                        <td className="px-4 py-3">
-                          <div className="flex justify-end gap-1">
-                            <Button variant="ghost" size="icon" aria-label="Открыть">
-                              <Eye />
-                            </Button>
-                            <Button asChild variant="ghost" size="icon" aria-label="Редактировать">
-                              <Link href={`/dashboard/products/${product.sku}/edit`}>
-                                <Edit3 />
-                              </Link>
-                            </Button>
-                            <Button variant="ghost" size="icon" aria-label="Скрыть">
-                              <EyeOff />
-                            </Button>
-                            <Button variant="ghost" size="icon" aria-label="Удалить">
-                              <Trash2 />
-                            </Button>
-                          </div>
-                        </td>
-                      </tr>
-                    );
-                  })}
+                        return (
+                          <tr key={product.id} className="border-t align-middle hover:bg-slate-50/70">
+                            <td className="px-4 py-3">
+                              <div className="flex size-12 items-center justify-center rounded-md bg-blue-50 text-blue-700">
+                                <ImageIcon className="size-5" />
+                              </div>
+                            </td>
+                            <td className="px-4 py-3">
+                              <div className="flex size-9 items-center justify-center rounded-md bg-slate-100 text-muted-foreground">
+                                <VideoOff className="size-4" />
+                              </div>
+                            </td>
+                            <td className="px-4 py-3 font-mono text-xs text-muted-foreground">{product.sku}</td>
+                            <td className="px-4 py-3">
+                              <div>
+                                <p className="font-medium">{product.name}</p>
+                                <p className="mt-1 max-w-56 truncate text-xs text-muted-foreground">
+                                  {product.keywords.join(", ")}
+                                </p>
+                              </div>
+                            </td>
+                            <td className="px-4 py-3">
+                              {product.category_id ? categoryMap.get(product.category_id) ?? "Без категории" : "Без категории"}
+                            </td>
+                            <td className="px-4 py-3 font-medium">{formatPrice(product.price)}</td>
+                            <td className="px-4 py-3">
+                              <span
+                                className={cn(
+                                  "font-medium",
+                                  product.stock === 0 && "text-red-700",
+                                  product.stock > 0 && product.stock <= 3 && "text-amber-700",
+                                )}
+                              >
+                                {product.stock}
+                              </span>
+                            </td>
+                            <td className="px-4 py-3">
+                              <Badge className={statusView.className}>{statusView.label}</Badge>
+                            </td>
+                            <td className="px-4 py-3 text-muted-foreground">{formatDate(product.updated_at)}</td>
+                            <td className="px-4 py-3">
+                              <div className="flex justify-end gap-1">
+                                <Button asChild variant="ghost" size="icon" aria-label="Открыть">
+                                  <Link href={`/dashboard/products/${product.id}/edit`}>
+                                    <Eye />
+                                  </Link>
+                                </Button>
+                                <Button asChild variant="ghost" size="icon" aria-label="Редактировать">
+                                  <Link href={`/dashboard/products/${product.id}/edit`}>
+                                    <Edit3 />
+                                  </Link>
+                                </Button>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  aria-label="Скрыть"
+                                  onClick={() => void hideProduct(product)}
+                                >
+                                  <EyeOff />
+                                </Button>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  aria-label="Удалить"
+                                  onClick={() => void deleteProduct(product)}
+                                >
+                                  <Trash2 />
+                                </Button>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })
+                    : null}
                 </tbody>
               </table>
             </div>
           </div>
 
           <div className="mt-4 flex flex-col gap-3 border-t pt-4 md:flex-row md:items-center md:justify-between">
-            <p className="text-sm text-muted-foreground">Показано 1-6 из {products.length} товаров</p>
+            <p className="text-sm text-muted-foreground">
+              Показано {filteredProducts.length} из {products.length} товаров
+            </p>
             <div className="flex items-center gap-2">
               <Button variant="outline" size="sm" disabled>
                 Назад
               </Button>
               <Button size="sm">1</Button>
-              <Button variant="outline" size="sm">
-                2
-              </Button>
-              <Button variant="outline" size="sm">
+              <Button variant="outline" size="sm" disabled>
                 Вперед
               </Button>
             </div>
           </div>
         </CardContent>
       </Card>
-
-      <div className="mt-6 grid gap-4 xl:grid-cols-2">
-        <Card>
-          <CardHeader>
-            <CardTitle>Loading state</CardTitle>
-            <CardDescription>Mock-состояние для будущей загрузки товаров.</CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            {[1, 2, 3].map((item) => (
-              <div key={item} className="flex items-center gap-3 rounded-lg border bg-white p-3">
-                <div className="size-11 animate-pulse rounded-md bg-slate-200" />
-                <div className="min-w-0 flex-1 space-y-2">
-                  <div className="h-3 w-2/3 animate-pulse rounded bg-slate-200" />
-                  <div className="h-3 w-1/3 animate-pulse rounded bg-slate-100" />
-                </div>
-                <MoreHorizontal className="size-5 text-muted-foreground" />
-              </div>
-            ))}
-          </CardContent>
-        </Card>
-
-        <EmptyState
-          icon={PackageOpen}
-          title="Товары не найдены"
-          description="Так будет выглядеть пустое состояние после поиска или фильтрации без результатов."
-        />
-      </div>
     </>
   );
 }
