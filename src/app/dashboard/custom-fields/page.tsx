@@ -1,32 +1,21 @@
 "use client";
 
-import { useMemo, useState } from "react";
-import { Braces, Code2, Edit3, Eye, Info, Plus, ShieldCheck, Trash2, X } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { Braces, Code2, Edit3, Eye, Info, Loader2, Plus, ShieldCheck, Trash2, X } from "lucide-react";
 
 import { PageHeader } from "@/components/page-header";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-
-type FieldType = "text" | "number" | "select" | "boolean";
-
-type CustomField = {
-  id: string;
-  name: string;
-  key: string;
-  type: FieldType;
-  unit: string;
-  required: boolean;
-  showInApi: boolean;
-  order: number;
-  options: string[];
-};
+import { DEFAULT_COMPANY_ID } from "@/lib/constants";
+import { supabase } from "@/lib/supabase/client";
+import type { CustomField as DatabaseCustomField, CustomFieldType } from "@/types/database";
 
 type CustomFieldForm = {
   name: string;
   key: string;
-  type: FieldType;
+  type: CustomFieldType;
   unit: string;
   required: boolean;
   showInApi: boolean;
@@ -34,81 +23,14 @@ type CustomFieldForm = {
   optionsText: string;
 };
 
-const fieldTypeLabels: Record<FieldType, string> = {
+const fieldTypes: CustomFieldType[] = ["text", "number", "select", "boolean"];
+
+const fieldTypeLabels: Record<CustomFieldType, string> = {
   text: "Текст",
   number: "Число",
   select: "Список",
   boolean: "Да / Нет",
 };
-
-const initialFields: CustomField[] = [
-  {
-    id: "proba",
-    name: "Проба",
-    key: "proba",
-    type: "text",
-    unit: "",
-    required: true,
-    showInApi: true,
-    order: 1,
-    options: [],
-  },
-  {
-    id: "weight",
-    name: "Вес",
-    key: "weight",
-    type: "number",
-    unit: "г",
-    required: false,
-    showInApi: true,
-    order: 2,
-    options: [],
-  },
-  {
-    id: "ring_size",
-    name: "Размер кольца",
-    key: "ring_size",
-    type: "text",
-    unit: "",
-    required: false,
-    showInApi: true,
-    order: 3,
-    options: [],
-  },
-  {
-    id: "stone",
-    name: "Камень",
-    key: "stone",
-    type: "text",
-    unit: "",
-    required: false,
-    showInApi: true,
-    order: 4,
-    options: [],
-  },
-  {
-    id: "warranty",
-    name: "Гарантия",
-    key: "warranty",
-    type: "boolean",
-    unit: "",
-    required: false,
-    showInApi: false,
-    order: 5,
-    options: [],
-  },
-  {
-    id: "color",
-    name: "Цвет",
-    key: "color",
-    type: "select",
-    unit: "",
-    required: false,
-    showInApi: true,
-    order: 6,
-    options: ["Белый", "Черный", "Золотой"],
-  },
-];
 
 const emptyForm: CustomFieldForm = {
   name: "",
@@ -132,15 +54,80 @@ function boolBadge(value: boolean, trueLabel: string, falseLabel: string) {
   );
 }
 
+function getFieldOptions(field: DatabaseCustomField) {
+  if (!Array.isArray(field.options)) {
+    return [];
+  }
+
+  return field.options.filter((option): option is string => typeof option === "string");
+}
+
+function getFriendlyErrorMessage(message: string) {
+  if (message.includes("custom_fields_company_key_unique")) {
+    return "Поле с таким техническим ключом уже есть в этой компании.";
+  }
+
+  if (message.includes("custom_fields_company_name_unique")) {
+    return "Поле с таким названием уже есть в этой компании.";
+  }
+
+  if (message.includes("custom_fields_key_check")) {
+    return "Ключ может содержать только латиницу, цифры и underscore.";
+  }
+
+  if (message.includes("custom_fields_type_check")) {
+    return "Тип поля должен быть text, number, select или boolean.";
+  }
+
+  return message;
+}
+
 export default function CustomFieldsPage() {
-  const [fields, setFields] = useState(initialFields);
+  const [fields, setFields] = useState<DatabaseCustomField[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isSaving, setIsSaving] = useState(false);
+  const [pageError, setPageError] = useState<string | null>(null);
   const [isDialogOpen, setIsDialogOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [form, setForm] = useState<CustomFieldForm>(emptyForm);
   const [errors, setErrors] = useState<Partial<Record<keyof CustomFieldForm, string>>>({});
 
-  const sortedFields = useMemo(() => [...fields].sort((first, second) => first.order - second.order), [fields]);
+  const sortedFields = useMemo(
+    () => [...fields].sort((first, second) => first.sort_order - second.sort_order),
+    [fields],
+  );
   const isEditing = editingId !== null;
+
+  function showError(message: string) {
+    const friendlyMessage = getFriendlyErrorMessage(message);
+    setPageError(friendlyMessage);
+    window.alert(friendlyMessage);
+  }
+
+  const loadFields = useCallback(async () => {
+    setIsLoading(true);
+    setPageError(null);
+
+    const { data, error } = await supabase
+      .from("custom_fields")
+      .select("*")
+      .eq("company_id", DEFAULT_COMPANY_ID)
+      .order("sort_order", { ascending: true });
+
+    if (error) {
+      setFields([]);
+      setIsLoading(false);
+      showError(error.message);
+      return;
+    }
+
+    setFields((data ?? []) as DatabaseCustomField[]);
+    setIsLoading(false);
+  }, []);
+
+  useEffect(() => {
+    void loadFields();
+  }, [loadFields]);
 
   function openCreateDialog() {
     setEditingId(null);
@@ -149,17 +136,17 @@ export default function CustomFieldsPage() {
     setIsDialogOpen(true);
   }
 
-  function openEditDialog(field: CustomField) {
+  function openEditDialog(field: DatabaseCustomField) {
     setEditingId(field.id);
     setForm({
       name: field.name,
       key: field.key,
-      type: field.type,
-      unit: field.unit,
-      required: field.required,
-      showInApi: field.showInApi,
-      order: String(field.order),
-      optionsText: field.options.join("\n"),
+      type: field.field_type,
+      unit: field.unit ?? "",
+      required: field.is_required,
+      showInApi: field.api_visible,
+      order: String(field.sort_order),
+      optionsText: getFieldOptions(field).join("\n"),
     });
     setErrors({});
     setIsDialogOpen(true);
@@ -187,6 +174,7 @@ export default function CustomFieldsPage() {
     const nextErrors: Partial<Record<keyof CustomFieldForm, string>> = {};
     const normalizedName = form.name.trim().toLowerCase();
     const normalizedKey = form.key.trim();
+    const sortOrder = Number(form.order);
 
     if (!form.name.trim()) {
       nextErrors.name = "Название не должно быть пустым";
@@ -196,6 +184,10 @@ export default function CustomFieldsPage() {
       nextErrors.key = "Ключ не должен быть пустым";
     } else if (!/^[a-zA-Z0-9_]+$/.test(normalizedKey)) {
       nextErrors.key = "Ключ: только латиница, цифры и underscore";
+    }
+
+    if (!fieldTypes.includes(form.type)) {
+      nextErrors.type = "Выберите корректный тип поля";
     }
 
     const duplicateName = fields.some(
@@ -211,7 +203,7 @@ export default function CustomFieldsPage() {
       nextErrors.key = "Поле с таким ключом уже есть";
     }
 
-    if (!form.order.trim() || Number.isNaN(Number(form.order))) {
+    if (!form.order.trim() || Number.isNaN(sortOrder) || !Number.isInteger(sortOrder)) {
       nextErrors.order = "Порядок должен быть числом";
     }
 
@@ -223,51 +215,96 @@ export default function CustomFieldsPage() {
     return Object.keys(nextErrors).length === 0;
   }
 
-  function saveField() {
+  async function saveField() {
     if (!validateForm()) {
       return;
     }
 
-    const nextField = {
+    setIsSaving(true);
+    setPageError(null);
+
+    const payload = {
       name: form.name.trim(),
       key: form.key.trim(),
-      type: form.type,
-      unit: form.unit.trim(),
-      required: form.required,
-      showInApi: form.showInApi,
-      order: Number(form.order),
+      field_type: form.type,
+      unit: form.unit.trim() || null,
       options: form.type === "select" ? parseOptions() : [],
+      is_required: form.required,
+      api_visible: form.showInApi,
+      sort_order: Number(form.order),
     };
 
-    if (editingId) {
-      setFields((current) => current.map((field) => (field.id === editingId ? { ...field, ...nextField } : field)));
-    } else {
-      setFields((current) => [
-        ...current,
-        {
-          id: crypto.randomUUID(),
-          ...nextField,
-        },
-      ]);
+    const result = editingId
+      ? await supabase
+          .from("custom_fields")
+          .update(payload)
+          .eq("id", editingId)
+          .eq("company_id", DEFAULT_COMPANY_ID)
+      : await supabase.from("custom_fields").insert({
+          company_id: DEFAULT_COMPANY_ID,
+          ...payload,
+        });
+
+    if (result.error) {
+      showError(result.error.message);
+      setIsSaving(false);
+      return;
     }
 
     closeDialog();
+    await loadFields();
+    setIsSaving(false);
   }
 
-  function deleteField(id: string) {
-    setFields((current) => current.filter((field) => field.id !== id));
+  async function deleteField(id: string) {
+    if (!window.confirm("Удалить пользовательское поле?")) {
+      return;
+    }
+
+    setPageError(null);
+
+    const { error } = await supabase.from("custom_fields").delete().eq("id", id).eq("company_id", DEFAULT_COMPANY_ID);
+
+    if (error) {
+      showError(error.message);
+      return;
+    }
+
+    await loadFields();
   }
 
-  function toggleRequired(id: string) {
-    setFields((current) =>
-      current.map((field) => (field.id === id ? { ...field, required: !field.required } : field)),
-    );
+  async function toggleRequired(field: DatabaseCustomField) {
+    setPageError(null);
+
+    const { error } = await supabase
+      .from("custom_fields")
+      .update({ is_required: !field.is_required })
+      .eq("id", field.id)
+      .eq("company_id", DEFAULT_COMPANY_ID);
+
+    if (error) {
+      showError(error.message);
+      return;
+    }
+
+    await loadFields();
   }
 
-  function toggleShowInApi(id: string) {
-    setFields((current) =>
-      current.map((field) => (field.id === id ? { ...field, showInApi: !field.showInApi } : field)),
-    );
+  async function toggleShowInApi(field: DatabaseCustomField) {
+    setPageError(null);
+
+    const { error } = await supabase
+      .from("custom_fields")
+      .update({ api_visible: !field.api_visible })
+      .eq("id", field.id)
+      .eq("company_id", DEFAULT_COMPANY_ID);
+
+    if (error) {
+      showError(error.message);
+      return;
+    }
+
+    await loadFields();
   }
 
   return (
@@ -296,6 +333,12 @@ export default function CustomFieldsPage() {
         </CardContent>
       </Card>
 
+      {pageError ? (
+        <Card className="mb-6 border-red-100 bg-red-50">
+          <CardContent className="p-5 text-sm text-red-700">{pageError}</CardContent>
+        </Card>
+      ) : null}
+
       <Card>
         <CardHeader>
           <div className="flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
@@ -303,7 +346,7 @@ export default function CustomFieldsPage() {
               <CardTitle>Список полей</CardTitle>
               <CardDescription>Всего полей: {fields.length}</CardDescription>
             </div>
-            <Badge className="w-fit bg-blue-50 text-blue-700">Mock data</Badge>
+            <Badge className="w-fit bg-blue-50 text-blue-700">Supabase</Badge>
           </div>
         </CardHeader>
         <CardContent>
@@ -323,65 +366,84 @@ export default function CustomFieldsPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {sortedFields.map((field) => (
-                    <tr key={field.id} className="border-t hover:bg-slate-50/70">
-                      <td className="px-4 py-3">
-                        <div className="flex items-center gap-3">
-                          <div className="flex size-9 items-center justify-center rounded-md bg-accent text-accent-foreground">
-                            <Braces className="size-4" />
-                          </div>
-                          <span className="font-medium">{field.name}</span>
-                        </div>
-                      </td>
-                      <td className="px-4 py-3">
-                        <span className="inline-flex items-center gap-2 font-mono text-xs text-muted-foreground">
-                          <Code2 className="size-3" />
-                          {field.key}
+                  {isLoading ? (
+                    <tr>
+                      <td className="px-4 py-8 text-center text-muted-foreground" colSpan={8}>
+                        <span className="inline-flex items-center gap-2">
+                          <Loader2 className="size-4 animate-spin" />
+                          Загрузка пользовательских полей
                         </span>
                       </td>
-                      <td className="px-4 py-3">{fieldTypeLabels[field.type]}</td>
-                      <td className="px-4 py-3 text-muted-foreground">{field.unit || "—"}</td>
-                      <td className="px-4 py-3">{boolBadge(field.required, "Да", "Нет")}</td>
-                      <td className="px-4 py-3">{boolBadge(field.showInApi, "Да", "Нет")}</td>
-                      <td className="px-4 py-3">{field.order}</td>
-                      <td className="px-4 py-3">
-                        <div className="flex justify-end gap-1">
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            aria-label="Переключить API"
-                            onClick={() => toggleShowInApi(field.id)}
-                          >
-                            <Eye />
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            aria-label="Переключить обязательность"
-                            onClick={() => toggleRequired(field.id)}
-                          >
-                            <ShieldCheck />
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            aria-label="Редактировать"
-                            onClick={() => openEditDialog(field)}
-                          >
-                            <Edit3 />
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            aria-label="Удалить"
-                            onClick={() => deleteField(field.id)}
-                          >
-                            <Trash2 />
-                          </Button>
-                        </div>
+                    </tr>
+                  ) : null}
+                  {!isLoading && sortedFields.length === 0 ? (
+                    <tr>
+                      <td className="px-4 py-10 text-center text-muted-foreground" colSpan={8}>
+                        Пользовательские поля пока не добавлены
                       </td>
                     </tr>
-                  ))}
+                  ) : null}
+                  {!isLoading
+                    ? sortedFields.map((field) => (
+                        <tr key={field.id} className="border-t hover:bg-slate-50/70">
+                          <td className="px-4 py-3">
+                            <div className="flex items-center gap-3">
+                              <div className="flex size-9 items-center justify-center rounded-md bg-accent text-accent-foreground">
+                                <Braces className="size-4" />
+                              </div>
+                              <span className="font-medium">{field.name}</span>
+                            </div>
+                          </td>
+                          <td className="px-4 py-3">
+                            <span className="inline-flex items-center gap-2 font-mono text-xs text-muted-foreground">
+                              <Code2 className="size-3" />
+                              {field.key}
+                            </span>
+                          </td>
+                          <td className="px-4 py-3">{fieldTypeLabels[field.field_type]}</td>
+                          <td className="px-4 py-3 text-muted-foreground">{field.unit || "—"}</td>
+                          <td className="px-4 py-3">{boolBadge(field.is_required, "Да", "Нет")}</td>
+                          <td className="px-4 py-3">{boolBadge(field.api_visible, "Да", "Нет")}</td>
+                          <td className="px-4 py-3">{field.sort_order}</td>
+                          <td className="px-4 py-3">
+                            <div className="flex justify-end gap-1">
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                aria-label="Переключить API"
+                                onClick={() => void toggleShowInApi(field)}
+                              >
+                                <Eye />
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                aria-label="Переключить обязательность"
+                                onClick={() => void toggleRequired(field)}
+                              >
+                                <ShieldCheck />
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                aria-label="Редактировать"
+                                onClick={() => openEditDialog(field)}
+                              >
+                                <Edit3 />
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                aria-label="Удалить"
+                                onClick={() => void deleteField(field.id)}
+                              >
+                                <Trash2 />
+                              </Button>
+                            </div>
+                          </td>
+                        </tr>
+                      ))
+                    : null}
                 </tbody>
               </table>
             </div>
@@ -436,13 +498,14 @@ export default function CustomFieldsPage() {
                   id="field-type"
                   className={selectClass}
                   value={form.type}
-                  onChange={(event) => updateForm("type", event.target.value as FieldType)}
+                  onChange={(event) => updateForm("type", event.target.value as CustomFieldType)}
                 >
                   <option value="text">Текст</option>
                   <option value="number">Число</option>
                   <option value="select">Список</option>
                   <option value="boolean">Да / Нет</option>
                 </select>
+                {errors.type ? <p className="text-xs text-red-600">{errors.type}</p> : null}
               </div>
               <div className="space-y-2">
                 <label className="text-sm font-medium" htmlFor="field-unit">
@@ -508,10 +571,13 @@ export default function CustomFieldsPage() {
               </label>
             </div>
             <div className="flex justify-end gap-2 border-t p-5">
-              <Button variant="outline" onClick={closeDialog}>
+              <Button variant="outline" onClick={closeDialog} disabled={isSaving}>
                 Отмена
               </Button>
-              <Button onClick={saveField}>{isEditing ? "Сохранить" : "Добавить"}</Button>
+              <Button onClick={() => void saveField()} disabled={isSaving}>
+                {isSaving ? <Loader2 className="animate-spin" /> : null}
+                {isEditing ? "Сохранить" : "Добавить"}
+              </Button>
             </div>
           </div>
         </div>
