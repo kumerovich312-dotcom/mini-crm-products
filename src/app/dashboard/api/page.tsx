@@ -31,7 +31,7 @@ const responseJson = `{
       "category": {
         "id": "...",
         "name": "Кольца",
-        "category_code": "001"
+        "code": "001"
       },
       "price": 24500,
       "stock": 2,

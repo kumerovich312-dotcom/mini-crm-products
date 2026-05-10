@@ -6,11 +6,11 @@ import { supabaseServer } from "@/lib/supabase/server";
 import type { Category, CustomField, Product, ProductCustomValue, ProductMedia } from "@/types/database";
 
 function getMediaType(media: ProductMedia) {
-  return media.type;
+  return media.media_type;
 }
 
 function getMediaUrl(media: ProductMedia) {
-  return media.optimized_url ?? media.original_url;
+  return media.processed_url ?? media.original_url;
 }
 
 function getCustomFieldValue(field: CustomField, value: ProductCustomValue) {
@@ -97,13 +97,13 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
       id: product.id,
       sku: product.sku,
       name: product.name,
-      category: category
-        ? {
-            id: category.id,
-            name: category.name,
-            category_code: category.code,
-          }
-        : null,
+        category: category
+          ? {
+              id: category.id,
+              name: category.name,
+              code: category.code,
+            }
+          : null,
       price: product.price,
       stock: product.stock,
       status: product.status,

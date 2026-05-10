@@ -12,7 +12,7 @@ type PublicProduct = {
   category: {
     id: string;
     name: string;
-    category_code: string;
+    code: string;
   } | null;
   price: number;
   stock: number;
@@ -42,11 +42,11 @@ function normalize(value: string) {
 }
 
 function getMediaType(media: ProductMedia) {
-  return media.type;
+  return media.media_type;
 }
 
 function getMediaUrl(media: ProductMedia) {
-  return media.optimized_url ?? media.original_url;
+  return media.processed_url ?? media.original_url;
 }
 
 function getCustomFieldValue(field: CustomField, value: ProductCustomValue) {
@@ -96,13 +96,13 @@ function buildPublicProducts(
       id: product.id,
       sku: product.sku,
       name: product.name,
-      category: category
-        ? {
-            id: category.id,
-            name: category.name,
-            category_code: category.code,
-          }
-        : null,
+          category: category
+            ? {
+                id: category.id,
+                name: category.name,
+                code: category.code,
+              }
+            : null,
       price: product.price,
       stock: product.stock,
       status: product.status,

@@ -78,22 +78,19 @@ create table public.product_media (
   id uuid primary key default gen_random_uuid(),
   company_id uuid not null references public.companies(id) on delete cascade,
   product_id uuid not null references public.products(id) on delete cascade,
-  type text not null,
+  media_type text not null,
   original_url text not null,
-  optimized_url text,
+  processed_url text,
   thumbnail_url text,
   file_name text,
-  mime_type text,
-  original_size bigint,
-  optimized_size bigint,
-  processing_status text not null default 'uploaded',
+  file_size_bytes bigint,
+  status text not null default 'uploaded',
   sort_order integer not null default 0,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
-  constraint product_media_type_check check (type in ('photo', 'video')),
-  constraint product_media_status_check check (processing_status in ('uploaded', 'processing', 'ready', 'failed')),
-  constraint product_media_original_size_check check (original_size is null or original_size >= 0),
-  constraint product_media_optimized_size_check check (optimized_size is null or optimized_size >= 0)
+  constraint product_media_type_check check (media_type in ('photo', 'video')),
+  constraint product_media_status_check check (status in ('uploaded', 'processing', 'ready', 'failed')),
+  constraint product_media_file_size_check check (file_size_bytes is null or file_size_bytes >= 0)
 );
 
 create table public.custom_fields (

@@ -231,15 +231,14 @@ function getProductCustomValue(field: CustomField, row: ProductCustomValue): Cus
 }
 
 function mapProductMedia(row: ProductMedia): MediaItem {
-  const mediaUrl = row.optimized_url ?? row.original_url;
-  const mediaSize = row.optimized_size ?? row.original_size;
+  const mediaUrl = row.processed_url ?? row.original_url;
 
   return {
     id: row.id,
     name: row.file_name ?? "media",
-    type: row.type,
-    size: mediaSize ? formatFileSize(mediaSize) : "unknown",
-    status: row.processing_status,
+    type: row.media_type,
+    size: row.file_size_bytes ? formatFileSize(row.file_size_bytes) : "unknown",
+    status: row.status,
     source: "existing",
     previewUrl: row.thumbnail_url ?? mediaUrl,
     originalUrl: row.original_url,
@@ -571,15 +570,13 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
     const mediaPayload = {
       company_id: companyId,
       product_id: productIdForMedia,
-      type,
+      media_type: type,
       original_url: originalUrl,
-      optimized_url: originalUrl,
+      processed_url: originalUrl,
       thumbnail_url: type === "photo" ? originalUrl : null,
       file_name: file.name,
-      mime_type: file.type || null,
-      original_size: file.size,
-      optimized_size: file.size,
-      processing_status: "ready",
+      file_size_bytes: file.size,
+      status: "ready",
       sort_order: sortOrder,
     };
 
