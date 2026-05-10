@@ -380,13 +380,12 @@ export default function ProductsPage() {
                     ? filteredProducts.map((product) => {
                         const statusView = statusMap[product.status];
                         const productMedia = mediaByProductId.get(product.id) ?? [];
-                        const firstPhoto = productMedia.find((item) => (item.media_type ?? item.type) === "photo");
+                        const firstPhoto = productMedia.find((item) => item.type === "photo");
                         const firstPhotoUrl =
                           firstPhoto?.thumbnail_url ??
-                          firstPhoto?.processed_url ??
                           firstPhoto?.optimized_url ??
                           firstPhoto?.original_url;
-                        const hasVideo = productMedia.some((item) => (item.media_type ?? item.type) === "video");
+                        const hasVideo = productMedia.some((item) => item.type === "video");
 
                         return (
                           <tr key={product.id} className="border-t align-middle hover:bg-slate-50/70">

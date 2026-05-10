@@ -231,17 +231,15 @@ function getProductCustomValue(field: CustomField, row: ProductCustomValue): Cus
 }
 
 function mapProductMedia(row: ProductMedia): MediaItem {
-  const mediaType = row.media_type ?? row.type ?? "photo";
-  const mediaUrl = row.processed_url ?? row.optimized_url ?? row.original_url;
-  const mediaSize = row.file_size_bytes ?? row.original_size;
-  const mediaStatus = row.status ?? row.processing_status ?? "ready";
+  const mediaUrl = row.optimized_url ?? row.original_url;
+  const mediaSize = row.optimized_size ?? row.original_size;
 
   return {
     id: row.id,
     name: row.file_name ?? "media",
-    type: mediaType,
+    type: row.type,
     size: mediaSize ? formatFileSize(mediaSize) : "unknown",
-    status: mediaStatus,
+    status: row.processing_status,
     source: "existing",
     previewUrl: row.thumbnail_url ?? mediaUrl,
     originalUrl: row.original_url,
@@ -266,6 +264,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
   const [customFieldValues, setCustomFieldValues] = useState<CustomFieldValuesState>({});
   const [customFieldErrors, setCustomFieldErrors] = useState<Record<string, string>>({});
   const [media, setMedia] = useState<MediaItem[]>([]);
+  const [isEditableProduct, setIsEditableProduct] = useState(!isEdit);
   const [form, setForm] = useState<ProductFormState>({
     name: "",
     sku: "",
@@ -314,6 +313,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
   const loadData = useCallback(async () => {
     setIsLoading(true);
     setPageError(null);
+    setIsEditableProduct(!isEdit);
 
     let currentCompanyId: string | null = null;
 
@@ -394,6 +394,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
 
       if (data) {
         const product = data as Product;
+        setIsEditableProduct(true);
 
         setForm({
           name: product.name,
@@ -408,6 +409,9 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
         setVisibility({
           showInApi: product.status === "hidden" || product.status === "draft" ? false : product.is_visible_in_api,
         });
+      } else if (!error) {
+        setIsEditableProduct(false);
+        setPageError("Товар не найден в текущей компании.");
       }
 
       const { data: customValuesData, error: customValuesError } = await supabase
@@ -546,6 +550,10 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
       return { error: "Компания текущего пользователя не найдена." };
     }
 
+    if (isEdit && !isEditableProduct) {
+      return { error: "Товар не найден в текущей компании." };
+    }
+
     const filePath = `${companyId}/${productIdForMedia}/${Date.now()}-${sanitizeFileName(file.name)}`;
     const { error: uploadError } = await supabase.storage.from(MEDIA_BUCKET).upload(filePath, file, {
       contentType: file.type || undefined,
@@ -563,18 +571,14 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
     const mediaPayload = {
       company_id: companyId,
       product_id: productIdForMedia,
-      media_type: type,
       type,
       original_url: originalUrl,
-      processed_url: originalUrl,
       optimized_url: originalUrl,
       thumbnail_url: type === "photo" ? originalUrl : null,
       file_name: file.name,
       mime_type: file.type || null,
-      file_size_bytes: file.size,
       original_size: file.size,
       optimized_size: file.size,
-      status: "ready",
       processing_status: "ready",
       sort_order: sortOrder,
     };
@@ -896,6 +900,16 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
 
     if (!form.categoryId) {
       setPageError("Выберите категорию товара.");
+      return;
+    }
+
+    if (isEdit && !isEditableProduct) {
+      setPageError("Товар не найден в текущей компании.");
+      return;
+    }
+
+    if (!categories.some((category) => category.id === form.categoryId && category.company_id === companyId)) {
+      setPageError("Выбранная категория не найдена в текущей компании.");
       return;
     }
 

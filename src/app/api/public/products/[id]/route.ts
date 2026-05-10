@@ -6,11 +6,11 @@ import { supabaseServer } from "@/lib/supabase/server";
 import type { Category, CustomField, Product, ProductCustomValue, ProductMedia } from "@/types/database";
 
 function getMediaType(media: ProductMedia) {
-  return media.media_type ?? media.type ?? "photo";
+  return media.type;
 }
 
 function getMediaUrl(media: ProductMedia) {
-  return media.processed_url ?? media.optimized_url ?? media.original_url;
+  return media.optimized_url ?? media.original_url;
 }
 
 function getCustomFieldValue(field: CustomField, value: ProductCustomValue) {

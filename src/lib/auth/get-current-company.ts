@@ -35,5 +35,26 @@ export async function getCurrentCompanyId() {
     throw new Error(getErrorMessage(error));
   }
 
-  return data?.company_id ?? null;
+  const companyId = data?.company_id ?? null;
+
+  if (!companyId) {
+    return null;
+  }
+
+  const { data: company, error: companyError } = await supabase
+    .from("companies")
+    .select("id")
+    .eq("id", companyId)
+    .maybeSingle();
+
+  if (companyError) {
+    logAppError("Auth/company error", companyError);
+    throw new Error(getErrorMessage(companyError));
+  }
+
+  if (!company) {
+    throw new Error("Компания текущего пользователя не найдена.");
+  }
+
+  return companyId;
 }
