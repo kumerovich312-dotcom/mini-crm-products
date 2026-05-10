@@ -9,6 +9,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { getCurrentCompanyId } from "@/lib/auth/get-current-company";
+import { getErrorMessage, logAppError } from "@/lib/errors";
 import { supabase } from "@/lib/supabase/client";
 import type { CustomField as DatabaseCustomField, CustomFieldType } from "@/types/database";
 
@@ -109,7 +110,17 @@ export default function CustomFieldsPage() {
     setIsLoading(true);
     setPageError(null);
 
-    const currentCompanyId = await getCurrentCompanyId();
+    let currentCompanyId: string | null = null;
+
+    try {
+      currentCompanyId = await getCurrentCompanyId();
+    } catch (error) {
+      logAppError("Custom fields profile error", error);
+      setFields([]);
+      setPageError(getErrorMessage(error));
+      setIsLoading(false);
+      return;
+    }
 
     if (!currentCompanyId) {
       setFields([]);

@@ -6,6 +6,7 @@ import { LogOut, Search } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { logAppError } from "@/lib/errors";
 import { supabase } from "@/lib/supabase/client";
 
 export function TopHeader() {
@@ -16,23 +17,43 @@ export function TopHeader() {
     async function loadCompanyName() {
       const {
         data: { user },
+        error: userError,
       } = await supabase.auth.getUser();
+
+      if (userError) {
+        logAppError("Top header auth error", userError);
+        return;
+      }
 
       if (!user) {
         return;
       }
 
-      const { data: profile } = await supabase
+      const { data: profile, error: profileError } = await supabase
         .from("profiles")
         .select("company_id")
         .eq("user_id", user.id)
         .maybeSingle();
 
+      if (profileError) {
+        logAppError("Top header profile error", profileError);
+        return;
+      }
+
       if (!profile?.company_id) {
         return;
       }
 
-      const { data: company } = await supabase.from("companies").select("name").eq("id", profile.company_id).maybeSingle();
+      const { data: company, error: companyError } = await supabase
+        .from("companies")
+        .select("name")
+        .eq("id", profile.company_id)
+        .maybeSingle();
+
+      if (companyError) {
+        logAppError("Top header company error", companyError);
+        return;
+      }
 
       if (company?.name) {
         setCompanyName(company.name);

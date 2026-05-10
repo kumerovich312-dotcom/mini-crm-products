@@ -19,6 +19,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { getCurrentCompanyId } from "@/lib/auth/get-current-company";
+import { getErrorMessage, logAppError } from "@/lib/errors";
 import { supabase } from "@/lib/supabase/client";
 import type { Category, CustomField, Product, ProductStatus } from "@/types/database";
 
@@ -185,7 +186,18 @@ export default function ImportPage() {
   }, [categoryColumn, categoryMapping, defaultCategoryId, fileCategories]);
 
   const loadReferenceData = useCallback(async () => {
-    const currentCompanyId = await getCurrentCompanyId();
+    let currentCompanyId: string | null = null;
+
+    try {
+      currentCompanyId = await getCurrentCompanyId();
+    } catch (error) {
+      logAppError("Import profile error", error);
+      setPageError(getErrorMessage(error));
+      setCategories([]);
+      setCustomFields([]);
+      setExistingProducts([]);
+      return;
+    }
 
     if (!currentCompanyId) {
       setPageError("Компания текущего пользователя не найдена. Войдите заново.");
@@ -207,7 +219,7 @@ export default function ImportPage() {
     const error = companyResult.error ?? categoriesResult.error ?? customFieldsResult.error ?? productsResult.error;
 
     if (error) {
-      console.error(error);
+      logAppError("Import reference data error", error);
       setPageError(error.message);
       return;
     }
@@ -269,7 +281,7 @@ export default function ImportPage() {
       setDefaultCategoryId("");
       setStep(1);
     } catch (error) {
-      console.error(error);
+      logAppError("Import file parse error", error);
       setPageError("Не удалось прочитать файл.");
     } finally {
       setIsBusy(false);
@@ -285,7 +297,7 @@ export default function ImportPage() {
     const { data, error } = await supabase.from("products").select("*").eq("company_id", companyId);
 
     if (error) {
-      console.error(error);
+      logAppError("Import products refresh error", error);
       setPageError(error.message);
       return existingProducts;
     }
@@ -420,7 +432,8 @@ export default function ImportPage() {
         .maybeSingle();
 
       if (existingError) {
-        throw existingError;
+        logAppError("Import custom value lookup error", existingError);
+        throw new Error(getErrorMessage(existingError));
       }
 
       const result = existingValue
@@ -432,7 +445,8 @@ export default function ImportPage() {
         : await supabase.from("product_custom_values").insert(payload);
 
       if (result.error) {
-        throw result.error;
+        logAppError("Import custom value save error", result.error);
+        throw new Error(getErrorMessage(result.error));
       }
     }
   }
@@ -479,7 +493,7 @@ export default function ImportPage() {
       .single();
 
     if (importResult.error) {
-      console.error(importResult.error);
+      logAppError("Import create error", importResult.error);
       setPageError(importResult.error.message);
       setIsBusy(false);
       return;

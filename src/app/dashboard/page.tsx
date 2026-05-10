@@ -22,6 +22,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { getCurrentCompanyId } from "@/lib/auth/get-current-company";
+import { getErrorMessage, logAppError } from "@/lib/errors";
 import { supabase } from "@/lib/supabase/client";
 import { cn } from "@/lib/utils";
 import type { Category, Product } from "@/types/database";
@@ -135,7 +136,19 @@ export default function DashboardPage() {
     setIsLoading(true);
     setPageError(null);
 
-    const currentCompanyId = await getCurrentCompanyId();
+    let currentCompanyId: string | null = null;
+
+    try {
+      currentCompanyId = await getCurrentCompanyId();
+    } catch (error) {
+      logAppError("Dashboard profile error", error);
+      setPageError(getErrorMessage(error));
+      setProducts([]);
+      setCategories([]);
+      setImports([]);
+      setIsLoading(false);
+      return;
+    }
 
     if (!currentCompanyId) {
       setPageError("Компания текущего пользователя не найдена. Войдите заново.");
@@ -169,7 +182,7 @@ export default function DashboardPage() {
     const error = productsResult.error ?? categoriesResult.error ?? importsResult.error;
 
     if (error) {
-      console.error(error);
+      logAppError("Dashboard data error", error);
       setPageError(error.message);
     }
 

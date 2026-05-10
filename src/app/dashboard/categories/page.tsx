@@ -21,6 +21,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { getCurrentCompanyId } from "@/lib/auth/get-current-company";
+import { getErrorMessage, logAppError } from "@/lib/errors";
 import { supabase } from "@/lib/supabase/client";
 import type { Category } from "@/types/database";
 
@@ -77,7 +78,17 @@ export default function CategoriesPage() {
   const loadCategories = useCallback(async () => {
     setIsLoading(true);
     setPageError(null);
-    const currentCompanyId = await getCurrentCompanyId();
+    let currentCompanyId: string | null = null;
+
+    try {
+      currentCompanyId = await getCurrentCompanyId();
+    } catch (error) {
+      logAppError("Categories profile error", error);
+      setPageError(getErrorMessage(error));
+      setCategories([]);
+      setIsLoading(false);
+      return;
+    }
 
     if (!currentCompanyId) {
       setPageError("Компания текущего пользователя не найдена. Войдите заново.");

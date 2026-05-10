@@ -8,6 +8,7 @@ import { BarChart3, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { logAppError } from "@/lib/errors";
 import { supabase } from "@/lib/supabase/client";
 
 export default function LoginPage() {
@@ -30,6 +31,7 @@ export default function LoginPage() {
     setIsLoading(false);
 
     if (signInError) {
+      logAppError("Login auth error", signInError);
       setError(signInError.message);
       return;
     }

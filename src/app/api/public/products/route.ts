@@ -1,6 +1,7 @@
 ﻿import { NextResponse } from "next/server";
 
 import { DEFAULT_COMPANY_ID } from "@/lib/constants";
+import { logAppError } from "@/lib/errors";
 import { supabaseServer } from "@/lib/supabase/server";
 import type { Category, CustomField, Product, ProductCustomValue, ProductMedia } from "@/types/database";
 
@@ -145,7 +146,7 @@ export async function GET(request: Request) {
     customValuesResult.error;
 
   if (error) {
-    console.error("public products api error", error);
+    logAppError("Public products API error", error);
     return NextResponse.json({ error: error.message }, { status: 500 });
   }
 

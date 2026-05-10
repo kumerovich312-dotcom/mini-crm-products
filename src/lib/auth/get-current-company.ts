@@ -1,4 +1,9 @@
+import { getErrorMessage, logAppError } from "@/lib/errors";
 import { supabase } from "@/lib/supabase/client";
+
+function isMissingSessionError(error: Error) {
+  return error.name === "AuthSessionMissingError" || error.message.toLowerCase().includes("auth session missing");
+}
 
 export async function getCurrentCompanyId() {
   const {
@@ -7,7 +12,12 @@ export async function getCurrentCompanyId() {
   } = await supabase.auth.getUser();
 
   if (userError) {
-    throw userError;
+    if (isMissingSessionError(userError)) {
+      return null;
+    }
+
+    logAppError("Auth user error", userError);
+    throw new Error(getErrorMessage(userError));
   }
 
   if (!user) {
@@ -21,7 +31,8 @@ export async function getCurrentCompanyId() {
     .maybeSingle();
 
   if (error) {
-    throw error;
+    logAppError("Auth/profile error", error);
+    throw new Error(getErrorMessage(error));
   }
 
   return data?.company_id ?? null;

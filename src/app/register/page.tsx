@@ -8,6 +8,7 @@ import { BarChart3, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { logAppError } from "@/lib/errors";
 import { supabase } from "@/lib/supabase/client";
 
 function makeSlug(value: string) {
@@ -52,6 +53,7 @@ export default function RegisterPage() {
     });
 
     if (signUpError) {
+      logAppError("Register auth error", signUpError);
       setError(signUpError.message);
       setIsLoading(false);
       return;
@@ -77,6 +79,7 @@ export default function RegisterPage() {
       .single();
 
     if (companyError) {
+      logAppError("Register company error", companyError);
       setError(companyError.message);
       setIsLoading(false);
       return;
@@ -94,6 +97,7 @@ export default function RegisterPage() {
     setIsLoading(false);
 
     if (profileError) {
+      logAppError("Register profile error", profileError);
       setError(profileError.message);
       return;
     }

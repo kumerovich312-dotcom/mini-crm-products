@@ -7,6 +7,7 @@ import { PageHeader } from "@/components/page-header";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { logAppError } from "@/lib/errors";
 
 const baseEndpoint = "http://localhost:3001/api/public/products";
 
@@ -82,7 +83,7 @@ export default function ApiPage() {
 
       setTestResponse(JSON.stringify(data, null, 2));
     } catch (error) {
-      console.error(error);
+      logAppError("Dashboard API test error", error);
       setTestResponse(JSON.stringify({ error: "Не удалось проверить API" }, null, 2));
     } finally {
       setIsTesting(false);

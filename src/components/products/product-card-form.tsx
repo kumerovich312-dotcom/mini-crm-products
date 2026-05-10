@@ -26,6 +26,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { getCurrentCompanyId } from "@/lib/auth/get-current-company";
+import { getErrorMessage, logAppError } from "@/lib/errors";
 import { supabase } from "@/lib/supabase/client";
 import { cn } from "@/lib/utils";
 import type { Category, CustomField, Product, ProductCustomValue, ProductMedia, ProductStatus } from "@/types/database";
@@ -314,7 +315,16 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
     setIsLoading(true);
     setPageError(null);
 
-    const currentCompanyId = await getCurrentCompanyId();
+    let currentCompanyId: string | null = null;
+
+    try {
+      currentCompanyId = await getCurrentCompanyId();
+    } catch (error) {
+      logAppError("Product form profile error", error);
+      setPageError(getErrorMessage(error));
+      setIsLoading(false);
+      return;
+    }
 
     if (!currentCompanyId) {
       setPageError("Компания текущего пользователя не найдена. Войдите заново.");
@@ -350,17 +360,17 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
     }, {});
 
     if (companyResult.error) {
-      console.error(companyResult.error);
+      logAppError("Product form company error", companyResult.error);
       setPageError(companyResult.error.message);
     }
 
     if (categoriesResult.error) {
-      console.error(categoriesResult.error);
+      logAppError("Product form categories error", categoriesResult.error);
       setPageError(categoriesResult.error.message);
     }
 
     if (customFieldsResult.error) {
-      console.error(customFieldsResult.error);
+      logAppError("Product form custom fields error", customFieldsResult.error);
       setPageError("Не удалось загрузить пользовательские поля. Попробуйте обновить страницу.");
     }
 
@@ -378,7 +388,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
         .maybeSingle();
 
       if (error) {
-        console.error(error);
+        logAppError("Product form product load error", error);
         setPageError(error.message);
       }
 
@@ -407,7 +417,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
         .eq("product_id", productId);
 
       if (customValuesError) {
-        console.error(customValuesError);
+        logAppError("Product form custom values error", customValuesError);
         setPageError("Не удалось загрузить значения пользовательских полей.");
       }
 
@@ -434,7 +444,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
         .order("sort_order", { ascending: true });
 
       if (mediaError) {
-        console.error(mediaError);
+        logAppError("Product form media load error", mediaError);
         setPageError("Не удалось загрузить медиа товара.");
       }
 
@@ -543,7 +553,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
     });
 
     if (uploadError) {
-      console.error(uploadError);
+      logAppError("Product form media upload error", uploadError);
       return { error: "Не удалось загрузить файл в Supabase Storage." };
     }
 
@@ -576,12 +586,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
       .single();
 
     if (insertError) {
-      console.error("product_media insert error", {
-        message: insertError.message,
-        details: insertError.details,
-        hint: insertError.hint,
-        code: insertError.code,
-      });
+      logAppError("Product form media insert error", insertError);
       return { error: insertError.message || "Не удалось сохранить запись медиа" };
     }
 
@@ -722,7 +727,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
         .eq("company_id", companyId);
 
       if (error) {
-        console.error(error);
+        logAppError("Product form media delete error", error);
         setPageError("Не удалось удалить медиа.");
         return;
       }
@@ -837,7 +842,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
           .eq("custom_field_id", field.id);
 
         if (error) {
-          console.error(error);
+          logAppError("Product form custom value delete error", error);
           return "Не удалось очистить значение пользовательского поля.";
         }
 
@@ -853,7 +858,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
         .maybeSingle();
 
       if (existingError) {
-        console.error(existingError);
+        logAppError("Product form custom value lookup error", existingError);
         return "Не удалось проверить значение пользовательского поля.";
       }
 
@@ -867,7 +872,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
         : await supabase.from("product_custom_values").insert(payload);
 
       if (saveResult.error) {
-        console.error(saveResult.error);
+        logAppError("Product form custom value save error", saveResult.error);
         return "Не удалось сохранить значения пользовательских полей.";
       }
     }
@@ -940,7 +945,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
         : await supabase.from("products").insert(payload).select("id").single();
 
     if (productResult.error) {
-      console.error(productResult.error);
+      logAppError("Product form product save error", productResult.error);
       setPageError(productResult.error.message);
       setIsSaving(false);
       return;
