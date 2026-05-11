@@ -12,6 +12,7 @@ as $$
 $$;
 
 grant execute on function public.current_company_id() to authenticated;
+revoke execute on function public.current_company_id() from anon;
 
 do $$
 declare
@@ -63,8 +64,8 @@ begin
       and tablename = 'objects'
       and (
         policyname like 'dev\_%' escape '\'
-        or qual = 'true'
-        or with_check = 'true'
+        or lower(replace(coalesce(qual, ''), ' ', '')) in ('true', '(true)')
+        or lower(replace(coalesce(with_check, ''), ' ', '')) in ('true', '(true)')
       )
   loop
     execute format('drop policy if exists %I on storage.objects', policy_row.policyname);
@@ -99,7 +100,10 @@ on public.profiles
 for update
 to authenticated
 using (user_id = auth.uid())
-with check (user_id = auth.uid());
+with check (
+  user_id = auth.uid()
+  and company_id = public.current_company_id()
+);
 
 create policy "companies select own"
 on public.companies
