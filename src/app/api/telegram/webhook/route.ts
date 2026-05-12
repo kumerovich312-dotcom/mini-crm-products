@@ -58,6 +58,10 @@ type TelegramDraft = {
 };
 type InlineButton = { text: string; callback_data: string };
 
+function logTiming(action: string, startedAt: number, chatId?: string) {
+  console.log("telegram timing", { action, ms: Date.now() - startedAt, chatId });
+}
+
 function getSupabaseAdmin() {
   const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -79,24 +83,55 @@ function logTelegramError(stage: string, error: unknown, details?: Record<string
   console.error("Telegram bot error", { stage, message: getErrorMessage(error), details });
 }
 
-async function telegramApi<T>(method: string, payload: Record<string, unknown>) {
-  const response = await fetch(`https://api.telegram.org/bot${getTelegramToken()}/${method}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  const body = (await response.json()) as { ok: boolean; result?: T; description?: string };
-  if (!response.ok || !body.ok) throw new Error(body.description ?? `Telegram API ${method} failed`);
-  return body.result as T;
+async function telegramApi<T>(method: string, payload: Record<string, unknown>, action = method) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8000);
+
+  try {
+    const response = await fetch(`https://api.telegram.org/bot${getTelegramToken()}/${method}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    const body = (await response.json()) as { ok: boolean; result?: T; description?: string };
+    if (!response.ok || !body.ok) throw new Error(body.description ?? `Telegram API ${method} failed`);
+    return body.result as T;
+  } catch (error) {
+    logTelegramError("telegram_api", error, { method, action });
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
-async function sendMessage(chatId: string, text: string, replyMarkup?: Record<string, unknown>) {
-  return telegramApi("sendMessage", { chat_id: chatId, text, reply_markup: replyMarkup });
+async function sendTelegramMessage(chatId: string, text: string, replyMarkup?: Record<string, unknown>, action = "send_message") {
+  return telegramApi("sendMessage", { chat_id: chatId, text, reply_markup: replyMarkup }, action);
+}
+
+async function editTelegramMessage(
+  chatId: string,
+  messageId: number,
+  text: string,
+  replyMarkup?: Record<string, unknown>,
+  action = "edit_message",
+) {
+  return telegramApi(
+    "editMessageText",
+    { chat_id: chatId, message_id: messageId, text, reply_markup: replyMarkup },
+    action,
+  );
 }
 
 async function answerCallbackQuery(callbackQueryId: string, text?: string) {
-  return telegramApi("answerCallbackQuery", { callback_query_id: callbackQueryId, text });
+  try {
+    return await telegramApi("answerCallbackQuery", { callback_query_id: callbackQueryId, text }, "answer_callback");
+  } catch {
+    return null;
+  }
 }
+
+const sendMessage = sendTelegramMessage;
 
 function keyboard(rows: InlineButton[][]) {
   return { inline_keyboard: rows };
@@ -109,22 +144,35 @@ async function sendKeyboard(chatId: string, text: string, rows: InlineButton[][]
 function mainMenuRows(): InlineButton[][] {
   return [
     [
-      { text: "➕ Добавить товар", callback_data: "m:add" },
-      { text: "🔎 Найти товар", callback_data: "m:find" },
+      { text: "➕ Добавить товар", callback_data: "menu:add_product" },
+      { text: "🔎 Найти товар", callback_data: "menu:find_product" },
     ],
     [
-      { text: "📦 Последние товары", callback_data: "m:last" },
-      { text: "✏️ Изменить товар", callback_data: "m:edit" },
+      { text: "📦 Последние товары", callback_data: "menu:latest_products" },
+      { text: "✏️ Изменить товар", callback_data: "menu:edit_product" },
     ],
     [
-      { text: "📊 Статистика", callback_data: "m:stats" },
-      { text: "⚙️ Помощь", callback_data: "m:help" },
+      { text: "📊 Статистика", callback_data: "menu:stats" },
+      { text: "⚙️ Помощь", callback_data: "menu:help" },
     ],
   ];
 }
 
 async function sendMainMenu(chatId: string, text = "Главное меню") {
   await sendKeyboard(chatId, text, mainMenuRows());
+}
+
+async function sendOrEditMenu(chatId: string, text = "Главное меню", messageId?: number) {
+  if (messageId) {
+    try {
+      await editTelegramMessage(chatId, messageId, text, keyboard(mainMenuRows()), "edit_menu");
+      return;
+    } catch {
+      // If Telegram refuses to edit an old or unchanged message, send a fresh menu.
+    }
+  }
+
+  await sendMainMenu(chatId, text);
 }
 
 function getMessageMedia(message: TelegramMessage) {
@@ -137,14 +185,26 @@ function getMessageMedia(message: TelegramMessage) {
 async function downloadTelegramFile(fileId: string) {
   const file = await telegramApi<{ file_path?: string; file_size?: number }>("getFile", { file_id: fileId });
   if (!file.file_path) throw new Error("Telegram did not return file_path.");
-  const response = await fetch(`https://api.telegram.org/file/bot${getTelegramToken()}/${file.file_path}`);
-  if (!response.ok) throw new Error(`Telegram file download failed with status ${response.status}.`);
-  return {
-    buffer: await response.arrayBuffer(),
-    filePath: file.file_path,
-    fileSize: file.file_size ?? null,
-    contentType: response.headers.get("content-type") ?? undefined,
-  };
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8000);
+
+  try {
+    const response = await fetch(`https://api.telegram.org/file/bot${getTelegramToken()}/${file.file_path}`, {
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`Telegram file download failed with status ${response.status}.`);
+    return {
+      buffer: await response.arrayBuffer(),
+      filePath: file.file_path,
+      fileSize: file.file_size ?? null,
+      contentType: response.headers.get("content-type") ?? undefined,
+    };
+  } catch (error) {
+    logTelegramError("telegram_file_download", error, { action: "download_file", fileId });
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function shortId() {
@@ -468,7 +528,7 @@ async function showAddPreview(supabase: ReturnType<typeof getSupabaseAdmin>, cha
     ],
     [
       { text: "❌ Отмена", callback_data: "d:cancel" },
-      { text: "⬅️ Главное меню", callback_data: "m:menu" },
+      { text: "⬅️ Главное меню", callback_data: "menu:menu" },
     ],
   ]);
 }
@@ -578,14 +638,18 @@ async function getProduct(supabase: ReturnType<typeof getSupabaseAdmin>, company
 
 async function findProducts(supabase: ReturnType<typeof getSupabaseAdmin>, companyId: string, query: string) {
   const normalized = normalize(query);
-  const { data, error } = await supabase.from("products").select("*").eq("company_id", companyId).order("updated_at", { ascending: false });
+  const { data, error } = await supabase
+    .from("products")
+    .select("id, sku, name, price, stock, status, is_visible_in_api, description, keywords, updated_at")
+    .eq("company_id", companyId)
+    .order("updated_at", { ascending: false });
   if (error) throw error;
   return (((data ?? []) as Product[]) ?? [])
     .filter((product) => {
       const haystack = [product.sku, product.name, product.description ?? "", ...(product.keywords ?? [])].join(" ").toLowerCase();
       return haystack.includes(normalized);
     })
-    .slice(0, 10);
+    .slice(0, 5);
 }
 
 async function sendProductList(chatId: string, products: Product[]) {
@@ -643,7 +707,7 @@ async function openProductCard(supabase: ReturnType<typeof getSupabaseAdmin>, ch
       { text: product.status === "hidden" ? "🙈 Показать" : "🙈 Скрыть", callback_data: `p:v:${product.id}` },
       { text: "🖼 Медиа", callback_data: `efp:media:${product.id}` },
     ],
-    [{ text: "⬅️ Главное меню", callback_data: "m:menu" }],
+    [{ text: "⬅️ Главное меню", callback_data: "menu:menu" }],
   ]);
 }
 
@@ -706,33 +770,57 @@ async function toggleApi(supabase: ReturnType<typeof getSupabaseAdmin>, chatId: 
 }
 
 async function showStats(supabase: ReturnType<typeof getSupabaseAdmin>, chatId: string, companyId: string) {
-  const [productsResult, categoriesResult, telegramDraftsResult] = await Promise.all([
-    supabase.from("products").select("*").eq("company_id", companyId),
-    supabase.from("categories").select("id").eq("company_id", companyId),
-    supabase.from("telegram_product_drafts").select("created_product_id").eq("company_id", companyId).not("created_product_id", "is", null),
+  const startedAt = Date.now();
+  const [
+    totalResult,
+    activeResult,
+    draftResult,
+    hiddenResult,
+    noStockResult,
+    apiResult,
+    categoriesResult,
+    telegramDraftsResult,
+  ] = await Promise.all([
+    supabase.from("products").select("id", { count: "exact", head: true }).eq("company_id", companyId),
+    supabase.from("products").select("id", { count: "exact", head: true }).eq("company_id", companyId).eq("status", "active"),
+    supabase.from("products").select("id", { count: "exact", head: true }).eq("company_id", companyId).eq("status", "draft"),
+    supabase.from("products").select("id", { count: "exact", head: true }).eq("company_id", companyId).eq("status", "hidden"),
+    supabase.from("products").select("id", { count: "exact", head: true }).eq("company_id", companyId).lte("stock", 0),
+    supabase.from("products").select("id", { count: "exact", head: true }).eq("company_id", companyId).eq("is_visible_in_api", true),
+    supabase.from("categories").select("id", { count: "exact", head: true }).eq("company_id", companyId),
+    supabase
+      .from("telegram_product_drafts")
+      .select("created_product_id", { count: "exact", head: true })
+      .eq("company_id", companyId)
+      .not("created_product_id", "is", null),
   ]);
-  if (productsResult.error) throw productsResult.error;
+  console.log("telegram timing", { action: "stats_counts", ms: Date.now() - startedAt, chatId });
+  if (totalResult.error) throw totalResult.error;
+  if (activeResult.error) throw activeResult.error;
+  if (draftResult.error) throw draftResult.error;
+  if (hiddenResult.error) throw hiddenResult.error;
+  if (noStockResult.error) throw noStockResult.error;
+  if (apiResult.error) throw apiResult.error;
   if (categoriesResult.error) throw categoriesResult.error;
   if (telegramDraftsResult.error) throw telegramDraftsResult.error;
-  const products = (((productsResult.data ?? []) as Product[]) ?? []);
   const text = [
-    `Товары: ${products.length}`,
-    `Активные: ${products.filter((item) => item.status === "active").length}`,
-    `Черновики: ${products.filter((item) => item.status === "draft").length}`,
-    `Скрытые: ${products.filter((item) => item.status === "hidden").length}`,
-    `Нет остатка: ${products.filter((item) => item.stock <= 0).length}`,
-    `Доступны боту/API: ${products.filter((item) => item.is_visible_in_api).length}`,
-    `Категории: ${(categoriesResult.data ?? []).length}`,
-    `Через Telegram: ${(telegramDraftsResult.data ?? []).length}`,
+    `Товары: ${totalResult.count ?? 0}`,
+    `Активные: ${activeResult.count ?? 0}`,
+    `Черновики: ${draftResult.count ?? 0}`,
+    `Скрытые: ${hiddenResult.count ?? 0}`,
+    `Нет остатка: ${noStockResult.count ?? 0}`,
+    `Доступны боту/API: ${apiResult.count ?? 0}`,
+    `Категории: ${categoriesResult.count ?? 0}`,
+    `Через Telegram: ${telegramDraftsResult.count ?? 0}`,
   ].join("\n");
-  await sendKeyboard(chatId, text, [[{ text: "⬅️ Главное меню", callback_data: "m:menu" }]]);
+  await sendKeyboard(chatId, text, [[{ text: "⬅️ Главное меню", callback_data: "menu:menu" }]]);
 }
 
 async function showHelp(chatId: string) {
   await sendKeyboard(
     chatId,
     "Отправьте фото, чтобы быстро добавить товар.\nИли используйте меню:\n➕ Добавить товар\n🔎 Найти товар\n📦 Последние товары\n✏️ Изменить товар\n\nКоманды:\n/menu\n/cancel\n/status",
-    [[{ text: "⬅️ Главное меню", callback_data: "m:menu" }]],
+    [[{ text: "⬅️ Главное меню", callback_data: "menu:menu" }]],
   );
 }
 
@@ -948,21 +1036,27 @@ async function handleDraftMedia(supabase: ReturnType<typeof getSupabaseAdmin>, c
 }
 
 async function handleMenuAction(supabase: ReturnType<typeof getSupabaseAdmin>, chatId: string, connection: TelegramConnection, action: string) {
-  const activeDraft = await getActiveDraft(supabase, connection.company_id, chatId);
-  if (isBusyDraft(activeDraft) && !["menu", "help"].includes(action)) return showBusyMessage(chatId);
   if (action === "menu") return sendMainMenu(chatId);
   if (action === "help") return showHelp(chatId);
-  if (action === "add") return startAddWizard(supabase, chatId, connection);
-  if (action === "find") {
+
+  const activeDraft = await getActiveDraft(supabase, connection.company_id, chatId);
+  if (isBusyDraft(activeDraft)) return showBusyMessage(chatId);
+  if (action === "add_product") return startAddWizard(supabase, chatId, connection);
+  if (action === "find_product") {
     await createDraft(supabase, connection.company_id, chatId, "find", "wait_find");
     return sendMessage(chatId, "Введите название, SKU или ключевое слово.");
   }
-  if (action === "edit") {
+  if (action === "edit_product") {
     await createDraft(supabase, connection.company_id, chatId, "edit_search", "wait_edit_search");
     return sendMessage(chatId, "Введите SKU или название товара.");
   }
-  if (action === "last") {
-    const { data, error } = await supabase.from("products").select("*").eq("company_id", connection.company_id).order("updated_at", { ascending: false }).limit(10);
+  if (action === "latest_products") {
+    const { data, error } = await supabase
+      .from("products")
+      .select("id, sku, name, price, stock, status, is_visible_in_api, updated_at")
+      .eq("company_id", connection.company_id)
+      .order("updated_at", { ascending: false })
+      .limit(5);
     if (error) throw error;
     return sendProductList(chatId, ((data ?? []) as Product[]) ?? []);
   }
@@ -970,21 +1064,49 @@ async function handleMenuAction(supabase: ReturnType<typeof getSupabaseAdmin>, c
 }
 
 async function handleCallback(supabase: ReturnType<typeof getSupabaseAdmin>, callback: TelegramCallbackQuery) {
+  const startedAt = Date.now();
   const chatId = callback.message?.chat.id ? String(callback.message.chat.id) : "";
   const data = callback.data ?? "";
   if (!chatId) return answerCallbackQuery(callback.id, "Чат не найден.");
   await answerCallbackQuery(callback.id);
-  const connection = await getConnection(supabase, chatId);
-  if (!connection) return sendMessage(chatId, NOT_CONNECTED);
-  const draft = await getActiveDraft(supabase, connection.company_id, chatId);
+  logTiming("answer_callback", startedAt, chatId);
 
-  if (data.startsWith("m:")) return handleMenuAction(supabase, chatId, connection, data.slice(2));
-  if (data === "busy:cont") return draft ? resumeDraft(supabase, chatId, draft) : sendMainMenu(chatId);
+  const getConnectionStartedAt = Date.now();
+  const connection = await getConnection(supabase, chatId);
+  logTiming("get connection", getConnectionStartedAt, chatId);
+  if (!connection) return sendMessage(chatId, NOT_CONNECTED);
+
+  if (data.startsWith("menu:") || data.startsWith("m:")) {
+    const actionMap: Record<string, string> = {
+      add: "add_product",
+      find: "find_product",
+      last: "latest_products",
+      edit: "edit_product",
+    };
+    const rawAction = data.includes(":") ? data.split(":")[1] : "menu";
+    const action = actionMap[rawAction] ?? rawAction;
+
+    if (action === "menu") {
+      const responseStartedAt = Date.now();
+      await sendOrEditMenu(chatId, "Главное меню", callback.message?.message_id);
+      logTiming("telegram response", responseStartedAt, chatId);
+      logTiming("handle action menu", startedAt, chatId);
+      return;
+    }
+
+    const actionStartedAt = Date.now();
+    await handleMenuAction(supabase, chatId, connection, action);
+    logTiming(`handle action ${action}`, actionStartedAt, chatId);
+    return;
+  }
+
+  const draft = await getActiveDraft(supabase, connection.company_id, chatId);
+  if (data === "busy:cont") return draft ? resumeDraft(supabase, chatId, draft) : sendOrEditMenu(chatId, "Главное меню", callback.message?.message_id);
   if (data === "busy:new") {
     await clearDrafts(supabase, connection.company_id, chatId);
-    return sendMainMenu(chatId, "Начните заново");
+    return sendOrEditMenu(chatId, "Начните заново", callback.message?.message_id);
   }
-  if (data === "busy:menu") return sendMainMenu(chatId);
+  if (data === "busy:menu") return sendOrEditMenu(chatId, "Главное меню", callback.message?.message_id);
   if (data === "media:skip") {
     if (!draft) return sendMessage(chatId, "Черновик не найден.");
     await updateDraft(supabase, draft, { step: "choose_category" });
@@ -1155,19 +1277,26 @@ async function handleEditCustomCallback(supabase: ReturnType<typeof getSupabaseA
 }
 
 async function handleMessage(supabase: ReturnType<typeof getSupabaseAdmin>, message: TelegramMessage) {
+  const startedAt = Date.now();
   const chatId = String(message.chat.id);
   const text = message.text?.trim() ?? "";
   const media = getMessageMedia(message);
   if (text === "/start") {
+    const getConnectionStartedAt = Date.now();
     const connection = await getConnection(supabase, chatId);
+    logTiming("get connection", getConnectionStartedAt, chatId);
     if (!connection) return sendMessage(chatId, "Отправьте код подключения из CRM.");
-    return sendMainMenu(chatId);
+    const result = await sendMainMenu(chatId);
+    logTiming("handle action start", startedAt, chatId);
+    return result;
   }
   if (text === "/status") {
     const connection = await getConnection(supabase, chatId);
     return sendMessage(chatId, connection ? "Бот подключён к компании." : "Бот не подключён.");
   }
+  const getConnectionStartedAt = Date.now();
   const connection = await getConnection(supabase, chatId);
+  logTiming("get connection", getConnectionStartedAt, chatId);
   if (!connection) {
     if (/^[0-9]{6}$/.test(text)) {
       const connected = await connectByCode(supabase, chatId, message.from, text);
@@ -1176,7 +1305,13 @@ async function handleMessage(supabase: ReturnType<typeof getSupabaseAdmin>, mess
     }
     return sendMessage(chatId, media || text === "/addproduct" ? NOT_CONNECTED : "Отправьте код подключения из CRM.");
   }
-  if (text === "/menu") return sendMainMenu(chatId);
+  if (text === "/menu" || normalize(text) === normalize("Главное меню")) {
+    const responseStartedAt = Date.now();
+    const result = await sendMainMenu(chatId);
+    logTiming("telegram response", responseStartedAt, chatId);
+    logTiming("handle action menu", startedAt, chatId);
+    return result;
+  }
   if (text === "/help") return showHelp(chatId);
   if (text === "/cancel") {
     await clearDrafts(supabase, connection.company_id, chatId);
@@ -1196,17 +1331,28 @@ async function handleMessage(supabase: ReturnType<typeof getSupabaseAdmin>, mess
 }
 
 export async function POST(request: Request) {
+  const startedAt = Date.now();
   const expectedSecret = process.env.TELEGRAM_WEBHOOK_SECRET;
   const actualSecret = request.headers.get("x-telegram-bot-api-secret-token");
   if (!expectedSecret || actualSecret !== expectedSecret) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   try {
+    const parseStartedAt = Date.now();
     const update = (await request.json()) as TelegramUpdate;
+    const chatId = update.callback_query?.message?.chat.id
+      ? String(update.callback_query.message.chat.id)
+      : update.message?.chat.id
+        ? String(update.message.chat.id)
+        : undefined;
+    const action = update.callback_query?.data ?? update.message?.text ?? (update.message?.photo || update.message?.video ? "media" : "unknown");
+    logTiming("parse update", parseStartedAt, chatId);
     const supabase = getSupabaseAdmin();
     if (update.callback_query) await handleCallback(supabase, update.callback_query);
     else if (update.message) await handleMessage(supabase, update.message);
+    logTiming(String(action), startedAt, chatId);
     return NextResponse.json({ ok: true });
   } catch (error) {
     logTelegramError("webhook", error);
+    logTiming("webhook_error", startedAt);
     return NextResponse.json({ ok: true });
   }
 }
