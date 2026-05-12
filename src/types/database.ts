@@ -8,6 +8,8 @@ export interface Company {
   name: string;
   slug: string;
   sku_prefix: string;
+  sku_random_digits: number;
+  company_code: string | null;
   currency: string;
   created_at: string;
   updated_at: string;

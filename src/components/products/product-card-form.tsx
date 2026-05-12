@@ -200,10 +200,12 @@ function logMediaError({
   });
 }
 
-function generateSkuDigits() {
-  return Math.floor(Math.random() * 10000)
+function generateSkuDigits(length: number) {
+  const max = 10 ** length;
+
+  return Math.floor(Math.random() * max)
     .toString()
-    .padStart(4, "0");
+    .padStart(length, "0");
 }
 
 function FieldLabel({ children, htmlFor }: { children: React.ReactNode; htmlFor?: string }) {
@@ -299,6 +301,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
   const [categories, setCategories] = useState<Category[]>([]);
   const [companyId, setCompanyId] = useState<string | null>(null);
   const [companyPrefix, setCompanyPrefix] = useState(FALLBACK_COMPANY_PREFIX);
+  const [skuRandomDigits, setSkuRandomDigits] = useState(4);
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [pageError, setPageError] = useState<string | null>(null);
@@ -323,7 +326,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
   });
 
   const buildUniqueSku = useCallback(
-    async (categoryId: string, prefix = companyPrefix) => {
+    async (categoryId: string, prefix = companyPrefix, randomDigits = skuRandomDigits) => {
       if (!companyId) {
         return "";
       }
@@ -335,7 +338,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
       }
 
       for (let attempt = 0; attempt < 20; attempt += 1) {
-        const candidate = `${prefix}-${category.code}-${generateSkuDigits()}`.toUpperCase();
+        const candidate = `${prefix}-${category.code}-${generateSkuDigits(randomDigits)}`.toUpperCase();
         const query = supabase
           .from("products")
           .select("id")
@@ -351,7 +354,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
 
       return null;
     },
-    [categories, companyId, companyPrefix, productId],
+    [categories, companyId, companyPrefix, productId, skuRandomDigits],
   );
 
   const loadData = useCallback(async () => {
@@ -379,7 +382,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
     setCompanyId(currentCompanyId);
 
     const [companyResult, categoriesResult, customFieldsResult] = await Promise.all([
-      supabase.from("companies").select("sku_prefix").eq("id", currentCompanyId).maybeSingle(),
+      supabase.from("companies").select("sku_prefix, sku_random_digits").eq("id", currentCompanyId).maybeSingle(),
       supabase
         .from("categories")
         .select("*")
@@ -393,6 +396,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
     ]);
 
     const nextPrefix = companyResult.data?.sku_prefix ?? FALLBACK_COMPANY_PREFIX;
+    const nextSkuRandomDigits = companyResult.data?.sku_random_digits ?? 4;
     const nextCategories = ((categoriesResult.data ?? []) as Category[]) ?? [];
     const nextCustomFields = ((customFieldsResult.data ?? []) as CustomField[]) ?? [];
     const defaultCustomValues = nextCustomFields.reduce<CustomFieldValuesState>((acc, field) => {
@@ -419,6 +423,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
     }
 
     setCompanyPrefix(nextPrefix);
+    setSkuRandomDigits(nextSkuRandomDigits);
     setCategories(nextCategories);
     setCustomFieldDefinitions(nextCustomFields);
     setCustomFieldValues(defaultCustomValues);
@@ -506,7 +511,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
       let candidate: string | null = null;
 
       for (let attempt = 0; attempt < 20; attempt += 1) {
-        const nextSku = `${nextPrefix}-${category.code}-${generateSkuDigits()}`.toUpperCase();
+        const nextSku = `${nextPrefix}-${category.code}-${generateSkuDigits(nextSkuRandomDigits)}`.toUpperCase();
         const { data, error } = await supabase
           .from("products")
           .select("id")

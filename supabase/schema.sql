@@ -14,15 +14,39 @@ begin
 end;
 $$;
 
+create or replace function public.generate_company_code()
+returns text
+language plpgsql
+as $$
+declare
+  candidate text;
+begin
+  loop
+    candidate := lpad(floor(random() * 1000000)::int::text, 6, '0');
+    exit when not exists (
+      select 1
+      from public.companies
+      where company_code = candidate
+    );
+  end loop;
+
+  return candidate;
+end;
+$$;
+
 create table public.companies (
   id uuid primary key default gen_random_uuid(),
   name text not null,
   slug text not null,
   sku_prefix text not null,
+  sku_random_digits integer not null default 4,
+  company_code text default public.generate_company_code(),
   currency text not null default 'KGS',
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   constraint companies_slug_unique unique (slug),
+  constraint companies_company_code_check check (company_code ~ '^[0-9]{5,6}$'),
+  constraint companies_sku_random_digits_check check (sku_random_digits in (4, 5, 6)),
   constraint companies_sku_prefix_check check (sku_prefix ~ '^[A-Za-z0-9]{2,6}$')
 );
 
@@ -178,6 +202,7 @@ create table public.import_errors (
 );
 
 create index profiles_company_id_idx on public.profiles(company_id);
+create unique index companies_company_code_unique_idx on public.companies(company_code);
 create index categories_company_id_idx on public.categories(company_id);
 create index categories_company_sort_order_idx on public.categories(company_id, sort_order);
 create index products_company_id_idx on public.products(company_id);

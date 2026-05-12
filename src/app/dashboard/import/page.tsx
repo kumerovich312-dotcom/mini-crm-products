@@ -84,10 +84,12 @@ function splitKeywords(value: string) {
     .filter(Boolean);
 }
 
-function generateSkuDigits() {
-  return Math.floor(Math.random() * 10000)
+function generateSkuDigits(length: number) {
+  const max = 10 ** length;
+
+  return Math.floor(Math.random() * max)
     .toString()
-    .padStart(4, "0");
+    .padStart(length, "0");
 }
 
 function guessMapping(columns: string[], customFields: CustomField[]) {
@@ -148,6 +150,7 @@ export default function ImportPage() {
   const [customFields, setCustomFields] = useState<CustomField[]>([]);
   const [companyId, setCompanyId] = useState<string | null>(null);
   const [companyPrefix, setCompanyPrefix] = useState("JWL");
+  const [skuRandomDigits, setSkuRandomDigits] = useState(4);
   const [existingProducts, setExistingProducts] = useState<Product[]>([]);
   const [validationErrors, setValidationErrors] = useState<ImportErrorItem[]>([]);
   const [result, setResult] = useState<ImportResult | null>(null);
@@ -210,7 +213,7 @@ export default function ImportPage() {
     setCompanyId(currentCompanyId);
 
     const [companyResult, categoriesResult, customFieldsResult, productsResult] = await Promise.all([
-      supabase.from("companies").select("sku_prefix").eq("id", currentCompanyId).maybeSingle(),
+      supabase.from("companies").select("sku_prefix, sku_random_digits").eq("id", currentCompanyId).maybeSingle(),
       supabase.from("categories").select("*").eq("company_id", currentCompanyId).order("sort_order", { ascending: true }),
       supabase.from("custom_fields").select("*").eq("company_id", currentCompanyId).order("sort_order", { ascending: true }),
       supabase.from("products").select("*").eq("company_id", currentCompanyId),
@@ -225,6 +228,7 @@ export default function ImportPage() {
     }
 
     setCompanyPrefix(companyResult.data?.sku_prefix ?? "JWL");
+    setSkuRandomDigits(companyResult.data?.sku_random_digits ?? 4);
     setCategories(((categoriesResult.data ?? []) as Category[]) ?? []);
     setCustomFields(((customFieldsResult.data ?? []) as CustomField[]) ?? []);
     setExistingProducts(((productsResult.data ?? []) as Product[]) ?? []);
@@ -388,7 +392,7 @@ export default function ImportPage() {
 
   async function buildUniqueSku(categoryCode: string, usedSkus: Set<string>) {
     for (let attempt = 0; attempt < 20; attempt += 1) {
-      const sku = `${companyPrefix}-${categoryCode}-${generateSkuDigits()}`.toUpperCase();
+      const sku = `${companyPrefix}-${categoryCode}-${generateSkuDigits(skuRandomDigits)}`.toUpperCase();
 
       if (!usedSkus.has(sku)) {
         usedSkus.add(sku);

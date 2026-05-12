@@ -1,65 +1,36 @@
 "use client";
 
-import { useState } from "react";
-import { Bot, Building2, KeyRound, Save, Settings2, UploadCloud } from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
+import { Building2, Loader2, Save, Settings2, UploadCloud } from "lucide-react";
 
 import { PageHeader } from "@/components/page-header";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { selectClassName } from "@/components/ui/select-style";
-import { Switch } from "@/components/ui/switch";
+import { getCurrentCompanyId } from "@/lib/auth/get-current-company";
+import { getErrorMessage, logAppError } from "@/lib/errors";
+import { supabase } from "@/lib/supabase/client";
+import type { Company } from "@/types/database";
 
 type SettingsState = {
   companyName: string;
   companySlug: string;
+  companyCode: string;
+  technicalCompanyId: string;
   skuPrefix: string;
+  skuRandomDigits: string;
   currency: string;
-  productCodeLength: string;
-  allowManualSku: boolean;
-  photoLimit: string;
-  videoLimit: string;
-  maxPhotoSize: string;
-  maxVideoSize: string;
-  autoCompressPhotos: boolean;
-  convertHeic: boolean;
-  convertMov: boolean;
-  keepOriginals: boolean;
-  telegramShowGuide: boolean;
-  telegramPhotoUpload: boolean;
-  telegramVideoUpload: boolean;
-  telegramMaxVideoLength: string;
-  telegramLargeFileAction: string;
-  apiEnabled: boolean;
-  apiDailyLimit: string;
-  apiShowHidden: boolean;
-  apiShowOutOfStock: boolean;
 };
 
 const initialSettings: SettingsState = {
-  companyName: "Jibek Jewelry",
-  companySlug: "jibek-jewelry",
+  companyName: "",
+  companySlug: "",
+  companyCode: "",
+  technicalCompanyId: "",
   skuPrefix: "JWL",
+  skuRandomDigits: "4",
   currency: "KGS",
-  productCodeLength: "4",
-  allowManualSku: true,
-  photoLimit: "10",
-  videoLimit: "3",
-  maxPhotoSize: "20",
-  maxVideoSize: "300",
-  autoCompressPhotos: true,
-  convertHeic: true,
-  convertMov: true,
-  keepOriginals: false,
-  telegramShowGuide: true,
-  telegramPhotoUpload: true,
-  telegramVideoUpload: true,
-  telegramMaxVideoLength: "30",
-  telegramLargeFileAction: "web_upload_link",
-  apiEnabled: true,
-  apiDailyLimit: "5000",
-  apiShowHidden: false,
-  apiShowOutOfStock: true,
 };
 
 const selectClass = selectClassName;
@@ -80,40 +51,87 @@ function FieldLabel({ children, htmlFor }: { children: React.ReactNode; htmlFor?
   );
 }
 
-function ToggleRow({
-  title,
-  description,
-  checked,
-  onChange,
-}: {
-  title: string;
-  description: string;
-  checked: boolean;
-  onChange: (checked: boolean) => void;
-}) {
-  return (
-    <label className="flex cursor-pointer items-start justify-between gap-4 rounded-lg border bg-white p-4">
-      <span>
-        <span className="block text-sm font-medium">{title}</span>
-        <span className="mt-1 block text-sm text-muted-foreground">{description}</span>
-      </span>
-      <Switch checked={checked} className="mt-1" onCheckedChange={onChange} />
-    </label>
-  );
+function buildExampleSku(prefix: string, digits: string) {
+  const length = Number(digits) || 4;
+  const exampleDigits = "493718".slice(0, length);
+
+  return `${prefix || "JWL"}-001-${exampleDigits}`;
 }
 
 export default function SettingsPage() {
+  const [companyId, setCompanyId] = useState<string | null>(null);
   const [settings, setSettings] = useState(initialSettings);
   const [errors, setErrors] = useState<Partial<Record<keyof SettingsState, string>>>({});
+  const [pageError, setPageError] = useState<string | null>(null);
+  const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isSaving, setIsSaving] = useState(false);
 
   function updateSetting<K extends keyof SettingsState>(field: K, value: SettingsState[K]) {
     setSettings((current) => ({ ...current, [field]: value }));
     setErrors((current) => ({ ...current, [field]: undefined }));
+    setSuccessMessage(null);
   }
 
-  function isPositiveNumber(value: string) {
-    return Number(value) > 0 && !Number.isNaN(Number(value));
-  }
+  const loadSettings = useCallback(async () => {
+    setIsLoading(true);
+    setPageError(null);
+    setSuccessMessage(null);
+
+    try {
+      const currentCompanyId = await getCurrentCompanyId();
+
+      if (!currentCompanyId) {
+        setPageError("Компания текущего пользователя не найдена. Войдите заново.");
+        setCompanyId(null);
+        setSettings(initialSettings);
+        return;
+      }
+
+      setCompanyId(currentCompanyId);
+
+      const { data, error } = await supabase
+        .from("companies")
+        .select("id, name, slug, sku_prefix, sku_random_digits, company_code, currency")
+        .eq("id", currentCompanyId)
+        .maybeSingle();
+
+      if (error) {
+        logAppError("Settings company load error", error);
+        setPageError(error.message);
+        return;
+      }
+
+      if (!data) {
+        setPageError("Компания текущего пользователя не найдена.");
+        return;
+      }
+
+      const company = data as Pick<
+        Company,
+        "id" | "name" | "slug" | "sku_prefix" | "sku_random_digits" | "company_code" | "currency"
+      >;
+
+      setSettings({
+        companyName: company.name,
+        companySlug: company.slug,
+        companyCode: company.company_code ?? "",
+        technicalCompanyId: company.id,
+        skuPrefix: company.sku_prefix,
+        skuRandomDigits: String(company.sku_random_digits ?? 4),
+        currency: company.currency,
+      });
+    } catch (error) {
+      logAppError("Settings load error", error);
+      setPageError(getErrorMessage(error));
+    } finally {
+      setIsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadSettings();
+  }, [loadSettings]);
 
   function validateSettings() {
     const nextErrors: Partial<Record<keyof SettingsState, string>> = {};
@@ -122,322 +140,239 @@ export default function SettingsPage() {
       nextErrors.companyName = "Название компании не должно быть пустым";
     }
 
+    if (!settings.companySlug.trim()) {
+      nextErrors.companySlug = "Slug компании не должен быть пустым";
+    }
+
+    if (!/^[a-zA-Z0-9-]+$/.test(settings.companySlug.trim())) {
+      nextErrors.companySlug = "Slug может содержать латиницу, цифры и дефис";
+    }
+
     if (!/^[a-zA-Z0-9]{2,6}$/.test(settings.skuPrefix.trim())) {
-      nextErrors.skuPrefix = "Префикс: латиница и цифры, 2–6 символов";
+      nextErrors.skuPrefix = "Префикс: латиница и цифры, 2-6 символов";
     }
 
-    if (!["4", "5", "6"].includes(settings.productCodeLength)) {
-      nextErrors.productCodeLength = "Длина кода товара должна быть 4, 5 или 6";
-    }
-
-    for (const field of ["photoLimit", "videoLimit", "maxPhotoSize", "maxVideoSize", "telegramMaxVideoLength", "apiDailyLimit"] as const) {
-      if (!isPositiveNumber(settings[field])) {
-        nextErrors[field] = "Значение должно быть положительным числом";
-      }
+    if (!["4", "5", "6"].includes(settings.skuRandomDigits)) {
+      nextErrors.skuRandomDigits = "Длина случайной части SKU должна быть 4, 5 или 6";
     }
 
     setErrors(nextErrors);
     return Object.keys(nextErrors).length === 0;
   }
 
-  function saveSettings() {
-    if (!validateSettings()) {
+  async function saveSettings() {
+    if (!companyId || !validateSettings()) {
       return;
     }
 
-    alert("Настройки сохранены локально. Подключение к базе будет позже.");
+    setIsSaving(true);
+    setPageError(null);
+    setSuccessMessage(null);
+
+    try {
+      const { data, error } = await supabase
+        .from("companies")
+        .update({
+          name: settings.companyName.trim(),
+          slug: settings.companySlug.trim().toLowerCase(),
+          sku_prefix: settings.skuPrefix.trim().toUpperCase(),
+          sku_random_digits: Number(settings.skuRandomDigits),
+          currency: settings.currency,
+        })
+        .eq("id", companyId)
+        .select("id, name, slug, sku_prefix, sku_random_digits, company_code, currency")
+        .single();
+
+      if (error) {
+        logAppError("Settings company save error", error);
+        setPageError(error.message);
+        return;
+      }
+
+      const company = data as Pick<
+        Company,
+        "id" | "name" | "slug" | "sku_prefix" | "sku_random_digits" | "company_code" | "currency"
+      >;
+
+      setSettings({
+        companyName: company.name,
+        companySlug: company.slug,
+        companyCode: company.company_code ?? settings.companyCode,
+        technicalCompanyId: company.id,
+        skuPrefix: company.sku_prefix,
+        skuRandomDigits: String(company.sku_random_digits),
+        currency: company.currency,
+      });
+      setSuccessMessage("Настройки сохранены");
+    } catch (error) {
+      logAppError("Settings company save exception", error);
+      setPageError(getErrorMessage(error));
+    } finally {
+      setIsSaving(false);
+    }
   }
+
+  const exampleSku = buildExampleSku(settings.skuPrefix, settings.skuRandomDigits);
 
   return (
     <>
       <PageHeader
         badge="Settings"
         title="Настройки"
-        description="Базовые настройки компании, артикула, валюты и обработки медиа."
+        description="Базовые настройки компании, артикула и валюты."
         action={
-          <Button onClick={saveSettings}>
-            <Save />
+          <Button onClick={() => void saveSettings()} disabled={isLoading || isSaving}>
+            {isSaving ? <Loader2 className="animate-spin" /> : <Save />}
             Сохранить настройки
           </Button>
         }
       />
 
-      <div className="space-y-6">
+      {pageError ? (
+        <Card className="mb-6 border-red-100 bg-red-50">
+          <CardContent className="p-5 text-sm text-red-700">{pageError}</CardContent>
+        </Card>
+      ) : null}
+
+      {successMessage ? (
+        <Card className="mb-6 border-emerald-100 bg-emerald-50">
+          <CardContent className="p-5 text-sm text-emerald-700">{successMessage}</CardContent>
+        </Card>
+      ) : null}
+
+      {isLoading ? (
         <Card>
-          <CardHeader>
-            <div className="flex items-center gap-3">
-              <SectionIcon icon={Building2} />
-              <div>
-                <CardTitle>Компания</CardTitle>
-                <CardDescription>Основные данные компании для каталога и артикулов.</CardDescription>
-              </div>
-            </div>
-          </CardHeader>
-          <CardContent className="grid gap-4 md:grid-cols-2">
-            <div className="space-y-2">
-              <FieldLabel htmlFor="company-name">Название компании</FieldLabel>
-              <Input
-                id="company-name"
-                value={settings.companyName}
-                onChange={(event) => updateSetting("companyName", event.target.value)}
-              />
-              {errors.companyName ? <p className="text-xs text-red-600">{errors.companyName}</p> : null}
-            </div>
-            <div className="space-y-2">
-              <FieldLabel htmlFor="company-slug">Slug компании</FieldLabel>
-              <Input
-                id="company-slug"
-                value={settings.companySlug}
-                onChange={(event) => updateSetting("companySlug", event.target.value)}
-              />
-            </div>
-            <div className="space-y-2">
-              <FieldLabel htmlFor="sku-prefix">Префикс артикула</FieldLabel>
-              <Input
-                id="sku-prefix"
-                value={settings.skuPrefix}
-                onChange={(event) => updateSetting("skuPrefix", event.target.value.toUpperCase())}
-              />
-              {errors.skuPrefix ? <p className="text-xs text-red-600">{errors.skuPrefix}</p> : null}
-            </div>
-            <div className="space-y-2">
-              <FieldLabel htmlFor="currency">Валюта</FieldLabel>
-              <select
-                id="currency"
-                className={selectClass}
-                value={settings.currency}
-                onChange={(event) => updateSetting("currency", event.target.value)}
-              >
-                <option value="KGS">KGS</option>
-                <option value="KZT">KZT</option>
-                <option value="USD">USD</option>
-                <option value="EUR">EUR</option>
-              </select>
-            </div>
+          <CardContent className="flex items-center gap-2 p-6 text-sm text-muted-foreground">
+            <Loader2 className="animate-spin" />
+            Загрузка настроек
           </CardContent>
         </Card>
-
-        <Card>
-          <CardHeader>
-            <div className="flex items-center gap-3">
-              <SectionIcon icon={Settings2} />
-              <div>
-                <CardTitle>Артикулы</CardTitle>
-                <CardDescription>
-                  Артикул формируется по шаблону: [ПРЕФИКС]-[КОД_КАТЕГОРИИ]-[КОД_ТОВАРА]
-                </CardDescription>
-              </div>
-            </div>
-          </CardHeader>
-          <CardContent className="space-y-5">
-            <div className="rounded-lg border bg-blue-50 p-4">
-              <p className="text-sm text-muted-foreground">Пример артикула</p>
-              <p className="mt-1 font-mono text-lg font-semibold text-blue-700">
-                {settings.skuPrefix || "JWL"}-001-4937
-              </p>
-            </div>
-            <div className="grid gap-4 md:grid-cols-2">
-              <div className="space-y-2">
-                <FieldLabel htmlFor="sku-company-prefix">Префикс компании</FieldLabel>
-                <Input
-                  id="sku-company-prefix"
-                  value={settings.skuPrefix}
-                  onChange={(event) => updateSetting("skuPrefix", event.target.value.toUpperCase())}
-                />
-                {errors.skuPrefix ? <p className="text-xs text-red-600">{errors.skuPrefix}</p> : null}
-              </div>
-              <div className="space-y-2">
-                <FieldLabel htmlFor="product-code-length">Длина случайного кода товара</FieldLabel>
-                <select
-                  id="product-code-length"
-                  className={selectClass}
-                  value={settings.productCodeLength}
-                  onChange={(event) => updateSetting("productCodeLength", event.target.value)}
-                >
-                  <option value="4">4 символа</option>
-                  <option value="5">5 символов</option>
-                  <option value="6">6 символов</option>
-                </select>
-                {errors.productCodeLength ? <p className="text-xs text-red-600">{errors.productCodeLength}</p> : null}
-              </div>
-            </div>
-            <ToggleRow
-              title="Разрешить ручное изменение SKU"
-              description="Пользователь сможет редактировать артикул в карточке товара."
-              checked={settings.allowManualSku}
-              onChange={(checked) => updateSetting("allowManualSku", checked)}
-            />
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader>
-            <div className="flex items-center gap-3">
-              <SectionIcon icon={UploadCloud} />
-              <div>
-                <CardTitle>Медиа</CardTitle>
-                <CardDescription>Ограничения и обработка фото/видео товара.</CardDescription>
-              </div>
-            </div>
-          </CardHeader>
-          <CardContent className="space-y-5">
-            <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-              {[
-                ["photoLimit", "Лимит фото на товар"],
-                ["videoLimit", "Лимит видео на товар"],
-                ["maxPhotoSize", "Максимальный размер фото, MB"],
-                ["maxVideoSize", "Максимальный размер видео, MB"],
-              ].map(([field, label]) => (
-                <div key={field} className="space-y-2">
-                  <FieldLabel htmlFor={field}>{label}</FieldLabel>
-                  <Input
-                    id={field}
-                    value={settings[field as keyof SettingsState] as string}
-                    onChange={(event) => updateSetting(field as keyof SettingsState, event.target.value)}
-                  />
-                  {errors[field as keyof SettingsState] ? (
-                    <p className="text-xs text-red-600">{errors[field as keyof SettingsState]}</p>
-                  ) : null}
+      ) : (
+        <div className="space-y-6">
+          <Card>
+            <CardHeader>
+              <div className="flex items-center gap-3">
+                <SectionIcon icon={Building2} />
+                <div>
+                  <CardTitle>Компания</CardTitle>
+                  <CardDescription>Основные данные компании для каталога и артикулов.</CardDescription>
                 </div>
-              ))}
-            </div>
-            <div className="grid gap-3 md:grid-cols-2">
-              <ToggleRow
-                title="Автосжатие фото"
-                description="Сжимать фото без искажения внешнего вида товара."
-                checked={settings.autoCompressPhotos}
-                onChange={(checked) => updateSetting("autoCompressPhotos", checked)}
-              />
-              <ToggleRow
-                title="Конвертация HEIC в JPG/WebP"
-                description="Преобразовывать HEIC после загрузки."
-                checked={settings.convertHeic}
-                onChange={(checked) => updateSetting("convertHeic", checked)}
-              />
-              <ToggleRow
-                title="Конвертация MOV в MP4"
-                description="Преобразовывать MOV для web-просмотра."
-                checked={settings.convertMov}
-                onChange={(checked) => updateSetting("convertMov", checked)}
-              />
-              <ToggleRow
-                title="Сохранять оригиналы файлов"
-                description="Хранить исходные файлы вместе с обработанными версиями."
-                checked={settings.keepOriginals}
-                onChange={(checked) => updateSetting("keepOriginals", checked)}
-              />
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader>
-            <div className="flex items-center gap-3">
-              <SectionIcon icon={Bot} />
-              <div>
-                <CardTitle>Telegram-добавление</CardTitle>
-                <CardDescription>Настройки будущего добавления товара через Telegram.</CardDescription>
               </div>
-            </div>
-          </CardHeader>
-          <CardContent className="space-y-5">
-            <div className="grid gap-3 md:grid-cols-2">
-              <ToggleRow
-                title="Показывать инструкцию по съёмке"
-                description="Перед загрузкой медиа показывать рекомендации."
-                checked={settings.telegramShowGuide}
-                onChange={(checked) => updateSetting("telegramShowGuide", checked)}
-              />
-              <ToggleRow
-                title="Разрешить загрузку фото через Telegram"
-                description="Пользователь сможет отправлять фото в бот."
-                checked={settings.telegramPhotoUpload}
-                onChange={(checked) => updateSetting("telegramPhotoUpload", checked)}
-              />
-              <ToggleRow
-                title="Разрешить загрузку видео через Telegram"
-                description="Пользователь сможет отправлять видео в бот."
-                checked={settings.telegramVideoUpload}
-                onChange={(checked) => updateSetting("telegramVideoUpload", checked)}
-              />
-            </div>
-            <div className="grid gap-4 md:grid-cols-2">
+            </CardHeader>
+            <CardContent className="grid gap-4 md:grid-cols-2">
               <div className="space-y-2">
-                <FieldLabel htmlFor="telegram-video-length">Максимальная длина видео, секунд</FieldLabel>
+                <FieldLabel htmlFor="company-code">Номер компании</FieldLabel>
+                <Input id="company-code" value={settings.companyCode || "Будет создан после миграции"} disabled />
+                <p className="text-xs text-muted-foreground">Красивый публичный номер. UUID компании не заменяет.</p>
+              </div>
+              <div className="space-y-2">
+                <FieldLabel htmlFor="company-id">Технический ID</FieldLabel>
+                <Input id="company-id" value={settings.technicalCompanyId} disabled />
+              </div>
+              <div className="space-y-2">
+                <FieldLabel htmlFor="company-name">Название компании</FieldLabel>
                 <Input
-                  id="telegram-video-length"
-                  value={settings.telegramMaxVideoLength}
-                  onChange={(event) => updateSetting("telegramMaxVideoLength", event.target.value)}
+                  id="company-name"
+                  value={settings.companyName}
+                  onChange={(event) => updateSetting("companyName", event.target.value)}
                 />
-                {errors.telegramMaxVideoLength ? (
-                  <p className="text-xs text-red-600">{errors.telegramMaxVideoLength}</p>
-                ) : null}
+                {errors.companyName ? <p className="text-xs text-red-600">{errors.companyName}</p> : null}
               </div>
               <div className="space-y-2">
-                <FieldLabel htmlFor="large-file-action">Если файл большой</FieldLabel>
+                <FieldLabel htmlFor="company-slug">Slug компании</FieldLabel>
+                <Input
+                  id="company-slug"
+                  value={settings.companySlug}
+                  onChange={(event) => updateSetting("companySlug", event.target.value.toLowerCase())}
+                />
+                {errors.companySlug ? <p className="text-xs text-red-600">{errors.companySlug}</p> : null}
+              </div>
+              <div className="space-y-2">
+                <FieldLabel htmlFor="currency">Валюта</FieldLabel>
                 <select
-                  id="large-file-action"
+                  id="currency"
                   className={selectClass}
-                  value={settings.telegramLargeFileAction}
-                  onChange={(event) => updateSetting("telegramLargeFileAction", event.target.value)}
+                  value={settings.currency}
+                  onChange={(event) => updateSetting("currency", event.target.value)}
                 >
-                  <option value="web_upload_link">дать ссылку на web-загрузку</option>
+                  <option value="KGS">KGS</option>
+                  <option value="KZT">KZT</option>
+                  <option value="USD">USD</option>
+                  <option value="EUR">EUR</option>
                 </select>
               </div>
-            </div>
-          </CardContent>
-        </Card>
+            </CardContent>
+          </Card>
 
-        <Card>
-          <CardHeader>
-            <div className="flex items-center gap-3">
-              <SectionIcon icon={KeyRound} />
-              <div>
-                <CardTitle>API для ИИ</CardTitle>
-                <CardDescription>Настройки read-only API для внешнего AI-бота.</CardDescription>
+          <Card>
+            <CardHeader>
+              <div className="flex items-center gap-3">
+                <SectionIcon icon={Settings2} />
+                <div>
+                  <CardTitle>Артикулы</CardTitle>
+                  <CardDescription>Новые товары используют шаблон [ПРЕФИКС]-[КОД_КАТЕГОРИИ]-[СЛУЧАЙНЫЕ_ЦИФРЫ].</CardDescription>
+                </div>
               </div>
-            </div>
-          </CardHeader>
-          <CardContent className="space-y-5">
-            <div className="grid gap-3 md:grid-cols-2">
-              <ToggleRow
-                title="Включить API"
-                description="Разрешить read-only доступ к каталогу по API-ключу."
-                checked={settings.apiEnabled}
-                onChange={(checked) => updateSetting("apiEnabled", checked)}
-              />
-              <ToggleRow
-                title="Показывать скрытые товары в API"
-                description="По умолчанию выключено для аккуратной выдачи."
-                checked={settings.apiShowHidden}
-                onChange={(checked) => updateSetting("apiShowHidden", checked)}
-              />
-              <ToggleRow
-                title="Показывать товары без остатка в API"
-                description="Разрешить внешнему AI-боту видеть товары с нулевым остатком."
-                checked={settings.apiShowOutOfStock}
-                onChange={(checked) => updateSetting("apiShowOutOfStock", checked)}
-              />
-            </div>
-            <div className="max-w-sm space-y-2">
-              <FieldLabel htmlFor="api-daily-limit">Лимит запросов в день</FieldLabel>
-              <Input
-                id="api-daily-limit"
-                value={settings.apiDailyLimit}
-                onChange={(event) => updateSetting("apiDailyLimit", event.target.value)}
-              />
-              {errors.apiDailyLimit ? <p className="text-xs text-red-600">{errors.apiDailyLimit}</p> : null}
-            </div>
-          </CardContent>
-        </Card>
+            </CardHeader>
+            <CardContent className="space-y-5">
+              <div className="rounded-lg border bg-blue-50 p-4">
+                <p className="text-sm text-muted-foreground">Пример артикула</p>
+                <p className="mt-1 font-mono text-lg font-semibold text-blue-700">{exampleSku}</p>
+              </div>
+              <div className="grid gap-4 md:grid-cols-2">
+                <div className="space-y-2">
+                  <FieldLabel htmlFor="sku-prefix">Префикс компании</FieldLabel>
+                  <Input
+                    id="sku-prefix"
+                    value={settings.skuPrefix}
+                    onChange={(event) => updateSetting("skuPrefix", event.target.value.toUpperCase())}
+                  />
+                  {errors.skuPrefix ? <p className="text-xs text-red-600">{errors.skuPrefix}</p> : null}
+                </div>
+                <div className="space-y-2">
+                  <FieldLabel htmlFor="sku-random-digits">Длина случайной части SKU</FieldLabel>
+                  <select
+                    id="sku-random-digits"
+                    className={selectClass}
+                    value={settings.skuRandomDigits}
+                    onChange={(event) => updateSetting("skuRandomDigits", event.target.value)}
+                  >
+                    <option value="4">4 цифры</option>
+                    <option value="5">5 цифр</option>
+                    <option value="6">6 цифр</option>
+                  </select>
+                  {errors.skuRandomDigits ? <p className="text-xs text-red-600">{errors.skuRandomDigits}</p> : null}
+                </div>
+              </div>
+            </CardContent>
+          </Card>
 
-        <div className="flex justify-end">
-          <Button onClick={saveSettings}>
-            <Save />
-            Сохранить настройки
-          </Button>
+          <Card>
+            <CardHeader>
+              <div className="flex items-center gap-3">
+                <SectionIcon icon={UploadCloud} />
+                <div>
+                  <CardTitle>Медиа, Telegram и API</CardTitle>
+                  <CardDescription>Эти настройки будут подключены отдельным этапом.</CardDescription>
+                </div>
+              </div>
+            </CardHeader>
+            <CardContent>
+              <div className="rounded-lg border bg-slate-50 p-4 text-sm text-muted-foreground">
+                Переключатели обработки медиа, Telegram и лимитов API скрыты как рабочие настройки, чтобы не создавать
+                ощущение сохранения без влияния на продукт. Сейчас реально сохраняются настройки компании, валюты и SKU.
+              </div>
+            </CardContent>
+          </Card>
+
+          <div className="flex justify-end">
+            <Button onClick={() => void saveSettings()} disabled={isSaving}>
+              {isSaving ? <Loader2 className="animate-spin" /> : <Save />}
+              Сохранить настройки
+            </Button>
+          </div>
         </div>
-      </div>
+      )}
     </>
   );
 }
