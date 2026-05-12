@@ -27,8 +27,6 @@ function getCustomFieldValue(field: CustomField, value: ProductCustomValue) {
 
 export async function GET(request: Request, context: { params: Promise<{ id: string }> }) {
   const { id } = await context.params;
-  const { searchParams } = new URL(request.url);
-  const includeDrafts = searchParams.get("include_drafts") === "true";
 
   const [productResult, categoriesResult, mediaResult, customFieldsResult, customValuesResult] = await Promise.all([
     supabaseServer
@@ -36,7 +34,9 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
       .select("*")
       .eq("company_id", DEFAULT_COMPANY_ID)
       .eq("id", id)
+      .eq("status", "active")
       .eq("is_visible_in_api", true)
+      .gt("stock", 0)
       .maybeSingle(),
     supabaseServer.from("categories").select("*").eq("company_id", DEFAULT_COMPANY_ID),
     supabaseServer
@@ -66,10 +66,6 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
   }
 
   const product = productResult.data as Product;
-
-  if (product.status !== "active" && !(includeDrafts && product.status === "draft")) {
-    return NextResponse.json({ error: "Product not found" }, { status: 404 });
-  }
 
   const categories = ((categoriesResult.data ?? []) as Category[]) ?? [];
   const category = product.category_id ? categories.find((item) => item.id === product.category_id) ?? null : null;

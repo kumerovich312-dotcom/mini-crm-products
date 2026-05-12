@@ -1,9 +1,11 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import * as XLSX from "xlsx";
 import {
+  Bot,
   Download,
   Edit3,
   Eye,
@@ -100,7 +102,44 @@ function getCustomFieldValue(field: CustomField, value: ProductCustomValue) {
   return value.value_text ?? "";
 }
 
+function getApiBadge(product: Product) {
+  if (product.status === "hidden") {
+    return { label: "Скрыт", className: "bg-slate-100 text-slate-700" };
+  }
+
+  if (product.stock <= 0) {
+    return { label: "Нет остатка", className: "bg-orange-50 text-orange-700" };
+  }
+
+  if (product.status === "active" && product.is_visible_in_api) {
+    return { label: "В API", className: "bg-emerald-50 text-emerald-700" };
+  }
+
+  return { label: "Не в API", className: "bg-slate-100 text-slate-700" };
+}
+
+function getRowClassName(product: Product) {
+  if (product.status === "hidden") {
+    return "bg-slate-50/80 text-muted-foreground opacity-75 hover:bg-slate-100/80";
+  }
+
+  if (product.status === "draft") {
+    return "border-l-2 border-l-amber-200 bg-amber-50/20 hover:bg-amber-50/40";
+  }
+
+  if (product.stock <= 0) {
+    return "border-l-2 border-l-orange-200 bg-orange-50/20 hover:bg-orange-50/40";
+  }
+
+  if (product.status === "active" && product.is_visible_in_api) {
+    return "border-l-2 border-l-emerald-200 hover:bg-emerald-50/20";
+  }
+
+  return "hover:bg-slate-50/70";
+}
+
 export default function ProductsPage() {
+  const router = useRouter();
   const [companyId, setCompanyId] = useState<string | null>(null);
   const [products, setProducts] = useState<Product[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
@@ -271,17 +310,26 @@ export default function ProductsPage() {
     });
   }, [categoryId, products, query, status, stockFilter]);
 
-  async function hideProduct(product: Product) {
+  async function toggleProductVisibility(product: Product) {
     if (!companyId) {
       setPageError("Компания текущего пользователя не найдена.");
       return;
     }
 
+    if (product.status !== "active" && product.status !== "hidden") {
+      setPageError("Черновик или товар без наличия нельзя случайно перевести в активный статус через скрытие.");
+      return;
+    }
+
     setPageError(null);
+    const nextValues =
+      product.status === "hidden"
+        ? { status: "active" as ProductStatus }
+        : { status: "hidden" as ProductStatus, is_visible_in_api: false };
 
     const { error } = await supabase
       .from("products")
-      .update({ status: "hidden", is_visible_in_api: false })
+      .update(nextValues)
       .eq("id", product.id)
       .eq("company_id", companyId);
 
@@ -290,12 +338,51 @@ export default function ProductsPage() {
       return;
     }
 
-    await loadData();
+    setProducts((current) =>
+      current.map((item) => (item.id === product.id ? { ...item, ...nextValues, updated_at: new Date().toISOString() } : item)),
+    );
+  }
+
+  async function toggleProductApiVisibility(product: Product) {
+    if (!companyId) {
+      setPageError("Компания текущего пользователя не найдена.");
+      return;
+    }
+
+    if (product.status === "hidden" || product.status === "draft") {
+      setPageError("Сначала активируйте товар");
+      return;
+    }
+
+    setPageError(null);
+    const nextIsVisibleInApi = !product.is_visible_in_api;
+    const { error } = await supabase
+      .from("products")
+      .update({ is_visible_in_api: nextIsVisibleInApi })
+      .eq("id", product.id)
+      .eq("company_id", companyId);
+
+    if (error) {
+      setPageError(error.message);
+      return;
+    }
+
+    setProducts((current) =>
+      current.map((item) =>
+        item.id === product.id
+          ? { ...item, is_visible_in_api: nextIsVisibleInApi, updated_at: new Date().toISOString() }
+          : item,
+      ),
+    );
   }
 
   async function deleteProduct(product: Product) {
     if (!companyId) {
       setPageError("Компания текущего пользователя не найдена.");
+      return;
+    }
+
+    if (!window.confirm(`Удалить товар "${product.name}"?`)) {
       return;
     }
 
@@ -312,7 +399,13 @@ export default function ProductsPage() {
       return;
     }
 
-    await loadData();
+    setProducts((current) => current.filter((item) => item.id !== product.id));
+    setMediaByProductId((current) => {
+      const nextMedia = new Map(current);
+      nextMedia.delete(product.id);
+      return nextMedia;
+    });
+    setCustomValues((current) => current.filter((value) => value.product_id !== product.id));
   }
 
   function resetFilters() {
@@ -482,7 +575,7 @@ export default function ProductsPage() {
 
           <div className="mt-5 overflow-hidden rounded-lg border">
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[1120px] border-collapse bg-white text-sm">
+              <table className="w-full min-w-[1220px] border-collapse bg-white text-sm">
                 <thead className="bg-slate-50 text-left text-xs uppercase text-muted-foreground">
                   <tr>
                     <th className="px-4 py-3 font-medium">Фото</th>
@@ -493,6 +586,7 @@ export default function ProductsPage() {
                     <th className="px-4 py-3 font-medium">Цена</th>
                     <th className="px-4 py-3 font-medium">Остаток</th>
                     <th className="px-4 py-3 font-medium">Статус</th>
+                    <th className="px-4 py-3 font-medium">Бот/API</th>
                     <th className="px-4 py-3 font-medium">Обновлено</th>
                     <th className="px-4 py-3 text-right font-medium">Действия</th>
                   </tr>
@@ -500,7 +594,7 @@ export default function ProductsPage() {
                 <tbody>
                   {isLoading ? (
                     <tr>
-                      <td className="px-4 py-10 text-center text-muted-foreground" colSpan={10}>
+                      <td className="px-4 py-10 text-center text-muted-foreground" colSpan={11}>
                         <span className="inline-flex items-center gap-2">
                           <Loader2 className="size-4 animate-spin" />
                           Загрузка товаров
@@ -510,7 +604,7 @@ export default function ProductsPage() {
                   ) : null}
                   {!isLoading && filteredProducts.length === 0 ? (
                     <tr>
-                      <td className="px-4 py-10" colSpan={10}>
+                      <td className="px-4 py-10" colSpan={11}>
                         <EmptyState
                           icon={PackageOpen}
                           title={products.length === 0 ? "Товары пока не добавлены" : "Товары не найдены"}
@@ -529,9 +623,15 @@ export default function ProductsPage() {
                           firstPhoto?.processed_url ??
                           firstPhoto?.original_url;
                         const hasVideo = productMedia.some((item) => item.media_type === "video");
+                        const apiBadge = getApiBadge(product);
+                        const apiToggleDisabled = product.status === "hidden" || product.status === "draft";
 
                         return (
-                          <tr key={product.id} className="border-t align-middle hover:bg-slate-50/70">
+                          <tr
+                            key={product.id}
+                            className={cn("cursor-pointer border-t align-middle transition-colors", getRowClassName(product))}
+                            onClick={() => router.push(`/dashboard/products/${product.id}/edit`)}
+                          >
                             <td className="px-4 py-3">
                               <div className="flex size-12 items-center justify-center overflow-hidden rounded-md bg-blue-50 text-blue-700">
                                 {firstPhotoUrl ? (
@@ -579,24 +679,51 @@ export default function ProductsPage() {
                             <td className="px-4 py-3">
                               <Badge className={statusView.className}>{statusView.label}</Badge>
                             </td>
+                            <td className="px-4 py-3">
+                              <Badge className={apiBadge.className}>{apiBadge.label}</Badge>
+                            </td>
                             <td className="px-4 py-3 text-muted-foreground">{formatDate(product.updated_at)}</td>
                             <td className="px-4 py-3">
                               <div className="flex justify-end gap-1">
-                                <Button asChild variant="ghost" size="icon" aria-label="Открыть">
-                                  <Link href={`/dashboard/products/${product.id}/edit`}>
+                                <Button asChild variant="ghost" size="icon" aria-label="Открыть карточку" title="Открыть карточку">
+                                  <Link
+                                    href={`/dashboard/products/${product.id}/edit`}
+                                    onClick={(event) => event.stopPropagation()}
+                                  >
                                     <Eye />
                                   </Link>
                                 </Button>
-                                <Button asChild variant="ghost" size="icon" aria-label="Редактировать">
-                                  <Link href={`/dashboard/products/${product.id}/edit`}>
+                                <Button asChild variant="ghost" size="icon" aria-label="Редактировать" title="Редактировать">
+                                  <Link
+                                    href={`/dashboard/products/${product.id}/edit`}
+                                    onClick={(event) => event.stopPropagation()}
+                                  >
                                     <Edit3 />
                                   </Link>
                                 </Button>
                                 <Button
                                   variant="ghost"
                                   size="icon"
-                                  aria-label="Скрыть"
-                                  onClick={() => void hideProduct(product)}
+                                  aria-label="Переключить видимость в API"
+                                  title={apiToggleDisabled ? "Сначала активируйте товар" : "Переключить видимость в API"}
+                                  disabled={apiToggleDisabled}
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    void toggleProductApiVisibility(product);
+                                  }}
+                                >
+                                  <Bot className={product.is_visible_in_api ? "text-emerald-700" : undefined} />
+                                </Button>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  aria-label={product.status === "hidden" ? "Показать товар" : "Скрыть товар"}
+                                  title={product.status === "hidden" ? "Показать товар" : "Скрыть товар"}
+                                  disabled={product.status !== "active" && product.status !== "hidden"}
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    void toggleProductVisibility(product);
+                                  }}
                                 >
                                   <EyeOff />
                                 </Button>
@@ -604,7 +731,11 @@ export default function ProductsPage() {
                                   variant="ghost"
                                   size="icon"
                                   aria-label="Удалить"
-                                  onClick={() => void deleteProduct(product)}
+                                  title="Удалить"
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    void deleteProduct(product);
+                                  }}
                                 >
                                   <Trash2 />
                                 </Button>
