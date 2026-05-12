@@ -8,6 +8,8 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { selectClassName } from "@/components/ui/select-style";
+import { Switch } from "@/components/ui/switch";
 import { getCurrentCompanyId } from "@/lib/auth/get-current-company";
 import { getErrorMessage, logAppError } from "@/lib/errors";
 import { supabase } from "@/lib/supabase/client";
@@ -44,8 +46,7 @@ const emptyForm: CustomFieldForm = {
   optionsText: "",
 };
 
-const selectClass =
-  "h-10 rounded-md border border-input bg-white px-3 text-sm text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring";
+const selectClass = selectClassName;
 
 function boolBadge(value: boolean, trueLabel: string, falseLabel: string) {
   return (
@@ -540,6 +541,7 @@ export default function CustomFieldsPage() {
                 <select
                   id="field-type"
                   className={selectClass}
+                  disabled={isSaving}
                   value={form.type}
                   onChange={(event) => updateForm("type", event.target.value as CustomFieldType)}
                 >
@@ -593,24 +595,14 @@ export default function CustomFieldsPage() {
                   <span className="block text-sm font-medium">Обязательное</span>
                   <span className="mt-1 block text-sm text-muted-foreground">Поле нужно заполнить в товаре</span>
                 </span>
-                <input
-                  type="checkbox"
-                  className="size-4 accent-blue-600"
-                  checked={form.required}
-                  onChange={(event) => updateForm("required", event.target.checked)}
-                />
+                <Switch checked={form.required} onCheckedChange={(checked) => updateForm("required", checked)} />
               </label>
               <label className="flex cursor-pointer items-center justify-between gap-4 rounded-lg border bg-slate-50 p-4">
                 <span>
                   <span className="block text-sm font-medium">Показывать в API</span>
                   <span className="mt-1 block text-sm text-muted-foreground">Передавать поле внешнему AI-боту</span>
                 </span>
-                <input
-                  type="checkbox"
-                  className="size-4 accent-blue-600"
-                  checked={form.showInApi}
-                  onChange={(event) => updateForm("showInApi", event.target.checked)}
-                />
+                <Switch checked={form.showInApi} onCheckedChange={(checked) => updateForm("showInApi", checked)} />
               </label>
             </div>
             <div className="flex justify-end gap-2 border-t p-5">

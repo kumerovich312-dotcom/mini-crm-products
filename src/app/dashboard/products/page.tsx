@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
+import * as XLSX from "xlsx";
 import {
   Download,
   Edit3,
@@ -25,11 +26,12 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { selectClassName } from "@/components/ui/select-style";
 import { getCurrentCompanyId } from "@/lib/auth/get-current-company";
 import { getErrorMessage, logAppError } from "@/lib/errors";
 import { supabase } from "@/lib/supabase/client";
 import { cn } from "@/lib/utils";
-import type { Category, Product, ProductMedia, ProductStatus } from "@/types/database";
+import type { Category, CustomField, Product, ProductCustomValue, ProductMedia, ProductStatus } from "@/types/database";
 
 const statusMap: Record<ProductStatus, { label: string; className: string }> = {
   active: {
@@ -50,8 +52,9 @@ const statusMap: Record<ProductStatus, { label: string; className: string }> = {
   },
 };
 
-const filterSelectClass =
-  "h-10 rounded-md border border-input bg-white px-3 text-sm text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring";
+const filterSelectClass = selectClassName;
+
+type ExportFormat = "csv" | "xlsx";
 
 function formatPrice(price: number) {
   return new Intl.NumberFormat("ru-RU", {
@@ -69,10 +72,40 @@ function formatDate(value: string) {
   }).format(new Date(value));
 }
 
+function getExportDate() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function downloadBlob(blob: Blob, fileName: string) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+
+  link.href = url;
+  link.download = fileName;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+function getCustomFieldValue(field: CustomField, value: ProductCustomValue) {
+  if (field.field_type === "number") {
+    return value.value_number ?? "";
+  }
+
+  if (field.field_type === "boolean") {
+    return value.value_boolean === null ? "" : value.value_boolean ? "Да" : "Нет";
+  }
+
+  return value.value_text ?? "";
+}
+
 export default function ProductsPage() {
   const [companyId, setCompanyId] = useState<string | null>(null);
   const [products, setProducts] = useState<Product[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
+  const [customFields, setCustomFields] = useState<CustomField[]>([]);
+  const [customValues, setCustomValues] = useState<ProductCustomValue[]>([]);
   const [mediaByProductId, setMediaByProductId] = useState<Map<string, ProductMedia[]>>(new Map());
   const [isLoading, setIsLoading] = useState(true);
   const [pageError, setPageError] = useState<string | null>(null);
@@ -93,6 +126,8 @@ export default function ProductsPage() {
       setPageError(getErrorMessage(error));
       setProducts([]);
       setCategories([]);
+      setCustomFields([]);
+      setCustomValues([]);
       setMediaByProductId(new Map());
       setIsLoading(false);
       return;
@@ -102,6 +137,8 @@ export default function ProductsPage() {
       setPageError("Компания текущего пользователя не найдена. Войдите заново.");
       setProducts([]);
       setCategories([]);
+      setCustomFields([]);
+      setCustomValues([]);
       setMediaByProductId(new Map());
       setIsLoading(false);
       return;
@@ -109,7 +146,7 @@ export default function ProductsPage() {
 
     setCompanyId(currentCompanyId);
 
-    const [productsResult, categoriesResult] = await Promise.all([
+    const [productsResult, categoriesResult, customFieldsResult] = await Promise.all([
       supabase
         .from("products")
         .select("*")
@@ -117,6 +154,11 @@ export default function ProductsPage() {
         .order("updated_at", { ascending: false }),
       supabase
         .from("categories")
+        .select("*")
+        .eq("company_id", currentCompanyId)
+        .order("sort_order", { ascending: true }),
+      supabase
+        .from("custom_fields")
         .select("*")
         .eq("company_id", currentCompanyId)
         .order("sort_order", { ascending: true }),
@@ -130,36 +172,57 @@ export default function ProductsPage() {
       setPageError(categoriesResult.error.message);
     }
 
+    if (customFieldsResult.error) {
+      setPageError(customFieldsResult.error.message);
+    }
+
     const nextProducts = ((productsResult.data ?? []) as Product[]) ?? [];
     setProducts(nextProducts);
     setCategories(((categoriesResult.data ?? []) as Category[]) ?? []);
+    setCustomFields(((customFieldsResult.data ?? []) as CustomField[]) ?? []);
 
     if (nextProducts.length > 0) {
-      const { data: mediaData, error: mediaError } = await supabase
-        .from("product_media")
-        .select("*")
-        .eq("company_id", currentCompanyId)
-        .in(
-          "product_id",
-          nextProducts.map((product) => product.id),
-        )
-        .order("sort_order", { ascending: true });
+      const [mediaResult, customValuesResult] = await Promise.all([
+        supabase
+          .from("product_media")
+          .select("*")
+          .eq("company_id", currentCompanyId)
+          .in(
+            "product_id",
+            nextProducts.map((product) => product.id),
+          )
+          .order("sort_order", { ascending: true }),
+        supabase
+          .from("product_custom_values")
+          .select("*")
+          .eq("company_id", currentCompanyId)
+          .in(
+            "product_id",
+            nextProducts.map((product) => product.id),
+          ),
+      ]);
 
-      if (mediaError) {
-        setPageError(mediaError.message);
+      if (mediaResult.error) {
+        setPageError(mediaResult.error.message);
+      }
+
+      if (customValuesResult.error) {
+        setPageError(customValuesResult.error.message);
       }
 
       const nextMediaByProductId = new Map<string, ProductMedia[]>();
 
-      ((mediaData ?? []) as ProductMedia[]).forEach((mediaItem) => {
+      ((mediaResult.data ?? []) as ProductMedia[]).forEach((mediaItem) => {
         const productMedia = nextMediaByProductId.get(mediaItem.product_id) ?? [];
         productMedia.push(mediaItem);
         nextMediaByProductId.set(mediaItem.product_id, productMedia);
       });
 
       setMediaByProductId(nextMediaByProductId);
+      setCustomValues(((customValuesResult.data ?? []) as ProductCustomValue[]) ?? []);
     } else {
       setMediaByProductId(new Map());
+      setCustomValues([]);
     }
 
     setIsLoading(false);
@@ -173,6 +236,18 @@ export default function ProductsPage() {
     () => new Map(categories.map((category) => [category.id, category.name])),
     [categories],
   );
+
+  const customValuesByProductId = useMemo(() => {
+    const nextValues = new Map<string, ProductCustomValue[]>();
+
+    customValues.forEach((value) => {
+      const productValues = nextValues.get(value.product_id) ?? [];
+      productValues.push(value);
+      nextValues.set(value.product_id, productValues);
+    });
+
+    return nextValues;
+  }, [customValues]);
 
   const filteredProducts = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
@@ -247,6 +322,63 @@ export default function ProductsPage() {
     setStockFilter("");
   }
 
+  function buildExportRows() {
+    return filteredProducts.map((product) => {
+      const productMedia = mediaByProductId.get(product.id) ?? [];
+      const firstPhoto = productMedia.find((item) => item.media_type === "photo");
+      const productCustomValues = customValuesByProductId.get(product.id) ?? [];
+      const customValuesByFieldId = new Map(productCustomValues.map((value) => [value.custom_field_id, value]));
+      const row: Record<string, string | number | boolean> = {
+        SKU: product.sku,
+        Название: product.name,
+        Категория: product.category_id ? categoryMap.get(product.category_id) ?? "" : "",
+        Цена: product.price,
+        Остаток: product.stock,
+        Статус: statusMap[product.status].label,
+        Описание: product.description ?? "",
+        Keywords: product.keywords.join(", "),
+        "Показывать в API": product.is_visible_in_api ? "Да" : "Нет",
+        "Дата создания": formatDate(product.created_at),
+        "Дата обновления": formatDate(product.updated_at),
+      };
+
+      customFields.forEach((field) => {
+        const value = customValuesByFieldId.get(field.id);
+        row[field.name || field.key] = value ? getCustomFieldValue(field, value) : "";
+      });
+
+      row.main_image_url = firstPhoto?.processed_url ?? firstPhoto?.original_url ?? "";
+      row.media_count = productMedia.length;
+
+      return row;
+    });
+  }
+
+  function exportProducts(format: ExportFormat) {
+    setPageError(null);
+
+    if (filteredProducts.length === 0) {
+      setPageError("Нет товаров для экспорта");
+      return;
+    }
+
+    const rows = buildExportRows();
+    const fileDate = getExportDate();
+
+    if (format === "csv") {
+      const worksheet = XLSX.utils.json_to_sheet(rows);
+      const csv = XLSX.utils.sheet_to_csv(worksheet);
+      const blob = new Blob([`\uFEFF${csv}`], { type: "text/csv;charset=utf-8" });
+      downloadBlob(blob, `products-export-${fileDate}.csv`);
+      return;
+    }
+
+    const worksheet = XLSX.utils.json_to_sheet(rows);
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, "Products");
+    XLSX.writeFile(workbook, `products-export-${fileDate}.xlsx`);
+  }
+
   return (
     <>
       <PageHeader
@@ -267,9 +399,13 @@ export default function ProductsPage() {
                 Импорт
               </Link>
             </Button>
-            <Button variant="outline" disabled>
+            <Button variant="outline" onClick={() => exportProducts("csv")}>
               <Download />
-              Экспорт
+              Экспорт CSV
+            </Button>
+            <Button variant="outline" onClick={() => exportProducts("xlsx")}>
+              <Download />
+              Экспорт Excel
             </Button>
           </div>
         }
@@ -304,6 +440,7 @@ export default function ProductsPage() {
             </div>
             <select
               className={filterSelectClass}
+              disabled={isLoading}
               value={categoryId}
               onChange={(event) => setCategoryId(event.target.value)}
             >
@@ -314,7 +451,12 @@ export default function ProductsPage() {
                 </option>
               ))}
             </select>
-            <select className={filterSelectClass} value={status} onChange={(event) => setStatus(event.target.value)}>
+            <select
+              className={filterSelectClass}
+              disabled={isLoading}
+              value={status}
+              onChange={(event) => setStatus(event.target.value)}
+            >
               <option value="">Все статусы</option>
               <option value="active">Активен</option>
               <option value="hidden">Скрыт</option>
@@ -323,6 +465,7 @@ export default function ProductsPage() {
             </select>
             <select
               className={filterSelectClass}
+              disabled={isLoading}
               value={stockFilter}
               onChange={(event) => setStockFilter(event.target.value)}
             >

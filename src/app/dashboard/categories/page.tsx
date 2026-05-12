@@ -349,7 +349,7 @@ export default function CategoriesPage() {
           <div>
             <p className="text-sm font-medium">Код категории используется в артикуле товара.</p>
             <p className="mt-1 text-sm text-muted-foreground">
-              Например: <span className="font-mono text-foreground">JWL-001-A7K9</span>, где{" "}
+              Например: <span className="font-mono text-foreground">JWL-001-4937</span>, где{" "}
               <span className="font-mono text-foreground">001</span> — код категории.
             </p>
           </div>

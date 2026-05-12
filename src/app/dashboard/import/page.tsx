@@ -18,6 +18,7 @@ import { PageHeader } from "@/components/page-header";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { selectClassName } from "@/components/ui/select-style";
 import { getCurrentCompanyId } from "@/lib/auth/get-current-company";
 import { getErrorMessage, logAppError } from "@/lib/errors";
 import { supabase } from "@/lib/supabase/client";
@@ -58,8 +59,7 @@ const standardFields = [
   { value: "status", label: "status", type: "Системное" },
 ];
 
-const selectClass =
-  "h-10 w-full rounded-md border border-input bg-white px-3 text-sm text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring";
+const selectClass = selectClassName;
 
 function formatFileSize(size: number) {
   if (size < 1024 * 1024) {
@@ -84,10 +84,10 @@ function splitKeywords(value: string) {
     .filter(Boolean);
 }
 
-function generateProductCode(length = 4) {
-  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-
-  return Array.from({ length }, () => alphabet[Math.floor(Math.random() * alphabet.length)]).join("");
+function generateSkuDigits() {
+  return Math.floor(Math.random() * 10000)
+    .toString()
+    .padStart(4, "0");
 }
 
 function guessMapping(columns: string[], customFields: CustomField[]) {
@@ -387,8 +387,8 @@ export default function ImportPage() {
   }
 
   async function buildUniqueSku(categoryCode: string, usedSkus: Set<string>) {
-    for (let attempt = 0; attempt < 10; attempt += 1) {
-      const sku = `${companyPrefix}-${categoryCode}-${generateProductCode()}`;
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const sku = `${companyPrefix}-${categoryCode}-${generateSkuDigits()}`.toUpperCase();
 
       if (!usedSkus.has(sku)) {
         usedSkus.add(sku);
@@ -396,9 +396,7 @@ export default function ImportPage() {
       }
     }
 
-    const sku = `${companyPrefix}-${categoryCode}-${generateProductCode(6)}`;
-    usedSkus.add(sku);
-    return sku;
+    return null;
   }
 
   async function saveCustomValues(productId: string, row: ImportRow) {
@@ -513,7 +511,24 @@ export default function ImportPage() {
       const category = categories.find((item) => item.id === mappedCategoryId) ?? null;
       const categoryCode = category?.code ?? "000";
       const skuFromFile = getCell(row, skuColumn).toUpperCase();
-      const sku = skuFromFile || (await buildUniqueSku(categoryCode, usedSkus));
+      const generatedSku = skuFromFile ? null : await buildUniqueSku(categoryCode, usedSkus);
+      const sku = skuFromFile || generatedSku;
+
+      if (!sku) {
+        errors.push({
+          row: rowNumber,
+          field: "sku",
+          value: "",
+          error: "Не удалось сгенерировать уникальный артикул, попробуйте ещё раз",
+        });
+        invalidRows.add(rowNumber);
+        continue;
+      }
+
+      if (skuFromFile) {
+        usedSkus.add(skuFromFile);
+      }
+
       const existingProduct = productBySku.get(sku);
       const rawStatus = getCell(row, statusColumn) as ProductStatus;
       const status: ProductStatus = ["active", "hidden", "out_of_stock", "draft"].includes(rawStatus)
@@ -787,6 +802,7 @@ export default function ImportPage() {
                         <td className="px-4 py-3">
                           <select
                             className={selectClass}
+                            disabled={isBusy}
                             value={mapping[column] ?? ""}
                             onChange={(event) => {
                               const nextMapping = { ...mapping, [column]: event.target.value };
@@ -839,6 +855,7 @@ export default function ImportPage() {
                           <td className="px-4 py-3">
                             <select
                               className={selectClass}
+                              disabled={isBusy || categories.length === 0}
                               value={categoryMapping[categoryName] ?? ""}
                               onChange={(event) =>
                                 setCategoryMapping((current) => ({ ...current, [categoryName]: event.target.value }))
@@ -862,6 +879,7 @@ export default function ImportPage() {
                   <p className="text-sm text-muted-foreground">Категория для всех товаров</p>
                   <select
                     className={selectClass}
+                    disabled={isBusy || categories.length === 0}
                     value={defaultCategoryId}
                     onChange={(event) => setDefaultCategoryId(event.target.value)}
                   >

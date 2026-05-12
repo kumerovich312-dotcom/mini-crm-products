@@ -24,6 +24,8 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { selectClassName } from "@/components/ui/select-style";
+import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { getCurrentCompanyId } from "@/lib/auth/get-current-company";
 import { createId } from "@/lib/create-id";
@@ -100,8 +102,7 @@ const statusView: Record<MediaStatus, { label: string; className: string; icon: 
   },
 };
 
-const selectClass =
-  "h-10 rounded-md border border-input bg-white px-3 text-sm text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring";
+const selectClass = selectClassName;
 
 function formatFileSize(size: number) {
   if (size < 1024 * 1024) {
@@ -182,10 +183,10 @@ function logMediaError({
   });
 }
 
-function generateProductCode(length = 4) {
-  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-
-  return Array.from({ length }, () => alphabet[Math.floor(Math.random() * alphabet.length)]).join("");
+function generateSkuDigits() {
+  return Math.floor(Math.random() * 10000)
+    .toString()
+    .padStart(4, "0");
 }
 
 function FieldLabel({ children, htmlFor }: { children: React.ReactNode; htmlFor?: string }) {
@@ -220,13 +221,7 @@ function ToggleRow({
         <span className="block text-sm font-medium">{title}</span>
         <span className="mt-1 block text-sm text-muted-foreground">{description}</span>
       </span>
-      <input
-        checked={checked}
-        className="mt-1 size-4 accent-blue-600"
-        disabled={disabled}
-        type="checkbox"
-        onChange={(event) => onChange(event.target.checked)}
-      />
+      <Switch checked={checked} className="mt-1" disabled={disabled} onCheckedChange={onChange} />
     </label>
   );
 }
@@ -322,8 +317,8 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
         return "";
       }
 
-      for (let attempt = 0; attempt < 10; attempt += 1) {
-        const candidate = `${prefix}-${category.code}-${generateProductCode(4)}`;
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        const candidate = `${prefix}-${category.code}-${generateSkuDigits()}`.toUpperCase();
         const query = supabase
           .from("products")
           .select("id")
@@ -337,7 +332,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
         }
       }
 
-      return `${prefix}-${category.code}-${generateProductCode(4)}`;
+      return null;
     },
     [categories, companyId, companyPrefix, productId],
   );
@@ -491,13 +486,31 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
 
     if (!isEdit && nextCategories[0]) {
       const category = nextCategories[0];
-      const candidate = `${nextPrefix}-${category.code}-${generateProductCode(4)}`;
+      let candidate: string | null = null;
+
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        const nextSku = `${nextPrefix}-${category.code}-${generateSkuDigits()}`.toUpperCase();
+        const { data, error } = await supabase
+          .from("products")
+          .select("id")
+          .eq("company_id", currentCompanyId)
+          .eq("sku", nextSku);
+
+        if (!error && (!data || data.length === 0)) {
+          candidate = nextSku;
+          break;
+        }
+      }
 
       setForm((current) => ({
         ...current,
         categoryId: category.id,
-        sku: current.sku || candidate,
+        sku: current.sku || candidate || "",
       }));
+
+      if (!candidate) {
+        setPageError("Не удалось сгенерировать уникальный артикул, попробуйте ещё раз");
+      }
     }
 
     setIsLoading(false);
@@ -806,15 +819,20 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
 
   async function regenerateSku() {
     if (!form.categoryId) {
-      setPageError("Выберите категорию для генерации артикула.");
+      setPageError("Выберите категорию для генерации артикула");
       return;
     }
 
     const nextSku = await buildUniqueSku(form.categoryId);
+    if (!nextSku) {
+      setPageError("Не удалось сгенерировать уникальный артикул, попробуйте ещё раз");
+      return;
+    }
+
     setForm((current) => ({ ...current, sku: nextSku }));
   }
 
-  async function validateSkuUnique() {
+  async function validateSkuUnique(sku: string) {
     if (!companyId) {
       setPageError("Компания текущего пользователя не найдена.");
       return false;
@@ -824,7 +842,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
       .from("products")
       .select("id")
       .eq("company_id", companyId)
-      .eq("sku", form.sku.trim());
+      .eq("sku", sku.trim().toUpperCase());
 
     const { data, error } = productId ? await query.neq("id", productId) : await query;
 
@@ -968,9 +986,18 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
       return;
     }
 
-    if (!form.sku.trim()) {
-      setPageError("SKU не должен быть пустым.");
-      return;
+    let skuForSave = form.sku.trim().toUpperCase();
+
+    if (!skuForSave) {
+      const generatedSku = await buildUniqueSku(form.categoryId);
+
+      if (!generatedSku) {
+        setPageError("Не удалось сгенерировать уникальный артикул, попробуйте ещё раз");
+        return;
+      }
+
+      skuForSave = generatedSku;
+      setForm((current) => ({ ...current, sku: generatedSku }));
     }
 
     if (!validateCustomFields()) {
@@ -978,7 +1005,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
       return;
     }
 
-    const isSkuUnique = await validateSkuUnique();
+    const isSkuUnique = await validateSkuUnique(skuForSave);
 
     if (!isSkuUnique) {
       setPageError("SKU уже используется внутри компании.");
@@ -994,7 +1021,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
       company_id: companyId,
       category_id: form.categoryId,
       name: form.name.trim(),
-      sku: form.sku.trim().toUpperCase(),
+      sku: skuForSave,
       price: Number(form.price) || 0,
       stock: Number(form.stock) || 0,
       status: nextStatus,
@@ -1187,6 +1214,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
               <FieldLabel htmlFor="category">Категория</FieldLabel>
               <select
                 className={selectClass}
+                disabled={isLoading || categories.length === 0}
                 id="category"
                 value={form.categoryId}
                 onChange={(event) => updateForm("categoryId", event.target.value)}
@@ -1221,6 +1249,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
               <FieldLabel htmlFor="status">Статус</FieldLabel>
               <select
                 className={selectClass}
+                disabled={isLoading}
                 id="status"
                 value={form.status}
                 onChange={(event) => updateForm("status", event.target.value as ProductStatus)}
@@ -1295,6 +1324,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
                         <select
                           id={inputId}
                           className={selectClass}
+                          disabled={isLoading}
                           value={String(value ?? "")}
                           onChange={(event) => updateCustomField(field.id, event.target.value)}
                         >
@@ -1307,15 +1337,13 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
                         </select>
                       ) : null}
                       {field.field_type === "boolean" ? (
-                        <label className="flex h-10 cursor-pointer items-center gap-2 rounded-md border bg-white px-3 text-sm">
-                          <input
+                        <label className="flex h-10 cursor-pointer items-center justify-between gap-3 rounded-md border bg-white px-3 text-sm">
+                          <span>Да</span>
+                          <Switch
                             id={inputId}
-                            type="checkbox"
-                            className="size-4 accent-blue-600"
                             checked={Boolean(value)}
-                            onChange={(event) => updateCustomField(field.id, event.target.checked)}
+                            onCheckedChange={(checked) => updateCustomField(field.id, checked)}
                           />
-                          Да
                         </label>
                       ) : null}
                       {shouldShowUnit ? <p className="text-xs text-muted-foreground">Единица: {field.unit}</p> : null}

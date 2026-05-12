@@ -7,6 +7,8 @@ import { PageHeader } from "@/components/page-header";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { selectClassName } from "@/components/ui/select-style";
+import { Switch } from "@/components/ui/switch";
 
 type SettingsState = {
   companyName: string;
@@ -60,8 +62,7 @@ const initialSettings: SettingsState = {
   apiShowOutOfStock: true,
 };
 
-const selectClass =
-  "h-10 rounded-md border border-input bg-white px-3 text-sm text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring";
+const selectClass = selectClassName;
 
 function SectionIcon({ icon: Icon }: { icon: typeof Building2 }) {
   return (
@@ -96,12 +97,7 @@ function ToggleRow({
         <span className="block text-sm font-medium">{title}</span>
         <span className="mt-1 block text-sm text-muted-foreground">{description}</span>
       </span>
-      <input
-        type="checkbox"
-        checked={checked}
-        className="mt-1 size-4 accent-blue-600"
-        onChange={(event) => onChange(event.target.checked)}
-      />
+      <Switch checked={checked} className="mt-1" onCheckedChange={onChange} />
     </label>
   );
 }
@@ -237,7 +233,7 @@ export default function SettingsPage() {
             <div className="rounded-lg border bg-blue-50 p-4">
               <p className="text-sm text-muted-foreground">Пример артикула</p>
               <p className="mt-1 font-mono text-lg font-semibold text-blue-700">
-                {settings.skuPrefix || "JWL"}-001-A7K9
+                {settings.skuPrefix || "JWL"}-001-4937
               </p>
             </div>
             <div className="grid gap-4 md:grid-cols-2">

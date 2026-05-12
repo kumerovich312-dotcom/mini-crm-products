@@ -16,7 +16,7 @@ import {
 
 import { cn } from "@/lib/utils";
 
-const navItems = [
+export const navItems = [
   { href: "/dashboard", label: "Дашборд", icon: Home, active: ["/dashboard"] },
   {
     href: "/dashboard/products",

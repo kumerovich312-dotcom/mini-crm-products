@@ -14,7 +14,7 @@ const baseEndpoint = "http://localhost:3001/api/public/products";
 const endpoints = [
   { method: "GET", path: "/api/public/products", description: "список активных товаров" },
   { method: "GET", path: "/api/public/products?query=кольцо", description: "поиск по названию, SKU, описанию и keywords" },
-  { method: "GET", path: "/api/public/products?sku=JWL-001-LV9B", description: "поиск по артикулу" },
+  { method: "GET", path: "/api/public/products?sku=JWL-001-4937", description: "поиск по артикулу" },
   { method: "GET", path: "/api/public/products?in_stock=true", description: "только товары в наличии" },
   { method: "GET", path: "/api/public/products/[id]", description: "один товар по ID" },
 ];
@@ -26,7 +26,7 @@ const responseJson = `{
   "products": [
     {
       "id": "...",
-      "sku": "JWL-001-A7K9",
+      "sku": "JWL-001-4937",
       "name": "Золотое кольцо",
       "category": {
         "id": "...",
