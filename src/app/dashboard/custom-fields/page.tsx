@@ -48,9 +48,9 @@ const emptyForm: CustomFieldForm = {
 
 const selectClass = selectClassName;
 
-function boolBadge(value: boolean, trueLabel: string, falseLabel: string) {
+function boolBadge(value: boolean, trueLabel: string, falseLabel: string, title?: string) {
   return (
-    <Badge className={value ? "bg-blue-50 text-blue-700" : "bg-slate-100 text-slate-700"}>
+    <Badge className={value ? "bg-blue-50 text-blue-700" : "bg-slate-100 text-slate-700"} title={title}>
       {value ? trueLabel : falseLabel}
     </Badge>
   );
@@ -432,22 +432,32 @@ export default function CustomFieldsPage() {
                         <tr key={field.id} className="border-t hover:bg-slate-50/70">
                           <td className="px-4 py-3">
                             <div className="flex items-center gap-3">
-                              <div className="flex size-9 items-center justify-center rounded-md bg-accent text-accent-foreground">
+                              <div
+                                className="flex size-9 items-center justify-center rounded-md bg-accent text-accent-foreground"
+                                title="Пользовательское поле"
+                              >
                                 <Braces className="size-4" />
                               </div>
                               <span className="font-medium">{field.name}</span>
                             </div>
                           </td>
                           <td className="px-4 py-3">
-                            <span className="inline-flex items-center gap-2 font-mono text-xs text-muted-foreground">
+                            <span
+                              className="inline-flex items-center gap-2 font-mono text-xs text-muted-foreground"
+                              title="Технический ключ поля"
+                            >
                               <Code2 className="size-3" />
                               {field.key}
                             </span>
                           </td>
                           <td className="px-4 py-3">{fieldTypeLabels[field.field_type]}</td>
                           <td className="px-4 py-3 text-muted-foreground">{field.unit || "—"}</td>
-                          <td className="px-4 py-3">{boolBadge(field.is_required, "Да", "Нет")}</td>
-                          <td className="px-4 py-3">{boolBadge(field.is_visible_in_api, "Да", "Нет")}</td>
+                          <td className="px-4 py-3">
+                            {boolBadge(field.is_required, "Да", "Нет", "Обязательное поле")}
+                          </td>
+                          <td className="px-4 py-3">
+                            {boolBadge(field.is_visible_in_api, "Да", "Нет", "Доступно боту/API")}
+                          </td>
                           <td className="px-4 py-3">{field.sort_order}</td>
                           <td className="px-4 py-3">
                             <div className="flex justify-end gap-1">
@@ -455,6 +465,7 @@ export default function CustomFieldsPage() {
                                 variant="ghost"
                                 size="icon"
                                 aria-label="Переключить API"
+                                title="Доступно боту/API"
                                 onClick={() => void toggleShowInApi(field)}
                               >
                                 <Eye />
@@ -463,6 +474,7 @@ export default function CustomFieldsPage() {
                                 variant="ghost"
                                 size="icon"
                                 aria-label="Переключить обязательность"
+                                title="Обязательное поле"
                                 onClick={() => void toggleRequired(field)}
                               >
                                 <ShieldCheck />
@@ -471,6 +483,7 @@ export default function CustomFieldsPage() {
                                 variant="ghost"
                                 size="icon"
                                 aria-label="Редактировать"
+                                title="Редактировать"
                                 onClick={() => openEditDialog(field)}
                               >
                                 <Edit3 />
@@ -479,6 +492,7 @@ export default function CustomFieldsPage() {
                                 variant="ghost"
                                 size="icon"
                                 aria-label="Удалить"
+                                title="Удалить"
                                 onClick={() => void deleteField(field.id)}
                               >
                                 <Trash2 />

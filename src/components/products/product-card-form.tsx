@@ -118,10 +118,27 @@ function getFileExtension(fileName: string) {
   return dotIndex === -1 ? "" : fileName.slice(dotIndex).toLowerCase();
 }
 
-function sanitizeFileName(fileName: string) {
-  const normalized = fileName.trim().replace(/\s+/g, "-");
+function sanitizeStorageBase(value: string) {
+  return value
+    .trim()
+    .replace(/\s+/g, "-")
+    .replace(/[^a-zA-Z0-9_-]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "")
+    .toUpperCase();
+}
 
-  return normalized.replace(/[^a-zA-Z0-9._-]/g, "-");
+function createShortId() {
+  const id = createId().replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
+
+  return (id || Math.random().toString(36).slice(2)).slice(0, 6);
+}
+
+function createMediaStorageFileName(file: File, sku?: string) {
+  const extension = getFileExtension(file.name) || (file.type === "image/png" ? ".png" : ".jpg");
+  const base = sanitizeStorageBase(sku ?? "") || "media";
+
+  return `${base}-${createShortId()}${extension}`;
 }
 
 function isSupportedFile(file: File, type: MediaType) {
@@ -590,7 +607,13 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
     return media.filter((item) => item.type === type).length;
   }
 
-  async function uploadMediaFile(file: File, type: MediaType, productIdForMedia: string, sortOrder: number) {
+  async function uploadMediaFile(
+    file: File,
+    type: MediaType,
+    productIdForMedia: string,
+    sortOrder: number,
+    skuForMedia?: string,
+  ) {
     const fileLimitError = getFileLimitError(file, type);
 
     if (fileLimitError) {
@@ -615,49 +638,55 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
       return { error: "Товар не найден в текущей компании." };
     }
 
-    const storageFileName = `${createId("media")}-${sanitizeFileName(file.name)}`;
+    const storageFileName = createMediaStorageFileName(file, skuForMedia || form.sku || "product");
     const filePath = `${companyId}/${productIdForMedia}/${storageFileName}`;
-    const { error: uploadError } = await supabase.storage.from(MEDIA_BUCKET).upload(filePath, file, {
-      contentType: file.type || undefined,
-      upsert: false,
-    });
 
-    if (uploadError) {
-      logMediaError({ stage: "storage_upload", file, path: filePath, error: uploadError });
-      return { error: `Не удалось загрузить файл в Supabase Storage: ${getErrorMessage(uploadError)}` };
+    try {
+      const { error: uploadError } = await supabase.storage.from(MEDIA_BUCKET).upload(filePath, file, {
+        contentType: file.type || undefined,
+        upsert: false,
+      });
+
+      if (uploadError) {
+        logMediaError({ stage: "storage_upload", file, path: filePath, error: uploadError });
+        return { error: `Не удалось загрузить файл в Supabase Storage: ${getErrorMessage(uploadError)}` };
+      }
+
+      const { data: publicUrlData } = supabase.storage.from(MEDIA_BUCKET).getPublicUrl(filePath);
+      const originalUrl = publicUrlData.publicUrl;
+
+      const mediaPayload = {
+        company_id: companyId,
+        product_id: productIdForMedia,
+        media_type: type,
+        original_url: originalUrl,
+        processed_url: originalUrl,
+        thumbnail_url: type === "photo" ? originalUrl : null,
+        file_name: storageFileName,
+        file_size_bytes: file.size,
+        status: "ready",
+        sort_order: sortOrder,
+      };
+
+      const { data, error: insertError } = await supabase
+        .from("product_media")
+        .insert(mediaPayload)
+        .select("*")
+        .single();
+
+      if (insertError) {
+        logMediaError({ stage: "product_media_insert", file, path: filePath, error: insertError });
+        return { error: `Не удалось сохранить запись медиа: ${getErrorMessage(insertError)}` };
+      }
+
+      return { media: mapProductMedia(data as ProductMedia) };
+    } catch (error) {
+      logMediaError({ stage: "storage_upload", file, path: filePath, error });
+      return { error: `Не удалось загрузить файл: ${getErrorMessage(error)}` };
     }
-
-    const { data: publicUrlData } = supabase.storage.from(MEDIA_BUCKET).getPublicUrl(filePath);
-    const originalUrl = publicUrlData.publicUrl;
-
-    const mediaPayload = {
-      company_id: companyId,
-      product_id: productIdForMedia,
-      media_type: type,
-      original_url: originalUrl,
-      processed_url: originalUrl,
-      thumbnail_url: type === "photo" ? originalUrl : null,
-      file_name: file.name,
-      file_size_bytes: file.size,
-      status: "ready",
-      sort_order: sortOrder,
-    };
-
-    const { data, error: insertError } = await supabase
-      .from("product_media")
-      .insert(mediaPayload)
-      .select("*")
-      .single();
-
-    if (insertError) {
-      logMediaError({ stage: "product_media_insert", file, path: filePath, error: insertError });
-      return { error: `Не удалось сохранить запись медиа: ${getErrorMessage(insertError)}` };
-    }
-
-    return { media: mapProductMedia(data as ProductMedia) };
   }
 
-  async function uploadPendingMedia(productIdForMedia: string) {
+  async function uploadPendingMedia(productIdForMedia: string, skuForMedia?: string) {
     const pendingMedia = media.filter((item) => item.source === "pending" && item.file);
 
     for (let index = 0; index < pendingMedia.length; index += 1) {
@@ -673,7 +702,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
         ),
       );
 
-      const result = await uploadMediaFile(item.file, item.type, productIdForMedia, index);
+      const result = await uploadMediaFile(item.file, item.type, productIdForMedia, index, skuForMedia);
 
       if (result.error) {
         setMedia((current) =>
@@ -753,7 +782,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
           ),
         );
 
-        const result = await uploadMediaFile(item.file, item.type, productId, currentCount + index);
+        const result = await uploadMediaFile(item.file, item.type, productId, currentCount + index, form.sku);
 
         if (result.error) {
           setPageError(result.error);
@@ -1064,7 +1093,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
       return;
     }
 
-    const mediaError = await uploadPendingMedia(savedProductId);
+    const mediaError = await uploadPendingMedia(savedProductId, skuForSave);
 
     if (mediaError) {
       setPageError(mediaError);

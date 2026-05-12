@@ -8,7 +8,6 @@ import {
   Bot,
   Download,
   Edit3,
-  Eye,
   EyeOff,
   FileSpreadsheet,
   ImageIcon,
@@ -103,19 +102,15 @@ function getCustomFieldValue(field: CustomField, value: ProductCustomValue) {
 }
 
 function getApiBadge(product: Product) {
-  if (product.status === "hidden") {
-    return { label: "Скрыт", className: "bg-slate-100 text-slate-700" };
-  }
-
   if (product.stock <= 0) {
-    return { label: "Нет остатка", className: "bg-orange-50 text-orange-700" };
+    return { label: "Нет остатка", className: "bg-slate-100 text-slate-700" };
   }
 
   if (product.status === "active" && product.is_visible_in_api) {
-    return { label: "В API", className: "bg-emerald-50 text-emerald-700" };
+    return { label: "Бот", className: "bg-emerald-50 text-emerald-700" };
   }
 
-  return { label: "Не в API", className: "bg-slate-100 text-slate-700" };
+  return { label: "—", className: "bg-slate-100 text-slate-600" };
 }
 
 function getRowClassName(product: Product) {
@@ -152,6 +147,8 @@ export default function ProductsPage() {
   const [categoryId, setCategoryId] = useState("");
   const [status, setStatus] = useState("");
   const [stockFilter, setStockFilter] = useState("");
+  const [productPendingDelete, setProductPendingDelete] = useState<Product | null>(null);
+  const [isDeletingProduct, setIsDeletingProduct] = useState(false);
 
   const loadData = useCallback(async () => {
     setIsLoading(true);
@@ -382,10 +379,7 @@ export default function ProductsPage() {
       return;
     }
 
-    if (!window.confirm(`Удалить товар "${product.name}"?`)) {
-      return;
-    }
-
+    setIsDeletingProduct(true);
     setPageError(null);
 
     const { error } = await supabase
@@ -396,6 +390,7 @@ export default function ProductsPage() {
 
     if (error) {
       setPageError(error.message);
+      setIsDeletingProduct(false);
       return;
     }
 
@@ -406,6 +401,8 @@ export default function ProductsPage() {
       return nextMedia;
     });
     setCustomValues((current) => current.filter((value) => value.product_id !== product.id));
+    setProductPendingDelete(null);
+    setIsDeletingProduct(false);
   }
 
   function resetFilters() {
@@ -575,20 +572,20 @@ export default function ProductsPage() {
 
           <div className="mt-5 overflow-hidden rounded-lg border">
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[1220px] border-collapse bg-white text-sm">
+              <table className="w-full min-w-[1060px] table-fixed border-collapse bg-white text-sm">
                 <thead className="bg-slate-50 text-left text-xs uppercase text-muted-foreground">
                   <tr>
-                    <th className="px-4 py-3 font-medium">Фото</th>
-                    <th className="px-4 py-3 font-medium">Видео</th>
-                    <th className="px-4 py-3 font-medium">SKU</th>
-                    <th className="px-4 py-3 font-medium">Название</th>
-                    <th className="px-4 py-3 font-medium">Категория</th>
-                    <th className="px-4 py-3 font-medium">Цена</th>
-                    <th className="px-4 py-3 font-medium">Остаток</th>
-                    <th className="px-4 py-3 font-medium">Статус</th>
-                    <th className="px-4 py-3 font-medium">Бот/API</th>
-                    <th className="px-4 py-3 font-medium">Обновлено</th>
-                    <th className="px-4 py-3 text-right font-medium">Действия</th>
+                    <th className="w-20 px-4 py-3 font-medium">Фото</th>
+                    <th className="w-20 px-4 py-3 font-medium">Видео</th>
+                    <th className="w-36 px-4 py-3 font-medium">SKU</th>
+                    <th className="w-[280px] px-4 py-3 font-medium">Название</th>
+                    <th className="w-40 px-4 py-3 font-medium">Категория</th>
+                    <th className="w-24 px-4 py-3 font-medium">Цена</th>
+                    <th className="w-24 px-4 py-3 font-medium">Остаток</th>
+                    <th className="w-28 px-4 py-3 font-medium">Статус</th>
+                    <th className="w-28 px-4 py-3 font-medium">Бот/API</th>
+                    <th className="w-36 px-4 py-3 font-medium">Обновлено</th>
+                    <th className="w-40 px-4 py-3 text-right font-medium">Действия</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -652,11 +649,20 @@ export default function ProductsPage() {
                                 {hasVideo ? <Play className="size-4" /> : <VideoOff className="size-4" />}
                               </div>
                             </td>
-                            <td className="px-4 py-3 font-mono text-xs text-muted-foreground">{product.sku}</td>
                             <td className="px-4 py-3">
-                              <div>
-                                <p className="font-medium">{product.name}</p>
-                                <p className="mt-1 max-w-56 truncate text-xs text-muted-foreground">
+                              <span
+                                className="block max-w-28 truncate font-mono text-xs text-muted-foreground"
+                                title={product.sku}
+                              >
+                                {product.sku}
+                              </span>
+                            </td>
+                            <td className="px-4 py-3">
+                              <div className="max-w-[260px]">
+                                <p className="truncate whitespace-nowrap font-medium" title={product.name}>
+                                  {product.name}
+                                </p>
+                                <p className="mt-1 truncate whitespace-nowrap text-xs text-muted-foreground">
                                   {product.keywords.join(", ")}
                                 </p>
                               </div>
@@ -685,14 +691,6 @@ export default function ProductsPage() {
                             <td className="px-4 py-3 text-muted-foreground">{formatDate(product.updated_at)}</td>
                             <td className="px-4 py-3">
                               <div className="flex justify-end gap-1">
-                                <Button asChild variant="ghost" size="icon" aria-label="Открыть карточку" title="Открыть карточку">
-                                  <Link
-                                    href={`/dashboard/products/${product.id}/edit`}
-                                    onClick={(event) => event.stopPropagation()}
-                                  >
-                                    <Eye />
-                                  </Link>
-                                </Button>
                                 <Button asChild variant="ghost" size="icon" aria-label="Редактировать" title="Редактировать">
                                   <Link
                                     href={`/dashboard/products/${product.id}/edit`}
@@ -734,7 +732,7 @@ export default function ProductsPage() {
                                   title="Удалить"
                                   onClick={(event) => {
                                     event.stopPropagation();
-                                    void deleteProduct(product);
+                                    setProductPendingDelete(product);
                                   }}
                                 >
                                   <Trash2 />
@@ -766,6 +764,41 @@ export default function ProductsPage() {
           </div>
         </CardContent>
       </Card>
+
+      {productPendingDelete ? (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/40 p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="delete-product-title"
+        >
+          <div className="w-full max-w-sm rounded-lg border bg-white p-5 shadow-soft">
+            <h2 id="delete-product-title" className="text-lg font-semibold">
+              Удалить товар?
+            </h2>
+            <p className="mt-2 text-sm text-muted-foreground">Это действие нельзя отменить.</p>
+            <div className="mt-5 flex justify-end gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                disabled={isDeletingProduct}
+                onClick={() => setProductPendingDelete(null)}
+              >
+                Отмена
+              </Button>
+              <Button
+                type="button"
+                className="bg-red-600 text-white hover:bg-red-700"
+                disabled={isDeletingProduct}
+                onClick={() => void deleteProduct(productPendingDelete)}
+              >
+                {isDeletingProduct ? <Loader2 className="animate-spin" /> : null}
+                Удалить
+              </Button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </>
   );
 }
