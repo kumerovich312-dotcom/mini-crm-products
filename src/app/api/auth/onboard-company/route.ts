@@ -1,6 +1,7 @@
 import { createClient } from "@supabase/supabase-js";
 import { NextResponse } from "next/server";
 
+import { createId } from "@/lib/create-id";
 import { getErrorMessage, logAppError } from "@/lib/errors";
 import type { Company, Profile } from "@/types/database";
 
@@ -49,7 +50,7 @@ function makeSlug(value: string) {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
 
-  return `${normalized || "company"}-${crypto.randomUUID().slice(0, 8)}`;
+  return `${normalized || "company"}-${createId().slice(0, 8)}`;
 }
 
 function validationError(message: string) {

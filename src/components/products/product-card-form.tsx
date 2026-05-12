@@ -26,6 +26,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { getCurrentCompanyId } from "@/lib/auth/get-current-company";
+import { createId } from "@/lib/create-id";
 import { getErrorMessage, logAppError } from "@/lib/errors";
 import { supabase } from "@/lib/supabase/client";
 import { cn } from "@/lib/utils";
@@ -53,6 +54,7 @@ type MediaItem = {
   size: string;
   status: MediaStatus;
   source: "existing" | "pending";
+  error?: string;
   file?: File;
   previewUrl?: string;
   originalUrl?: string;
@@ -147,6 +149,37 @@ function getFileLimitError(file: File, type: MediaType) {
   }
 
   return null;
+}
+
+function getErrorField(error: unknown, field: "details" | "statusCode") {
+  if (typeof error === "object" && error !== null && field in error) {
+    return (error as Record<string, unknown>)[field];
+  }
+
+  return undefined;
+}
+
+function logMediaError({
+  stage,
+  file,
+  path,
+  error,
+}: {
+  stage: "storage_upload" | "product_media_insert";
+  file: File;
+  path: string;
+  error: unknown;
+}) {
+  console.error("Product media upload error", {
+    stage,
+    fileName: file.name,
+    fileSize: file.size,
+    bucket: MEDIA_BUCKET,
+    path,
+    errorMessage: getErrorMessage(error),
+    errorDetails: getErrorField(error, "details"),
+    errorStatusCode: getErrorField(error, "statusCode"),
+  });
 }
 
 function generateProductCode(length = 4) {
@@ -545,23 +578,40 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
   }
 
   async function uploadMediaFile(file: File, type: MediaType, productIdForMedia: string, sortOrder: number) {
+    const fileLimitError = getFileLimitError(file, type);
+
+    if (fileLimitError) {
+      return { error: fileLimitError };
+    }
+
     if (!companyId) {
       return { error: "Компания текущего пользователя не найдена." };
+    }
+
+    const { data: userData, error: userError } = await supabase.auth.getUser();
+
+    if (userError) {
+      return { error: `Не удалось проверить сессию: ${getErrorMessage(userError)}` };
+    }
+
+    if (!userData.user) {
+      return { error: "Сессия пользователя не найдена. Войдите заново и повторите загрузку." };
     }
 
     if (isEdit && !isEditableProduct) {
       return { error: "Товар не найден в текущей компании." };
     }
 
-    const filePath = `${companyId}/${productIdForMedia}/${Date.now()}-${sanitizeFileName(file.name)}`;
+    const storageFileName = `${createId("media")}-${sanitizeFileName(file.name)}`;
+    const filePath = `${companyId}/${productIdForMedia}/${storageFileName}`;
     const { error: uploadError } = await supabase.storage.from(MEDIA_BUCKET).upload(filePath, file, {
       contentType: file.type || undefined,
       upsert: false,
     });
 
     if (uploadError) {
-      logAppError("Product form media upload error", uploadError);
-      return { error: "Не удалось загрузить файл в Supabase Storage." };
+      logMediaError({ stage: "storage_upload", file, path: filePath, error: uploadError });
+      return { error: `Не удалось загрузить файл в Supabase Storage: ${getErrorMessage(uploadError)}` };
     }
 
     const { data: publicUrlData } = supabase.storage.from(MEDIA_BUCKET).getPublicUrl(filePath);
@@ -587,8 +637,8 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
       .single();
 
     if (insertError) {
-      logAppError("Product form media insert error", insertError);
-      return { error: insertError.message || "Не удалось сохранить запись медиа" };
+      logMediaError({ stage: "product_media_insert", file, path: filePath, error: insertError });
+      return { error: `Не удалось сохранить запись медиа: ${getErrorMessage(insertError)}` };
     }
 
     return { media: mapProductMedia(data as ProductMedia) };
@@ -605,14 +655,18 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
       }
 
       setMedia((current) =>
-        current.map((mediaItem) => (mediaItem.id === item.id ? { ...mediaItem, status: "processing" } : mediaItem)),
+        current.map((mediaItem) =>
+          mediaItem.id === item.id ? { ...mediaItem, status: "processing", error: undefined } : mediaItem,
+        ),
       );
 
       const result = await uploadMediaFile(item.file, item.type, productIdForMedia, index);
 
       if (result.error) {
         setMedia((current) =>
-          current.map((mediaItem) => (mediaItem.id === item.id ? { ...mediaItem, status: "failed" } : mediaItem)),
+          current.map((mediaItem) =>
+            mediaItem.id === item.id ? { ...mediaItem, status: "failed", error: result.error } : mediaItem,
+          ),
         );
         return result.error;
       }
@@ -663,7 +717,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
       }
 
       return {
-        id: `${file.name}-${file.lastModified}-${crypto.randomUUID()}`,
+        id: `${file.name}-${file.lastModified}-${createId("media")}`,
         name: file.name,
         type,
         size: formatFileSize(file.size),
@@ -681,7 +735,9 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
         const item = nextMedia[index];
 
         setMedia((current) =>
-          current.map((mediaItem) => (mediaItem.id === item.id ? { ...mediaItem, status: "processing" } : mediaItem)),
+          current.map((mediaItem) =>
+            mediaItem.id === item.id ? { ...mediaItem, status: "processing", error: undefined } : mediaItem,
+          ),
         );
 
         const result = await uploadMediaFile(item.file, item.type, productId, currentCount + index);
@@ -689,7 +745,9 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
         if (result.error) {
           setPageError(result.error);
           setMedia((current) =>
-            current.map((mediaItem) => (mediaItem.id === item.id ? { ...mediaItem, status: "failed" } : mediaItem)),
+            current.map((mediaItem) =>
+              mediaItem.id === item.id ? { ...mediaItem, status: "failed", error: result.error } : mediaItem,
+            ),
           );
           return;
         }
@@ -929,6 +987,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
 
     setIsSaving(true);
 
+    try {
     const nextStatus = form.status;
     const canShowInApi = nextStatus === "active" || nextStatus === "out_of_stock";
     const payload = {
@@ -986,8 +1045,13 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
       return;
     }
 
-    setIsSaving(false);
     router.push("/dashboard/products");
+    } catch (error) {
+      logAppError("Product form save error", error);
+      setPageError(getErrorMessage(error));
+    } finally {
+      setIsSaving(false);
+    }
   }
 
   return (
@@ -1086,6 +1150,7 @@ export function ProductCardForm({ mode, productId }: { mode: ProductFormMode; pr
                         <StatusIcon className={cn("size-3", item.status === "processing" && "animate-spin")} />
                         {statusView[item.status].label}
                       </Badge>
+                      {item.error ? <p className="mt-2 text-xs text-red-600">{item.error}</p> : null}
                     </div>
                   </div>
                 );
