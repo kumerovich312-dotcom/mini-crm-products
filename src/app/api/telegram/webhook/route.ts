@@ -114,7 +114,7 @@ function getTelegramToken() {
 }
 
 function logTelegramError(stage: string, error: unknown, details?: Record<string, unknown>) {
-  console.error("Telegram bot error", {
+  console.error("Telegram connection error", {
     stage,
     message: getErrorMessage(error),
     details,
@@ -278,55 +278,31 @@ async function sendCategoryKeyboard(supabase: ReturnType<typeof getSupabaseAdmin
   );
 }
 
-async function createNewDraft(supabase: ReturnType<typeof getSupabaseAdmin>, companyId: string, chatId: string) {
-  await supabase
-    .from("telegram_product_drafts")
-    .delete()
-    .eq("company_id", companyId)
-    .eq("telegram_chat_id", chatId)
-    .neq("step", "done");
-
-  const { data, error } = await supabase
-    .from("telegram_product_drafts")
-    .insert({
-      company_id: companyId,
-      telegram_chat_id: chatId,
-      step: "choose_category",
-      status: "draft",
-    })
-    .select("*")
-    .single();
-
-  if (error) {
-    throw error;
-  }
-
-  return data as TelegramProductDraft;
-}
-
-async function connectByCompanyCode(
+async function connectByCode(
   supabase: ReturnType<typeof getSupabaseAdmin>,
   chatId: string,
   user: TelegramUser | undefined,
   code: string,
 ) {
-  const { data: companyData, error: companyError } = await supabase
-    .from("companies")
-    .select("id")
-    .eq("company_code", code)
+  const { data: codeData, error: codeError } = await supabase
+    .from("telegram_connection_codes")
+    .select("id, company_id, expires_at, used_at")
+    .eq("code", code)
+    .is("used_at", null)
+    .gt("expires_at", new Date().toISOString())
     .maybeSingle();
 
-  if (companyError) {
-    throw companyError;
+  if (codeError) {
+    throw codeError;
   }
 
-  if (!companyData) {
+  if (!codeData) {
     return false;
   }
 
   const { error } = await supabase.from("telegram_connections").upsert(
     {
-      company_id: companyData.id,
+      company_id: codeData.company_id,
       telegram_chat_id: chatId,
       telegram_user_id: user?.id ? String(user.id) : null,
       telegram_username: user?.username ?? null,
@@ -337,6 +313,15 @@ async function connectByCompanyCode(
 
   if (error) {
     throw error;
+  }
+
+  const { error: codeUpdateError } = await supabase
+    .from("telegram_connection_codes")
+    .update({ used_at: new Date().toISOString() })
+    .eq("id", codeData.id);
+
+  if (codeUpdateError) {
+    throw codeUpdateError;
   }
 
   return true;
@@ -536,7 +521,7 @@ async function handleStart(supabase: ReturnType<typeof getSupabaseAdmin>, messag
   const connection = await getConnection(supabase, chatId);
 
   if (connection) {
-    await sendMessage(chatId, "Бот подключён к компании.");
+    await sendMessage(chatId, "Бот уже подключён к компании.");
     return;
   }
 
@@ -551,8 +536,27 @@ async function handleAddProduct(supabase: ReturnType<typeof getSupabaseAdmin>, c
     return;
   }
 
-  await createNewDraft(supabase, connection.company_id, chatId);
-  await sendCategoryKeyboard(supabase, connection.company_id, chatId);
+  await sendMessage(chatId, "Добавление товара скоро будет доступно.");
+}
+
+async function handleStatus(supabase: ReturnType<typeof getSupabaseAdmin>, chatId: string) {
+  const connection = await getConnection(supabase, chatId);
+
+  await sendMessage(chatId, connection ? "Бот подключён к компании." : "Бот не подключён. Отправьте код из CRM.");
+}
+
+async function handleDisconnect(supabase: ReturnType<typeof getSupabaseAdmin>, chatId: string) {
+  const { error } = await supabase
+    .from("telegram_connections")
+    .update({ is_active: false })
+    .eq("telegram_chat_id", chatId)
+    .eq("is_active", true);
+
+  if (error) {
+    throw error;
+  }
+
+  await sendMessage(chatId, "Бот отключён от компании.");
 }
 
 async function handleCancel(supabase: ReturnType<typeof getSupabaseAdmin>, chatId: string) {
@@ -801,12 +805,25 @@ async function handleMessage(supabase: ReturnType<typeof getSupabaseAdmin>, mess
     return;
   }
 
+  if (text === "/status") {
+    await handleStatus(supabase, chatId);
+    return;
+  }
+
+  if (text === "/disconnect") {
+    await handleDisconnect(supabase, chatId);
+    return;
+  }
+
   const connection = await getConnection(supabase, chatId);
 
   if (!connection) {
     if (/^[0-9]{5,6}$/.test(text)) {
-      const connected = await connectByCompanyCode(supabase, chatId, message.from, text);
-      await sendMessage(chatId, connected ? "Бот подключён к компании." : "Код подключения не найден.");
+      const connected = await connectByCode(supabase, chatId, message.from, text);
+      await sendMessage(
+        chatId,
+        connected ? "Бот успешно подключён к компании." : "Код неверный или истёк. Сгенерируйте новый код в CRM.",
+      );
       return;
     }
 

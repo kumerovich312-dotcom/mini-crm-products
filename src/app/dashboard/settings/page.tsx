@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { Building2, Loader2, Save, Settings2, UploadCloud } from "lucide-react";
+import { Bot, Building2, Loader2, Save, Settings2, UploadCloud } from "lucide-react";
 
 import { PageHeader } from "@/components/page-header";
 import { Button } from "@/components/ui/button";
@@ -66,6 +66,10 @@ export default function SettingsPage() {
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
+  const [isTelegramConnected, setIsTelegramConnected] = useState(false);
+  const [telegramCode, setTelegramCode] = useState<string | null>(null);
+  const [telegramCodeExpiresAt, setTelegramCodeExpiresAt] = useState<string | null>(null);
+  const [isGeneratingTelegramCode, setIsGeneratingTelegramCode] = useState(false);
 
   function updateSetting<K extends keyof SettingsState>(field: K, value: SettingsState[K]) {
     setSettings((current) => ({ ...current, [field]: value }));
@@ -90,16 +94,28 @@ export default function SettingsPage() {
 
       setCompanyId(currentCompanyId);
 
-      const { data, error } = await supabase
-        .from("companies")
-        .select("id, name, slug, sku_prefix, sku_random_digits, company_code, currency")
-        .eq("id", currentCompanyId)
-        .maybeSingle();
+      const [{ data, error }, connectionsResult] = await Promise.all([
+        supabase
+          .from("companies")
+          .select("id, name, slug, sku_prefix, sku_random_digits, company_code, currency")
+          .eq("id", currentCompanyId)
+          .maybeSingle(),
+        supabase
+          .from("telegram_connections")
+          .select("id")
+          .eq("company_id", currentCompanyId)
+          .eq("is_active", true)
+          .limit(1),
+      ]);
 
       if (error) {
         logAppError("Settings company load error", error);
         setPageError(error.message);
         return;
+      }
+
+      if (connectionsResult.error) {
+        logAppError("Settings telegram connection load error", connectionsResult.error);
       }
 
       if (!data) {
@@ -121,6 +137,7 @@ export default function SettingsPage() {
         skuRandomDigits: String(company.sku_random_digits ?? 4),
         currency: company.currency,
       });
+      setIsTelegramConnected((connectionsResult.data?.length ?? 0) > 0);
     } catch (error) {
       logAppError("Settings load error", error);
       setPageError(getErrorMessage(error));
@@ -209,6 +226,50 @@ export default function SettingsPage() {
       setPageError(getErrorMessage(error));
     } finally {
       setIsSaving(false);
+    }
+  }
+
+  async function generateTelegramCode() {
+    setIsGeneratingTelegramCode(true);
+    setPageError(null);
+    setSuccessMessage(null);
+    setTelegramCode(null);
+    setTelegramCodeExpiresAt(null);
+
+    try {
+      const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
+
+      if (sessionError) {
+        throw sessionError;
+      }
+
+      const token = sessionData.session?.access_token;
+
+      if (!token) {
+        setPageError("Сессия пользователя не найдена. Войдите заново.");
+        return;
+      }
+
+      const response = await fetch("/api/telegram/generate-code", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+        },
+      });
+      const payload = (await response.json()) as { code?: string; expires_at?: string; error?: string };
+
+      if (!response.ok || !payload.code) {
+        throw new Error(payload.error ?? "Не удалось сгенерировать код подключения.");
+      }
+
+      setTelegramCode(payload.code);
+      setTelegramCodeExpiresAt(payload.expires_at ?? null);
+      setSuccessMessage("Код подключения создан");
+    } catch (error) {
+      logAppError("Settings telegram code error", error);
+      setPageError(getErrorMessage(error));
+    } finally {
+      setIsGeneratingTelegramCode(false);
     }
   }
 
@@ -352,7 +413,7 @@ export default function SettingsPage() {
               <div className="flex items-center gap-3">
                 <SectionIcon icon={UploadCloud} />
                 <div>
-                  <CardTitle>Медиа, Telegram и API</CardTitle>
+                  <CardTitle>Медиа и API</CardTitle>
                   <CardDescription>Эти настройки будут подключены отдельным этапом.</CardDescription>
                 </div>
               </div>
@@ -362,6 +423,50 @@ export default function SettingsPage() {
                 Переключатели обработки медиа, Telegram и лимитов API скрыты как рабочие настройки, чтобы не создавать
                 ощущение сохранения без влияния на продукт. Сейчас реально сохраняются настройки компании, валюты и SKU.
               </div>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <div className="flex items-center gap-3">
+                <SectionIcon icon={Bot} />
+                <div>
+                  <CardTitle>Telegram-бот</CardTitle>
+                  <CardDescription>Подключение Telegram-чата к текущей компании.</CardDescription>
+                </div>
+              </div>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="rounded-lg border bg-slate-50 p-4 text-sm">
+                <span className="font-medium">Статус: </span>
+                <span className={isTelegramConnected ? "text-emerald-700" : "text-muted-foreground"}>
+                  {isTelegramConnected ? "подключён" : "не подключён"}
+                </span>
+              </div>
+              <Button
+                type="button"
+                variant="outline"
+                disabled={isGeneratingTelegramCode}
+                onClick={() => void generateTelegramCode()}
+              >
+                {isGeneratingTelegramCode ? <Loader2 className="animate-spin" /> : <Bot />}
+                Сгенерировать код подключения
+              </Button>
+              {telegramCode ? (
+                <div className="rounded-lg border border-blue-100 bg-blue-50 p-4">
+                  <p className="text-sm text-muted-foreground">Отправьте этот код боту:</p>
+                  <p className="mt-1 font-mono text-2xl font-semibold text-blue-700">{telegramCode}</p>
+                  {telegramCodeExpiresAt ? (
+                    <p className="mt-2 text-xs text-muted-foreground">
+                      Код действует до {new Intl.DateTimeFormat("ru-RU", {
+                        hour: "2-digit",
+                        minute: "2-digit",
+                      }).format(new Date(telegramCodeExpiresAt))}
+                    </p>
+                  ) : null}
+                </div>
+              ) : null}
+              <p className="text-xs text-muted-foreground">Токен и секрет webhook в интерфейсе не отображаются.</p>
             </CardContent>
           </Card>
 
