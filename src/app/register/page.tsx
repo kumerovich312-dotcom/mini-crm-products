@@ -8,17 +8,17 @@ import { BarChart3, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import { logAppError } from "@/lib/errors";
+import { getErrorMessage, logAppError } from "@/lib/errors";
 import { supabase } from "@/lib/supabase/client";
 
-function makeSlug(value: string) {
-  const normalized = value
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
+async function getOnboardError(response: Response) {
+  try {
+    const data = (await response.json()) as { error?: unknown };
 
-  return `${normalized || "company"}-${crypto.randomUUID().slice(0, 8)}`;
+    return getErrorMessage(data.error ?? data);
+  } catch (error) {
+    return getErrorMessage(error);
+  }
 }
 
 export default function RegisterPage() {
@@ -47,63 +47,53 @@ export default function RegisterPage() {
 
     setIsLoading(true);
 
-    const { data: authData, error: signUpError } = await supabase.auth.signUp({
-      email: email.trim(),
-      password,
-    });
+    try {
+      const trimmedEmail = email.trim();
+      const { data: authData, error: signUpError } = await supabase.auth.signUp({
+        email: trimmedEmail,
+        password,
+      });
 
-    if (signUpError) {
-      logAppError("Register auth error", signUpError);
-      setError(signUpError.message);
+      if (signUpError) {
+        logAppError("Register auth error", signUpError);
+        setError(getErrorMessage(signUpError));
+        return;
+      }
+
+      const user = authData.user;
+
+      if (!user) {
+        setError("Пользователь создан, но Supabase не вернул user.id. Проверьте email и войдите.");
+        return;
+      }
+
+      const onboardResponse = await fetch("/api/auth/onboard-company", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          user_id: user.id,
+          email: trimmedEmail,
+          full_name: fullName.trim(),
+          company_name: companyName.trim(),
+          sku_prefix: skuPrefix.trim(),
+        }),
+      });
+
+      if (!onboardResponse.ok) {
+        setError(await getOnboardError(onboardResponse));
+        return;
+      }
+
+      router.push("/dashboard");
+      router.refresh();
+    } catch (error) {
+      logAppError("Register onboard error", error);
+      setError(getErrorMessage(error));
+    } finally {
       setIsLoading(false);
-      return;
     }
-
-    const user = authData.user;
-
-    if (!user) {
-      setError("Пользователь создан, но сессия не получена. Проверьте email и войдите.");
-      setIsLoading(false);
-      return;
-    }
-
-    const { data: company, error: companyError } = await supabase
-      .from("companies")
-      .insert({
-        name: companyName.trim(),
-        slug: makeSlug(companyName),
-        sku_prefix: skuPrefix.trim().toUpperCase(),
-        currency: "KGS",
-      })
-      .select("id")
-      .single();
-
-    if (companyError) {
-      logAppError("Register company error", companyError);
-      setError(companyError.message);
-      setIsLoading(false);
-      return;
-    }
-
-    const { error: profileError } = await supabase.from("profiles").insert({
-      id: user.id,
-      user_id: user.id,
-      company_id: company.id,
-      email: email.trim(),
-      full_name: fullName.trim() || null,
-      role: "owner",
-    });
-
-    setIsLoading(false);
-
-    if (profileError) {
-      logAppError("Register profile error", profileError);
-      setError(profileError.message);
-      return;
-    }
-
-    router.push("/dashboard");
-    router.refresh();
   }
 
   return (
