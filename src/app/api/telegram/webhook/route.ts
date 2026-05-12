@@ -21,7 +21,7 @@ type TelegramMessage = {
   video?: TelegramVideo;
 };
 type TelegramCallbackQuery = { id: string; from: TelegramUser; message?: TelegramMessage; data?: string };
-type TelegramUpdate = { message?: TelegramMessage; callback_query?: TelegramCallbackQuery };
+type TelegramUpdate = { update_id?: number; message?: TelegramMessage; callback_query?: TelegramCallbackQuery };
 type TelegramConnection = {
   id: string;
   company_id: string;
@@ -57,9 +57,65 @@ type TelegramDraft = {
   status: string;
 };
 type InlineButton = { text: string; callback_data: string };
+type CachedConnection = { company_id: string; is_active: boolean };
+type DraftBrief = Pick<TelegramDraft, "id" | "step" | "mode" | "product_id" | "category_id">;
+
+const CONNECTION_CACHE_TTL_MS = 60_000;
+const RECENT_UPDATE_TTL_MS = 120_000;
+const connectionCache = new Map<string, { value: CachedConnection | null; expiresAt: number }>();
+const recentUpdates = new Map<string, number>();
 
 function logTiming(action: string, startedAt: number, chatId?: string) {
   console.log("telegram timing", { action, ms: Date.now() - startedAt, chatId });
+}
+
+function logTotalTiming(action: string, startedAt: number, chatId?: string) {
+  console.log("telegram timing total", { action, ms: Date.now() - startedAt, chatId });
+}
+
+function cachedConnectionToConnection(chatId: string, cached: CachedConnection): TelegramConnection {
+  return {
+    id: "cache",
+    company_id: cached.company_id,
+    telegram_chat_id: chatId,
+    telegram_user_id: null,
+    telegram_username: null,
+    is_active: cached.is_active,
+  };
+}
+
+function clearConnectionCache(chatId: string) {
+  connectionCache.delete(chatId);
+}
+
+function cleanupRecentUpdates(now = Date.now()) {
+  for (const [key, expiresAt] of recentUpdates.entries()) {
+    if (expiresAt <= now) recentUpdates.delete(key);
+  }
+}
+
+function getDedupeKeys(update: TelegramUpdate) {
+  const keys: string[] = [];
+  if (typeof update.update_id === "number") keys.push(`update:${update.update_id}`);
+  if (update.callback_query?.id) keys.push(`callback:${update.callback_query.id}`);
+  return keys;
+}
+
+function isDuplicateUpdate(update: TelegramUpdate) {
+  const keys = getDedupeKeys(update);
+  if (keys.length === 0) return false;
+
+  const now = Date.now();
+  cleanupRecentUpdates(now);
+  if (keys.some((key) => {
+    const expiresAt = recentUpdates.get(key);
+    return Boolean(expiresAt && expiresAt > now);
+  })) {
+    return true;
+  }
+
+  for (const key of keys) recentUpdates.set(key, now + RECENT_UPDATE_TTL_MS);
+  return false;
 }
 
 function getSupabaseAdmin() {
@@ -236,14 +292,28 @@ function normalize(value: string) {
 }
 
 async function getConnection(supabase: ReturnType<typeof getSupabaseAdmin>, chatId: string) {
+  const cacheStartedAt = Date.now();
+  const cached = connectionCache.get(chatId);
+  const now = Date.now();
+  if (cached && cached.expiresAt > now) {
+    logTiming("get connection cache", cacheStartedAt, chatId);
+    return cached.value?.is_active ? cachedConnectionToConnection(chatId, cached.value) : null;
+  }
+  if (cached) connectionCache.delete(chatId);
+
   const { data, error } = await supabase
     .from("telegram_connections")
-    .select("*")
+    .select("id, company_id, telegram_chat_id, is_active")
     .eq("telegram_chat_id", chatId)
     .eq("is_active", true)
     .limit(1);
   if (error) throw error;
-  return ((data?.[0] ?? null) as TelegramConnection | null) ?? null;
+  const connection = ((data?.[0] ?? null) as TelegramConnection | null) ?? null;
+  connectionCache.set(chatId, {
+    value: connection ? { company_id: connection.company_id, is_active: connection.is_active } : null,
+    expiresAt: Date.now() + CONNECTION_CACHE_TTL_MS,
+  });
+  return connection;
 }
 
 async function getActiveDraft(supabase: ReturnType<typeof getSupabaseAdmin>, companyId: string, chatId: string) {
@@ -257,6 +327,19 @@ async function getActiveDraft(supabase: ReturnType<typeof getSupabaseAdmin>, com
     .limit(1);
   if (error) throw error;
   return ((data?.[0] ?? null) as TelegramDraft | null) ?? null;
+}
+
+async function getActiveDraftBrief(supabase: ReturnType<typeof getSupabaseAdmin>, companyId: string, chatId: string) {
+  const { data, error } = await supabase
+    .from("telegram_product_drafts")
+    .select("id, step, mode, product_id, category_id")
+    .eq("company_id", companyId)
+    .eq("telegram_chat_id", chatId)
+    .neq("step", "done")
+    .order("updated_at", { ascending: false })
+    .limit(1);
+  if (error) throw error;
+  return ((data?.[0] ?? null) as DraftBrief | null) ?? null;
 }
 
 async function clearDrafts(supabase: ReturnType<typeof getSupabaseAdmin>, companyId: string, chatId: string) {
@@ -327,6 +410,7 @@ async function connectByCode(supabase: ReturnType<typeof getSupabaseAdmin>, chat
     .update({ used_at: new Date().toISOString() })
     .eq("id", codeData.id);
   if (codeUpdateError) throw codeUpdateError;
+  clearConnectionCache(chatId);
   return true;
 }
 
@@ -824,7 +908,7 @@ async function showHelp(chatId: string) {
   );
 }
 
-function isBusyDraft(draft: TelegramDraft | null) {
+function isBusyDraft(draft: { step: string } | null) {
   return Boolean(draft && draft.step !== "idle" && draft.step !== "done");
 }
 
@@ -1039,14 +1123,14 @@ async function handleMenuAction(supabase: ReturnType<typeof getSupabaseAdmin>, c
   if (action === "menu") return sendMainMenu(chatId);
   if (action === "help") return showHelp(chatId);
 
-  const activeDraft = await getActiveDraft(supabase, connection.company_id, chatId);
+  const activeDraft = await getActiveDraftBrief(supabase, connection.company_id, chatId);
   if (isBusyDraft(activeDraft)) return showBusyMessage(chatId);
-  if (action === "add_product") return startAddWizard(supabase, chatId, connection);
-  if (action === "find_product") {
+  if (action === "add_product" || action === "add") return startAddWizard(supabase, chatId, connection);
+  if (action === "find_product" || action === "find") {
     await createDraft(supabase, connection.company_id, chatId, "find", "wait_find");
     return sendMessage(chatId, "Введите название, SKU или ключевое слово.");
   }
-  if (action === "edit_product") {
+  if (action === "edit_product" || action === "edit") {
     await createDraft(supabase, connection.company_id, chatId, "edit_search", "wait_edit_search");
     return sendMessage(chatId, "Введите SKU или название товара.");
   }
@@ -1063,14 +1147,15 @@ async function handleMenuAction(supabase: ReturnType<typeof getSupabaseAdmin>, c
   if (action === "stats") return showStats(supabase, chatId, connection.company_id);
 }
 
-async function handleCallback(supabase: ReturnType<typeof getSupabaseAdmin>, callback: TelegramCallbackQuery) {
+async function handleCallback(supabase: ReturnType<typeof getSupabaseAdmin>, callback: TelegramCallbackQuery, callbackAnswered = false) {
   const startedAt = Date.now();
   const chatId = callback.message?.chat.id ? String(callback.message.chat.id) : "";
   const data = callback.data ?? "";
   if (!chatId) return answerCallbackQuery(callback.id, "Чат не найден.");
-  await answerCallbackQuery(callback.id);
-  logTiming("answer_callback", startedAt, chatId);
-
+  if (!callbackAnswered) {
+    await answerCallbackQuery(callback.id);
+    logTiming("answer_callback", startedAt, chatId);
+  }
   const getConnectionStartedAt = Date.now();
   const connection = await getConnection(supabase, chatId);
   logTiming("get connection", getConnectionStartedAt, chatId);
@@ -1281,6 +1366,16 @@ async function handleMessage(supabase: ReturnType<typeof getSupabaseAdmin>, mess
   const chatId = String(message.chat.id);
   const text = message.text?.trim() ?? "";
   const media = getMessageMedia(message);
+  if (text === "/disconnect") {
+    const { error } = await supabase
+      .from("telegram_connections")
+      .update({ is_active: false, updated_at: new Date().toISOString() })
+      .eq("telegram_chat_id", chatId)
+      .eq("is_active", true);
+    if (error) throw error;
+    clearConnectionCache(chatId);
+    return sendMessage(chatId, "Бот отключён от компании.");
+  }
   if (text === "/start") {
     const getConnectionStartedAt = Date.now();
     const connection = await getConnection(supabase, chatId);
@@ -1345,14 +1440,27 @@ export async function POST(request: Request) {
         : undefined;
     const action = update.callback_query?.data ?? update.message?.text ?? (update.message?.photo || update.message?.video ? "media" : "unknown");
     logTiming("parse update", parseStartedAt, chatId);
+    let callbackAnswered = false;
+    if (update.callback_query) {
+      const answerStartedAt = Date.now();
+      await answerCallbackQuery(update.callback_query.id);
+      callbackAnswered = true;
+      logTiming("answer_callback", answerStartedAt, chatId);
+    }
+    if (isDuplicateUpdate(update)) {
+      logTotalTiming(`duplicate ${String(action)}`, startedAt, chatId);
+      return NextResponse.json({ ok: true });
+    }
     const supabase = getSupabaseAdmin();
-    if (update.callback_query) await handleCallback(supabase, update.callback_query);
+    if (update.callback_query) await handleCallback(supabase, update.callback_query, callbackAnswered);
     else if (update.message) await handleMessage(supabase, update.message);
     logTiming(String(action), startedAt, chatId);
+    logTotalTiming(String(action), startedAt, chatId);
     return NextResponse.json({ ok: true });
   } catch (error) {
     logTelegramError("webhook", error);
     logTiming("webhook_error", startedAt);
+    logTotalTiming("webhook_error", startedAt);
     return NextResponse.json({ ok: true });
   }
 }
