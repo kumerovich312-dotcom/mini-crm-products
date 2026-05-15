@@ -2,6 +2,7 @@ export type TelegramUser = { id: number; username?: string };
 export type TelegramChat = { id: number };
 export type TelegramPhotoSize = { file_id: string; file_size?: number };
 export type TelegramVideo = { file_id: string; file_name?: string; mime_type?: string; file_size?: number };
+export type TelegramDocument = { file_id: string; file_name?: string; mime_type?: string; file_size?: number };
 
 export type TelegramMessage = {
   message_id: number;
@@ -10,6 +11,7 @@ export type TelegramMessage = {
   text?: string;
   photo?: TelegramPhotoSize[];
   video?: TelegramVideo;
+  document?: TelegramDocument;
 };
 
 export type TelegramCallbackQuery = { id: string; from: TelegramUser; message?: TelegramMessage; data?: string };

@@ -1,7 +1,10 @@
 import "dotenv/config";
+import dns from "node:dns";
 import Fastify from "fastify";
 import { logTelegramWebhookParseError, processTelegramUpdate } from "./bot/handler.js";
 import type { TelegramUpdate } from "./telegram/types.js";
+
+dns.setDefaultResultOrder("ipv4first");
 
 const app = Fastify({ logger: false });
 

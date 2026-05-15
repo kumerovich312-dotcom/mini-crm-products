@@ -1,10 +1,20 @@
 import { getSupabaseAdmin } from "../supabase/admin.js";
+import {
+  answerCallbackQuery,
+  downloadTelegramFile as downloadTelegramFileByPath,
+  editTelegramMessage,
+  getTelegramFile,
+  isNonCriticalTelegramError,
+  sendTelegramMessage,
+  TelegramFileError,
+} from "../telegram/api.js";
 import type { TelegramCallbackQuery, TelegramMessage, TelegramUpdate, TelegramUser } from "../telegram/types.js";
 import type { Category, Company, CustomField, Product, ProductCustomValue, ProductMedia, ProductStatus } from "./database.js";
 import { createId, getErrorMessage } from "./utils.js";
 
 const MEDIA_BUCKET = "product-media";
 const NOT_CONNECTED = "Сначала подключите бота. Откройте CRM → Настройки → Telegram-бот и отправьте сюда код подключения.";
+const TELEGRAM_FILE_SIZE_LIMIT_BYTES = 300 * 1024 * 1024;
 
 type TelegramConnection = {
   id: string;
@@ -115,62 +125,8 @@ function isDuplicateUpdate(update: TelegramUpdate) {
   return false;
 }
 
-function getTelegramToken() {
-  const token = process.env.TELEGRAM_BOT_TOKEN;
-  if (!token) throw new Error("TELEGRAM_BOT_TOKEN is missing.");
-  return token;
-}
-
 function logTelegramError(stage: string, error: unknown, details?: Record<string, unknown>) {
   console.error("Telegram bot error", { stage, message: getErrorMessage(error), details });
-}
-
-async function telegramApi<T>(method: string, payload: Record<string, unknown>, action = method) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 8000);
-
-  try {
-    const response = await fetch(`https://api.telegram.org/bot${getTelegramToken()}/${method}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(payload),
-      signal: controller.signal,
-    });
-    const body = (await response.json()) as { ok: boolean; result?: T; description?: string };
-    if (!response.ok || !body.ok) throw new Error(body.description ?? `Telegram API ${method} failed`);
-    return body.result as T;
-  } catch (error) {
-    logTelegramError("telegram_api", error, { method, action });
-    throw error;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-async function sendTelegramMessage(chatId: string, text: string, replyMarkup?: Record<string, unknown>, action = "send_message") {
-  return telegramApi<TelegramMessage>("sendMessage", { chat_id: chatId, text, reply_markup: replyMarkup }, action);
-}
-
-async function editTelegramMessage(
-  chatId: string,
-  messageId: number,
-  text: string,
-  replyMarkup?: Record<string, unknown>,
-  action = "edit_message",
-) {
-  return telegramApi(
-    "editMessageText",
-    { chat_id: chatId, message_id: messageId, text, reply_markup: replyMarkup },
-    action,
-  );
-}
-
-async function answerCallbackQuery(callbackQueryId: string, text?: string) {
-  try {
-    return await telegramApi("answerCallbackQuery", { callback_query_id: callbackQueryId, text }, "answer_callback");
-  } catch {
-    return null;
-  }
 }
 
 function keyboard(rows: InlineButton[][]) {
@@ -242,7 +198,7 @@ async function safeEditOrSend(
       await editTelegramMessage(chatId, messageId, text, replyMarkup, action);
       return { mode: "edit" as const, messageId };
     } catch (error) {
-      if (getErrorMessage(error).includes("message is not modified")) {
+      if (isNonCriticalTelegramError(error)) {
         return { mode: "edit" as const, messageId };
       }
     }
@@ -343,32 +299,34 @@ async function showCancelledMenu(
 function getMessageMedia(message: TelegramMessage) {
   const photo = message.photo?.[message.photo.length - 1] ?? null;
   const video = message.video ?? null;
-  if (!photo && !video) return null;
-  return { fileId: photo?.file_id ?? video?.file_id ?? "", mediaType: photo ? ("photo" as const) : ("video" as const) };
+  const document = message.document ?? null;
+  const imageDocument = document?.mime_type?.startsWith("image/") ? document : null;
+  if (!photo && !video && !imageDocument) return null;
+  return {
+    fileId: photo?.file_id ?? video?.file_id ?? imageDocument?.file_id ?? "",
+    fileSize: photo?.file_size ?? video?.file_size ?? imageDocument?.file_size ?? null,
+    mediaType: photo || imageDocument ? ("photo" as const) : ("video" as const),
+  };
 }
 
 async function downloadTelegramFile(fileId: string) {
-  const file = await telegramApi<{ file_path?: string; file_size?: number }>("getFile", { file_id: fileId });
+  const file = await getTelegramFile(fileId);
   if (!file.file_path) throw new Error("Telegram did not return file_path.");
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 8000);
+  if (file.file_size && file.file_size > TELEGRAM_FILE_SIZE_LIMIT_BYTES) {
+    throw new TelegramFileError("Telegram file is too large.", "file_too_large", undefined, { file_size: file.file_size });
+  }
 
   try {
-    const response = await fetch(`https://api.telegram.org/file/bot${getTelegramToken()}/${file.file_path}`, {
-      signal: controller.signal,
-    });
-    if (!response.ok) throw new Error(`Telegram file download failed with status ${response.status}.`);
+    const downloaded = await downloadTelegramFileByPath(file.file_path);
     return {
-      buffer: await response.arrayBuffer(),
+      buffer: downloaded.buffer,
       filePath: file.file_path,
-      fileSize: file.file_size ?? null,
-      contentType: response.headers.get("content-type") ?? undefined,
+      fileSize: file.file_size ?? downloaded.bytes,
+      contentType: downloaded.contentType,
     };
   } catch (error) {
     logTelegramError("telegram_file_download", error, { action: "download_file", fileId });
     throw error;
-  } finally {
-    clearTimeout(timeout);
   }
 }
 
@@ -398,6 +356,46 @@ function parseStock(value: string) {
 
 function normalize(value: string) {
   return value.trim().toLowerCase();
+}
+
+function mediaUploadErrorMessage(error: unknown) {
+  if (error instanceof TelegramFileError) {
+    if (error.code === "get_file") return "Не удалось получить файл из Telegram. Попробуйте отправить ещё раз.";
+    if (error.code === "file_too_large") return "Файл слишком большой. Максимальный размер для загрузки: 300 MB.";
+  }
+  return "Не удалось загрузить файл. Попробуйте ещё раз или нажмите Пропустить медиа.";
+}
+
+async function renderMediaRetryScreen(
+  supabase: ReturnType<typeof getSupabaseAdmin>,
+  chatId: string,
+  companyId: string,
+  text: string,
+  connection?: TelegramConnection | null,
+) {
+  return renderTelegramScreen({
+    supabase,
+    chatId,
+    companyId,
+    connection,
+    screen: "wait_media",
+    text,
+    rows: [[{ text: "Пропустить медиа", callback_data: "media:skip" }]],
+  });
+}
+
+async function withTimeout<T>(promise: PromiseLike<T>, timeoutMs: number, message: string) {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(message)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
 }
 
 async function getConnection(supabase: ReturnType<typeof getSupabaseAdmin>, chatId: string) {
@@ -607,10 +605,16 @@ async function uploadTelegramMedia(
   const extension = getExtension(downloaded.filePath, mediaType === "photo" ? ".jpg" : ".mp4");
   const finalFileName = fileName ?? `draft-${shortId()}${extension}`;
   const storagePath = `${companyId}/telegram/${targetId}/${finalFileName}`;
-  const { error: uploadError } = await supabase.storage.from(MEDIA_BUCKET).upload(storagePath, downloaded.buffer, {
-    contentType: downloaded.contentType,
-    upsert: false,
-  });
+  console.log("telegram file", { stage: "storage_upload", path: storagePath });
+  const uploadResult = await withTimeout(
+    supabase.storage.from(MEDIA_BUCKET).upload(storagePath, downloaded.buffer, {
+      contentType: downloaded.contentType,
+      upsert: false,
+    }),
+    30000,
+    "Supabase storage upload timed out.",
+  );
+  const { error: uploadError } = uploadResult;
   if (uploadError) throw uploadError;
   const { data } = supabase.storage.from(MEDIA_BUCKET).getPublicUrl(storagePath);
   return {
@@ -1088,7 +1092,7 @@ async function toggleVisibility(
     .eq("company_id", companyId)
     .eq("id", productId);
   if (error) throw error;
-  if (options.callbackId) await answerCallbackQuery(options.callbackId, nextStatus === "hidden" ? "Товар скрыт" : "Товар активирован");
+  if (options.callbackId) await answerCallbackQuery(options.callbackId, nextStatus === "hidden" ? "Товар скрыт" : "Товар активирован", chatId);
   await openProductCard(supabase, chatId, companyId, productId, options);
 }
 
@@ -1106,7 +1110,7 @@ async function toggleApi(
   const nextValue = !product.is_visible_in_api;
   const { error } = await supabase.from("products").update({ is_visible_in_api: nextValue }).eq("company_id", companyId).eq("id", productId);
   if (error) throw error;
-  if (options.callbackId) await answerCallbackQuery(options.callbackId, nextValue ? "API включён" : "API выключен");
+  if (options.callbackId) await answerCallbackQuery(options.callbackId, nextValue ? "API включён" : "API выключен", chatId);
   await openProductCard(supabase, chatId, companyId, productId, options);
 }
 
@@ -1238,7 +1242,8 @@ async function startAddWizard(
       await uploadDraftMediaFromMessage(supabase, draft, message as TelegramMessage, "choose_category");
     } catch (error) {
       logTelegramError("media_upload", error, { companyId: connection.company_id, chatId });
-      await sendMessage(chatId, "Не удалось загрузить фото. Попробуйте ещё раз.");
+      await updateDraft(supabase, draft, { step: "wait_media" });
+      await renderMediaRetryScreen(supabase, chatId, connection.company_id, mediaUploadErrorMessage(error), connection);
       return;
     }
     await sendCategoryKeyboard(supabase, connection.company_id, chatId, "Фото получил ✅ Выберите категорию товара:", { connection, screen: "choose_category" });
@@ -1465,38 +1470,49 @@ async function handleDraftMedia(supabase: ReturnType<typeof getSupabaseAdmin>, c
   if (draft.mode === "edit" && draft.product_id && (draft.step === "edit_media_add" || draft.step === "edit_media_replace")) {
     const product = await getProduct(supabase, draft.company_id, draft.product_id);
     if (!product) return sendMessage(chatId, "Товар не найден.");
-    if (draft.step === "edit_media_replace") {
-      await supabase.from("product_media").delete().eq("company_id", draft.company_id).eq("product_id", draft.product_id);
-    }
     const media = getMessageMedia(message);
     if (!media) return sendMessage(chatId, "Отправьте фото или видео.");
-    const countResult = await supabase.from("product_media").select("id").eq("company_id", draft.company_id).eq("product_id", draft.product_id);
-    const index = (countResult.data?.length ?? 0) + 1;
-    const ext = media.mediaType === "photo" ? ".jpg" : ".mp4";
-    const item = await uploadTelegramMedia(supabase, draft.company_id, product.id, media.fileId, media.mediaType, `${product.sku}-${index}${ext}`);
-    const { error } = await supabase.from("product_media").insert({
-      company_id: draft.company_id,
-      product_id: product.id,
-      media_type: item.media_type,
-      original_url: item.public_url,
-      processed_url: item.public_url,
-      thumbnail_url: item.media_type === "photo" ? item.public_url : null,
-      file_name: item.file_name,
-      file_size_bytes: item.file_size_bytes,
-      status: "ready",
-      sort_order: index - 1,
-    });
-    if (error) throw error;
-    await clearDrafts(supabase, draft.company_id, chatId);
     const connection = await getConnection(supabase, chatId);
-    return openProductCard(supabase, chatId, draft.company_id, product.id, { connection: connection ?? undefined });
+    try {
+      if (draft.step === "edit_media_replace") {
+        await supabase.from("product_media").delete().eq("company_id", draft.company_id).eq("product_id", draft.product_id);
+      }
+      const countResult = await supabase.from("product_media").select("id").eq("company_id", draft.company_id).eq("product_id", draft.product_id);
+      const index = (countResult.data?.length ?? 0) + 1;
+      const ext = media.mediaType === "photo" ? ".jpg" : ".mp4";
+      const item = await uploadTelegramMedia(supabase, draft.company_id, product.id, media.fileId, media.mediaType, `${product.sku}-${index}${ext}`);
+      const { error } = await supabase.from("product_media").insert({
+        company_id: draft.company_id,
+        product_id: product.id,
+        media_type: item.media_type,
+        original_url: item.public_url,
+        processed_url: item.public_url,
+        thumbnail_url: item.media_type === "photo" ? item.public_url : null,
+        file_name: item.file_name,
+        file_size_bytes: item.file_size_bytes,
+        status: "ready",
+        sort_order: index - 1,
+      });
+      if (error) throw error;
+      await clearDrafts(supabase, draft.company_id, chatId);
+      return openProductCard(supabase, chatId, draft.company_id, product.id, { connection: connection ?? undefined });
+    } catch (error) {
+      logTelegramError("telegram_file_download", error, { action: "download_file", fileId: media.fileId });
+      return renderMediaRetryScreen(supabase, chatId, draft.company_id, mediaUploadErrorMessage(error), connection);
+    }
   }
   if (draft.mode === "add" && (draft.step === "wait_media" || draft.step === "choose_category")) {
     const nextStep = draft.step === "wait_media" ? "choose_category" : "choose_category";
-    const nextDraft = await uploadDraftMediaFromMessage(supabase, draft, message, nextStep);
-    if (!nextDraft) return sendMessage(chatId, "Отправьте фото или видео.");
     const connection = await getConnection(supabase, chatId);
-    return sendCategoryKeyboard(supabase, draft.company_id, chatId, "Фото получил ✅ Выберите категорию товара:", { connection });
+    try {
+      const nextDraft = await uploadDraftMediaFromMessage(supabase, draft, message, nextStep);
+      if (!nextDraft) return sendMessage(chatId, "Отправьте фото или видео.");
+      return sendCategoryKeyboard(supabase, draft.company_id, chatId, "Фото получил ✅ Выберите категорию товара:", { connection });
+    } catch (error) {
+      logTelegramError("telegram_file_download", error, { action: "download_file", fileId: getMessageMedia(message)?.fileId });
+      await updateDraft(supabase, draft, { step: "wait_media" });
+      return renderMediaRetryScreen(supabase, chatId, draft.company_id, mediaUploadErrorMessage(error), connection);
+    }
   }
   await sendMessage(chatId, "Сейчас ожидаю текст или кнопку.");
 }
@@ -1595,7 +1611,7 @@ async function handleCallback(supabase: ReturnType<typeof getSupabaseAdmin>, cal
   const data = callback.data ?? "";
   if (!chatId) return answerCallbackQuery(callback.id, "Чат не найден.");
   if (!callbackAnswered) {
-    await answerCallbackQuery(callback.id);
+    await answerCallbackQuery(callback.id, undefined, chatId);
     logTiming("answer_callback", startedAt, chatId);
   }
   const getConnectionStartedAt = Date.now();
@@ -1635,13 +1651,13 @@ async function handleCallback(supabase: ReturnType<typeof getSupabaseAdmin>, cal
   if (data === "draft:restart") return restartDraft(supabase, chatId, connection, draft);
   if (data === "draft:cancel") {
     await clearDrafts(supabase, connection.company_id, chatId);
-    await answerCallbackQuery(callback.id, "Действие отменено");
+    await answerCallbackQuery(callback.id, "Действие отменено", chatId);
     return showCancelledMenu(supabase, chatId, connection, { messageId: callback.message?.message_id });
   }
   if (data === "busy:cont") return draft ? resumeDraft(supabase, chatId, draft, { connection, messageId: callback.message?.message_id }) : showMainMenu(supabase, chatId, connection, { messageId: callback.message?.message_id });
   if (data === "busy:new") {
     await clearDrafts(supabase, connection.company_id, chatId);
-    await answerCallbackQuery(callback.id, "Начните заново");
+    await answerCallbackQuery(callback.id, "Начните заново", chatId);
     return showMainMenu(supabase, chatId, connection, { messageId: callback.message?.message_id });
   }
   if (data === "busy:menu") return showMainMenu(supabase, chatId, connection, { messageId: callback.message?.message_id });
@@ -1659,7 +1675,7 @@ async function handleCallback(supabase: ReturnType<typeof getSupabaseAdmin>, cal
       const { error } = await supabase.from("products").update({ category_id: categoryId }).eq("company_id", connection.company_id).eq("id", draft.product_id);
       if (error) throw error;
       await clearDrafts(supabase, connection.company_id, chatId);
-      await answerCallbackQuery(callback.id, "Сохранено");
+      await answerCallbackQuery(callback.id, "Сохранено", chatId);
       return openProductCard(supabase, chatId, connection.company_id, draft.product_id, { connection, messageId: callback.message?.message_id });
     }
     const nextDraft = await updateDraft(supabase, draft, { category_id: categoryId, step: "wait_name" });
@@ -1677,12 +1693,12 @@ async function handleCallback(supabase: ReturnType<typeof getSupabaseAdmin>, cal
   if (data.startsWith("d:save:")) {
     if (!draft) return sendMessage(chatId, "Черновик не найден.");
     const result = await saveDraftAsProduct(supabase, draft, data.slice(7));
-    await answerCallbackQuery(callback.id, `Товар сохранён как черновик: ${result.sku}`);
+    await answerCallbackQuery(callback.id, `Товар сохранён как черновик: ${result.sku}`, chatId);
     return showMainMenu(supabase, chatId, connection, { messageId: callback.message?.message_id });
   }
   if (data === "d:cancel") {
     await clearDrafts(supabase, connection.company_id, chatId);
-    await answerCallbackQuery(callback.id, "Действие отменено");
+    await answerCallbackQuery(callback.id, "Действие отменено", chatId);
     return showCancelledMenu(supabase, chatId, connection, { messageId: callback.message?.message_id });
   }
   if (data === "d:edit") return sendDraftEditMenu(supabase, chatId, draft, { connection, messageId: callback.message?.message_id });
@@ -1824,7 +1840,7 @@ async function updateProductStatus(
   const payload = status === "hidden" || status === "draft" ? { status, is_visible_in_api: false } : { status };
   const { error } = await supabase.from("products").update(payload).eq("company_id", companyId).eq("id", productId);
   if (error) throw error;
-  if (options.callbackId) await answerCallbackQuery(options.callbackId, "Сохранено");
+  if (options.callbackId) await answerCallbackQuery(options.callbackId, "Сохранено", chatId);
   await openProductCard(supabase, chatId, companyId, productId, options);
 }
 
@@ -1839,7 +1855,7 @@ async function handleMediaCallback(
   if (action === "delete") {
     const { error } = await supabase.from("product_media").delete().eq("company_id", companyId).eq("product_id", productId);
     if (error) throw error;
-    if (options.callbackId) await answerCallbackQuery(options.callbackId, "Сохранено");
+    if (options.callbackId) await answerCallbackQuery(options.callbackId, "Сохранено", chatId);
     return openProductCard(supabase, chatId, companyId, productId, options);
   }
   await createDraft(supabase, companyId, chatId, "edit", action === "replace" ? "edit_media_replace" : "edit_media_add", { product_id: productId, edit_field: "media" });
@@ -1910,7 +1926,7 @@ async function handleEditCustomCallback(
   if (!field) return sendMessage(chatId, "Поле не найдено.");
   const value = kind === "ecfb" ? raw === "1" : fieldOptions(field)[Number(raw)] ?? "";
   await saveOneCustomValue(supabase, companyId, productId, field, value);
-  if (options.callbackId) await answerCallbackQuery(options.callbackId, "Сохранено");
+  if (options.callbackId) await answerCallbackQuery(options.callbackId, "Сохранено", chatId);
   await openProductCard(supabase, chatId, companyId, productId, options);
 }
 
@@ -1997,7 +2013,7 @@ export async function processTelegramUpdate(update: TelegramUpdate) {
     let callbackAnswered = false;
     if (update.callback_query) {
       const answerStartedAt = Date.now();
-      await answerCallbackQuery(update.callback_query.id);
+      await answerCallbackQuery(update.callback_query.id, undefined, chatId);
       callbackAnswered = true;
       logTiming("answer_callback", answerStartedAt, chatId);
     }
