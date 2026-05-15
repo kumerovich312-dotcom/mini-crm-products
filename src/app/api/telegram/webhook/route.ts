@@ -1,6 +1,4 @@
 import { createClient } from "@supabase/supabase-js";
-import { NextResponse } from "next/server";
-
 import { createId } from "@/lib/create-id";
 import { getErrorMessage } from "@/lib/errors";
 import type { Category, Company, CustomField, Product, ProductCustomValue, ProductMedia, ProductStatus } from "@/types/database";
@@ -54,11 +52,12 @@ type TelegramDraft = {
   custom_values: Record<string, unknown>;
   edit_field: string | null;
   created_product_id: string | null;
+  step_history: string[];
   status: string;
 };
 type InlineButton = { text: string; callback_data: string };
 type CachedConnection = { company_id: string; is_active: boolean };
-type DraftBrief = Pick<TelegramDraft, "id" | "step" | "mode" | "product_id" | "category_id">;
+type DraftBrief = Pick<TelegramDraft, "id" | "step" | "mode" | "product_id" | "category_id" | "step_history">;
 
 const CONNECTION_CACHE_TTL_MS = 60_000;
 const RECENT_UPDATE_TTL_MS = 120_000;
@@ -187,14 +186,31 @@ async function answerCallbackQuery(callbackQueryId: string, text?: string) {
   }
 }
 
-const sendMessage = sendTelegramMessage;
-
 function keyboard(rows: InlineButton[][]) {
   return { inline_keyboard: rows };
 }
 
-async function sendKeyboard(chatId: string, text: string, rows: InlineButton[][]) {
-  return sendMessage(chatId, text, keyboard(rows));
+function navRows(includeCancel = true): InlineButton[][] {
+  return [
+    [
+      { text: "⬅️ Назад", callback_data: "nav:back" },
+      { text: "🏠 Главное меню", callback_data: "nav:menu" },
+    ],
+    ...(includeCancel ? [[{ text: "❌ Отмена", callback_data: "draft:cancel" }]] : []),
+  ];
+}
+
+function withNavRows(rows: InlineButton[][], includeCancel = true) {
+  return [...rows, ...navRows(includeCancel)];
+}
+
+async function sendMessage(chatId: string, text: string, replyMarkup?: Record<string, unknown>, action = "send_message") {
+  return sendTelegramMessage(chatId, text, replyMarkup ?? keyboard(navRows()), action);
+}
+
+async function sendKeyboard(chatId: string, text: string, rows: InlineButton[][], options: { nav?: boolean; cancel?: boolean } = {}) {
+  const finalRows = options.nav === false ? rows : withNavRows(rows, options.cancel ?? true);
+  return sendTelegramMessage(chatId, text, keyboard(finalRows));
 }
 
 function mainMenuRows(): InlineButton[][] {
@@ -215,7 +231,7 @@ function mainMenuRows(): InlineButton[][] {
 }
 
 async function sendMainMenu(chatId: string, text = "Главное меню") {
-  await sendKeyboard(chatId, text, mainMenuRows());
+  await sendKeyboard(chatId, text, mainMenuRows(), { nav: false });
 }
 
 async function sendOrEditMenu(chatId: string, text = "Главное меню", messageId?: number) {
@@ -223,7 +239,8 @@ async function sendOrEditMenu(chatId: string, text = "Главное меню", 
     try {
       await editTelegramMessage(chatId, messageId, text, keyboard(mainMenuRows()), "edit_menu");
       return;
-    } catch {
+    } catch (error) {
+      if (getErrorMessage(error).includes("message is not modified")) return;
       // If Telegram refuses to edit an old or unchanged message, send a fresh menu.
     }
   }
@@ -332,7 +349,7 @@ async function getActiveDraft(supabase: ReturnType<typeof getSupabaseAdmin>, com
 async function getActiveDraftBrief(supabase: ReturnType<typeof getSupabaseAdmin>, companyId: string, chatId: string) {
   const { data, error } = await supabase
     .from("telegram_product_drafts")
-    .select("id, step, mode, product_id, category_id")
+    .select("id, step, mode, product_id, category_id, step_history")
     .eq("company_id", companyId)
     .eq("telegram_chat_id", chatId)
     .neq("step", "done")
@@ -363,17 +380,34 @@ async function createDraft(
   await clearDrafts(supabase, companyId, chatId);
   const { data, error } = await supabase
     .from("telegram_product_drafts")
-    .insert({ company_id: companyId, telegram_chat_id: chatId, mode, step, status: "draft", ...extra })
+    .insert({ company_id: companyId, telegram_chat_id: chatId, mode, step, step_history: [], status: "draft", ...extra })
     .select("*")
     .single();
   if (error) throw error;
   return data as TelegramDraft;
 }
 
+function getDraftHistoryKey(draft: Pick<TelegramDraft, "step" | "edit_field">) {
+  if (draft.step === "custom_fields" && draft.edit_field) return `custom_fields:${draft.edit_field}`;
+  return draft.step;
+}
+
+function draftValuesWithHistory(draft: TelegramDraft, values: Record<string, unknown>) {
+  if ("step_history" in values) return values;
+  const nextStep = typeof values.step === "string" ? values.step : draft.step;
+  const nextEditField = typeof values.edit_field === "string" ? values.edit_field : draft.edit_field;
+  const isSameStep = nextStep === draft.step;
+  const isSameCustomField = draft.step === "custom_fields" && nextStep === "custom_fields" && nextEditField === draft.edit_field;
+  if (isSameStep && (draft.step !== "custom_fields" || isSameCustomField)) return values;
+  const currentKey = getDraftHistoryKey(draft);
+  const history = Array.isArray(draft.step_history) ? draft.step_history : [];
+  return { ...values, step_history: [...history, currentKey] };
+}
+
 async function updateDraft(supabase: ReturnType<typeof getSupabaseAdmin>, draft: TelegramDraft, values: Record<string, unknown>) {
   const { data, error } = await supabase
     .from("telegram_product_drafts")
-    .update(values)
+    .update(draftValuesWithHistory(draft, values))
     .eq("id", draft.id)
     .eq("company_id", draft.company_id)
     .select("*")
@@ -611,8 +645,8 @@ async function showAddPreview(supabase: ReturnType<typeof getSupabaseAdmin>, cha
       { text: "✏️ Изменить", callback_data: "d:edit" },
     ],
     [
-      { text: "❌ Отмена", callback_data: "d:cancel" },
-      { text: "⬅️ Главное меню", callback_data: "menu:menu" },
+      { text: "❌ Отмена", callback_data: "draft:cancel" },
+      { text: "🏠 Главное меню", callback_data: "nav:menu" },
     ],
   ]);
 }
@@ -791,17 +825,16 @@ async function openProductCard(supabase: ReturnType<typeof getSupabaseAdmin>, ch
       { text: product.status === "hidden" ? "🙈 Показать" : "🙈 Скрыть", callback_data: `p:v:${product.id}` },
       { text: "🖼 Медиа", callback_data: `efp:media:${product.id}` },
     ],
-    [{ text: "⬅️ Главное меню", callback_data: "menu:menu" }],
+    [{ text: "🏠 Главное меню", callback_data: "nav:menu" }],
   ]);
 }
 
-async function startEditProduct(supabase: ReturnType<typeof getSupabaseAdmin>, chatId: string, companyId: string, productId: string) {
+async function sendEditProductMenu(supabase: ReturnType<typeof getSupabaseAdmin>, chatId: string, companyId: string, productId: string) {
   const product = await getProduct(supabase, companyId, productId);
   if (!product) {
     await sendMessage(chatId, "Товар не найден.");
     return;
   }
-  await clearDrafts(supabase, companyId, chatId);
   await sendKeyboard(chatId, `Редактирование\n${product.sku} — ${product.name}`, [
     [
       { text: "Название", callback_data: `efp:name:${product.id}` },
@@ -824,6 +857,11 @@ async function startEditProduct(supabase: ReturnType<typeof getSupabaseAdmin>, c
       { text: "Назад", callback_data: `p:o:${product.id}` },
     ],
   ]);
+}
+
+async function startEditProduct(supabase: ReturnType<typeof getSupabaseAdmin>, chatId: string, companyId: string, productId: string) {
+  await createDraft(supabase, companyId, chatId, "edit", "edit_menu", { product_id: productId });
+  await sendEditProductMenu(supabase, chatId, companyId, productId);
 }
 
 async function toggleVisibility(supabase: ReturnType<typeof getSupabaseAdmin>, chatId: string, companyId: string, productId: string) {
@@ -897,14 +935,14 @@ async function showStats(supabase: ReturnType<typeof getSupabaseAdmin>, chatId: 
     `Категории: ${categoriesResult.count ?? 0}`,
     `Через Telegram: ${telegramDraftsResult.count ?? 0}`,
   ].join("\n");
-  await sendKeyboard(chatId, text, [[{ text: "⬅️ Главное меню", callback_data: "menu:menu" }]]);
+  await sendKeyboard(chatId, text, [[{ text: "🏠 Главное меню", callback_data: "nav:menu" }]]);
 }
 
 async function showHelp(chatId: string) {
   await sendKeyboard(
     chatId,
     "Отправьте фото, чтобы быстро добавить товар.\nИли используйте меню:\n➕ Добавить товар\n🔎 Найти товар\n📦 Последние товары\n✏️ Изменить товар\n\nКоманды:\n/menu\n/cancel\n/status",
-    [[{ text: "⬅️ Главное меню", callback_data: "menu:menu" }]],
+    [[{ text: "🏠 Главное меню", callback_data: "nav:menu" }]],
   );
 }
 
@@ -912,14 +950,19 @@ function isBusyDraft(draft: { step: string } | null) {
   return Boolean(draft && draft.step !== "idle" && draft.step !== "done");
 }
 
-async function showBusyMessage(chatId: string) {
-  await sendKeyboard(chatId, "У вас есть незавершённое действие.", [
+async function showBusyMessage(chatId: string, messageId?: number) {
+  const rows = [
     [
-      { text: "Продолжить", callback_data: "busy:cont" },
-      { text: "Начать заново", callback_data: "busy:new" },
+      { text: "Продолжить", callback_data: "draft:resume" },
+      { text: "Начать заново", callback_data: "draft:restart" },
     ],
-    [{ text: "Главное меню", callback_data: "busy:menu" }],
-  ]);
+    [{ text: "Удалить черновик", callback_data: "draft:cancel" }],
+  ];
+  if (messageId) {
+    await sendOrEditKeyboard(chatId, "У вас есть незавершённое действие", rows, messageId, { nav: false });
+    return;
+  }
+  await sendKeyboard(chatId, "У вас есть незавершённое действие", rows, { nav: false });
 }
 
 async function startAddWizard(supabase: ReturnType<typeof getSupabaseAdmin>, chatId: string, connection: TelegramConnection, message?: TelegramMessage) {
@@ -939,8 +982,7 @@ async function startAddWizard(supabase: ReturnType<typeof getSupabaseAdmin>, cha
   await sendKeyboard(chatId, "Отправьте фото или видео", [[{ text: "Пропустить медиа", callback_data: "media:skip" }]]);
 }
 
-async function askFieldValue(supabase: ReturnType<typeof getSupabaseAdmin>, chatId: string, companyId: string, productId: string, field: string) {
-  await createDraft(supabase, companyId, chatId, "edit", `edit_${field}`, { product_id: productId, edit_field: field });
+async function showEditFieldPrompt(supabase: ReturnType<typeof getSupabaseAdmin>, chatId: string, companyId: string, productId: string, field: string) {
   if (field === "category") return sendCategoryKeyboard(supabase, companyId, chatId, "Выберите категорию");
   if (field === "status") {
     return sendKeyboard(chatId, "Выберите статус", [
@@ -972,6 +1014,11 @@ async function askFieldValue(supabase: ReturnType<typeof getSupabaseAdmin>, chat
     description: "Введите описание",
   };
   await sendMessage(chatId, prompts[field] ?? "Введите значение");
+}
+
+async function askFieldValue(supabase: ReturnType<typeof getSupabaseAdmin>, chatId: string, companyId: string, productId: string, field: string) {
+  await createDraft(supabase, companyId, chatId, "edit", `edit_${field}`, { product_id: productId, edit_field: field, step_history: [`edit_menu:${productId}`] });
+  return showEditFieldPrompt(supabase, chatId, companyId, productId, field);
 }
 
 async function handleEditText(supabase: ReturnType<typeof getSupabaseAdmin>, chatId: string, draft: TelegramDraft, text: string) {
@@ -1119,12 +1166,18 @@ async function handleDraftMedia(supabase: ReturnType<typeof getSupabaseAdmin>, c
   await sendMessage(chatId, "Сейчас ожидаю текст или кнопку.");
 }
 
-async function handleMenuAction(supabase: ReturnType<typeof getSupabaseAdmin>, chatId: string, connection: TelegramConnection, action: string) {
+async function handleMenuAction(
+  supabase: ReturnType<typeof getSupabaseAdmin>,
+  chatId: string,
+  connection: TelegramConnection,
+  action: string,
+  messageId?: number,
+) {
   if (action === "menu") return sendMainMenu(chatId);
   if (action === "help") return showHelp(chatId);
 
   const activeDraft = await getActiveDraftBrief(supabase, connection.company_id, chatId);
-  if (isBusyDraft(activeDraft)) return showBusyMessage(chatId);
+  if (isBusyDraft(activeDraft)) return showBusyMessage(chatId, messageId);
   if (action === "add_product" || action === "add") return startAddWizard(supabase, chatId, connection);
   if (action === "find_product" || action === "find") {
     await createDraft(supabase, connection.company_id, chatId, "find", "wait_find");
@@ -1147,6 +1200,82 @@ async function handleMenuAction(supabase: ReturnType<typeof getSupabaseAdmin>, c
   if (action === "stats") return showStats(supabase, chatId, connection.company_id);
 }
 
+async function sendOrEditKeyboard(chatId: string, text: string, rows: InlineButton[][], messageId?: number, options: { nav?: boolean; cancel?: boolean } = {}) {
+  const finalRows = options.nav === false ? rows : withNavRows(rows, options.cancel ?? true);
+  if (messageId) {
+    try {
+      await editTelegramMessage(chatId, messageId, text, keyboard(finalRows), "edit_navigation");
+      return;
+    } catch (error) {
+      if (getErrorMessage(error).includes("message is not modified")) return;
+      // Fall back to a fresh message when Telegram cannot edit the current one.
+    }
+  }
+  await sendTelegramMessage(chatId, text, keyboard(finalRows));
+}
+
+async function showDraftNavigationMenu(
+  supabase: ReturnType<typeof getSupabaseAdmin>,
+  chatId: string,
+  connection: TelegramConnection,
+  messageId?: number,
+) {
+  const draft = await getActiveDraftBrief(supabase, connection.company_id, chatId);
+  if (!isBusyDraft(draft)) return sendOrEditMenu(chatId, "Главное меню", messageId);
+
+  return sendOrEditKeyboard(
+    chatId,
+    "У вас есть незавершённое действие",
+    [
+      [{ text: "Продолжить", callback_data: "draft:resume" }],
+      [{ text: "Начать заново", callback_data: "draft:restart" }],
+      [{ text: "Удалить черновик", callback_data: "draft:cancel" }],
+    ],
+    messageId,
+    { nav: false },
+  );
+}
+
+async function restartDraft(supabase: ReturnType<typeof getSupabaseAdmin>, chatId: string, connection: TelegramConnection, draft: TelegramDraft | null) {
+  const mode = draft?.mode;
+  const productId = draft?.product_id;
+  await clearDrafts(supabase, connection.company_id, chatId);
+  if (mode === "find") {
+    await createDraft(supabase, connection.company_id, chatId, "find", "wait_find");
+    return sendMessage(chatId, "Введите название, SKU или ключевое слово.");
+  }
+  if (mode === "edit_search") {
+    await createDraft(supabase, connection.company_id, chatId, "edit_search", "wait_edit_search");
+    return sendMessage(chatId, "Введите SKU или название товара.");
+  }
+  if (mode === "edit" && productId) return startEditProduct(supabase, chatId, connection.company_id, productId);
+  return startAddWizard(supabase, chatId, connection);
+}
+
+async function handleDraftBack(supabase: ReturnType<typeof getSupabaseAdmin>, chatId: string, draft: TelegramDraft | null) {
+  if (!draft) return sendMainMenu(chatId);
+  const history = Array.isArray(draft.step_history) ? draft.step_history : [];
+  const previous = history.at(-1);
+  if (!previous) return resumeDraft(supabase, chatId, draft);
+
+  const stepHistory = history.slice(0, -1);
+  const [step, editField] = previous.split(":");
+  if (step === "edit_menu" && draft.product_id) {
+    const nextDraft = await updateDraft(supabase, { ...draft, step_history: stepHistory } as TelegramDraft, {
+      step: "edit_menu",
+      edit_field: null,
+      step_history: stepHistory,
+    });
+    return resumeDraft(supabase, chatId, nextDraft);
+  }
+  const nextDraft = await updateDraft(supabase, { ...draft, step_history: stepHistory } as TelegramDraft, {
+    step,
+    step_history: stepHistory,
+    ...(step === "custom_fields" ? { edit_field: editField ?? draft.edit_field } : {}),
+  });
+  return resumeDraft(supabase, chatId, nextDraft);
+}
+
 async function handleCallback(supabase: ReturnType<typeof getSupabaseAdmin>, callback: TelegramCallbackQuery, callbackAnswered = false) {
   const startedAt = Date.now();
   const chatId = callback.message?.chat.id ? String(callback.message.chat.id) : "";
@@ -1160,6 +1289,8 @@ async function handleCallback(supabase: ReturnType<typeof getSupabaseAdmin>, cal
   const connection = await getConnection(supabase, chatId);
   logTiming("get connection", getConnectionStartedAt, chatId);
   if (!connection) return sendMessage(chatId, NOT_CONNECTED);
+
+  if (data === "nav:menu") return showDraftNavigationMenu(supabase, chatId, connection, callback.message?.message_id);
 
   if (data.startsWith("menu:") || data.startsWith("m:")) {
     const actionMap: Record<string, string> = {
@@ -1180,12 +1311,19 @@ async function handleCallback(supabase: ReturnType<typeof getSupabaseAdmin>, cal
     }
 
     const actionStartedAt = Date.now();
-    await handleMenuAction(supabase, chatId, connection, action);
+    await handleMenuAction(supabase, chatId, connection, action, callback.message?.message_id);
     logTiming(`handle action ${action}`, actionStartedAt, chatId);
     return;
   }
 
   const draft = await getActiveDraft(supabase, connection.company_id, chatId);
+  if (data === "nav:back") return handleDraftBack(supabase, chatId, draft);
+  if (data === "draft:resume") return draft ? resumeDraft(supabase, chatId, draft) : sendOrEditMenu(chatId, "Главное меню", callback.message?.message_id);
+  if (data === "draft:restart") return restartDraft(supabase, chatId, connection, draft);
+  if (data === "draft:cancel") {
+    await clearDrafts(supabase, connection.company_id, chatId);
+    return sendOrEditMenu(chatId, "Действие отменено.", callback.message?.message_id);
+  }
   if (data === "busy:cont") return draft ? resumeDraft(supabase, chatId, draft) : sendOrEditMenu(chatId, "Главное меню", callback.message?.message_id);
   if (data === "busy:new") {
     await clearDrafts(supabase, connection.company_id, chatId);
@@ -1222,17 +1360,22 @@ async function handleCallback(supabase: ReturnType<typeof getSupabaseAdmin>, cal
   if (data.startsWith("d:save:")) {
     if (!draft) return sendMessage(chatId, "Черновик не найден.");
     const result = await saveDraftAsProduct(supabase, draft, data.slice(7));
-    await sendMessage(chatId, `Товар сохранён как черновик ✅ SKU: ${result.sku}\nПроверьте карточку в CRM перед публикацией.`);
-    return sendMainMenu(chatId);
+    return sendOrEditMenu(
+      chatId,
+      `Товар сохранён как черновик ✅ SKU: ${result.sku}\nПроверьте карточку в CRM перед публикацией.`,
+      callback.message?.message_id,
+    );
   }
   if (data === "d:cancel") {
     await clearDrafts(supabase, connection.company_id, chatId);
-    await sendMessage(chatId, "Действие отменено.");
-    return sendMainMenu(chatId);
+    return sendOrEditMenu(chatId, "Действие отменено.", callback.message?.message_id);
   }
   if (data === "d:edit") return sendDraftEditMenu(chatId);
   if (data.startsWith("de:")) return handleDraftEditChoice(supabase, chatId, connection.company_id, draft, data.slice(3));
-  if (data.startsWith("p:o:")) return openProductCard(supabase, chatId, connection.company_id, data.slice(4));
+  if (data.startsWith("p:o:")) {
+    await clearDrafts(supabase, connection.company_id, chatId);
+    return openProductCard(supabase, chatId, connection.company_id, data.slice(4));
+  }
   if (data.startsWith("p:e:")) return startEditProduct(supabase, chatId, connection.company_id, data.slice(4));
   if (data.startsWith("p:a:")) return toggleApi(supabase, chatId, connection.company_id, data.slice(4));
   if (data.startsWith("p:v:")) return toggleVisibility(supabase, chatId, connection.company_id, data.slice(4));
@@ -1253,6 +1396,14 @@ async function resumeDraft(supabase: ReturnType<typeof getSupabaseAdmin>, chatId
   if (draft.step === "wait_price") return sendMessage(chatId, "Введите цену");
   if (draft.step === "wait_stock") return sendMessage(chatId, "Введите остаток");
   if (draft.step === "wait_description") return sendKeyboard(chatId, "Добавьте описание или нажмите Пропустить", [[{ text: "Пропустить", callback_data: "desc:skip" }]]);
+  if (draft.step === "wait_find") return sendMessage(chatId, "Введите название, SKU или ключевое слово.");
+  if (draft.step === "wait_edit_search") return sendMessage(chatId, "Введите SKU или название товара.");
+  if (draft.step === "custom_fields") return askNextCustomField(supabase, chatId, draft);
+  if (draft.step === "edit_menu" && draft.product_id) return sendEditProductMenu(supabase, chatId, draft.company_id, draft.product_id);
+  if (draft.mode === "edit" && draft.product_id && draft.step.startsWith("edit_")) {
+    const field = draft.edit_field ?? draft.step.slice(5);
+    return showEditFieldPrompt(supabase, chatId, draft.company_id, draft.product_id, field);
+  }
   if (draft.step === "preview") return showAddPreview(supabase, chatId, draft);
   return sendMessage(chatId, "Продолжайте текущий шаг.");
 }
@@ -1410,8 +1561,7 @@ async function handleMessage(supabase: ReturnType<typeof getSupabaseAdmin>, mess
   if (text === "/help") return showHelp(chatId);
   if (text === "/cancel") {
     await clearDrafts(supabase, connection.company_id, chatId);
-    await sendMessage(chatId, "Действие отменено.");
-    return sendMainMenu(chatId);
+    return sendMainMenu(chatId, "Действие отменено.");
   }
   if (text === "/find") return handleMenuAction(supabase, chatId, connection, "find");
   if (text === "/addproduct") return handleMenuAction(supabase, chatId, connection, "add");
@@ -1425,21 +1575,19 @@ async function handleMessage(supabase: ReturnType<typeof getSupabaseAdmin>, mess
   return handleAddDraftText(supabase, chatId, draft, text);
 }
 
-export async function POST(request: Request) {
+async function processTelegramUpdate(update: TelegramUpdate) {
   const startedAt = Date.now();
-  const expectedSecret = process.env.TELEGRAM_WEBHOOK_SECRET;
-  const actualSecret = request.headers.get("x-telegram-bot-api-secret-token");
-  if (!expectedSecret || actualSecret !== expectedSecret) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  let chatId: string | undefined;
+  let action = "unknown";
+
   try {
-    const parseStartedAt = Date.now();
-    const update = (await request.json()) as TelegramUpdate;
-    const chatId = update.callback_query?.message?.chat.id
+    chatId = update.callback_query?.message?.chat.id
       ? String(update.callback_query.message.chat.id)
       : update.message?.chat.id
         ? String(update.message.chat.id)
         : undefined;
-    const action = update.callback_query?.data ?? update.message?.text ?? (update.message?.photo || update.message?.video ? "media" : "unknown");
-    logTiming("parse update", parseStartedAt, chatId);
+    action = update.callback_query?.data ?? update.message?.text ?? (update.message?.photo || update.message?.video ? "media" : "unknown");
+
     let callbackAnswered = false;
     if (update.callback_query) {
       const answerStartedAt = Date.now();
@@ -1449,18 +1597,39 @@ export async function POST(request: Request) {
     }
     if (isDuplicateUpdate(update)) {
       logTotalTiming(`duplicate ${String(action)}`, startedAt, chatId);
-      return NextResponse.json({ ok: true });
+      return;
     }
     const supabase = getSupabaseAdmin();
     if (update.callback_query) await handleCallback(supabase, update.callback_query, callbackAnswered);
     else if (update.message) await handleMessage(supabase, update.message);
     logTiming(String(action), startedAt, chatId);
     logTotalTiming(String(action), startedAt, chatId);
-    return NextResponse.json({ ok: true });
   } catch (error) {
-    logTelegramError("webhook", error);
+    logTelegramError("webhook_async", error, { action, chatId });
     logTiming("webhook_error", startedAt);
     logTotalTiming("webhook_error", startedAt);
-    return NextResponse.json({ ok: true });
+    throw error;
+  } finally {
+    console.log("telegram async processing", { ms: Date.now() - startedAt });
   }
+}
+
+export function POST(request: Request) {
+  const startedAt = Date.now();
+  const expectedSecret = process.env.TELEGRAM_WEBHOOK_SECRET;
+  const actualSecret = request.headers.get("x-telegram-bot-api-secret-token");
+  if (!expectedSecret || actualSecret !== expectedSecret) return Response.json({ error: "Unauthorized" }, { status: 401 });
+
+  request
+    .json()
+    .then((update: TelegramUpdate) => {
+      processTelegramUpdate(update).catch(console.error);
+    })
+    .catch((error: unknown) => {
+      logTelegramError("webhook_parse", error);
+      console.error(error);
+    });
+
+  console.log("telegram webhook fast response", { ms: Date.now() - startedAt });
+  return Response.json({ ok: true });
 }
