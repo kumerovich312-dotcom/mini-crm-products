@@ -1,6 +1,7 @@
 import { getSupabaseAdmin } from "../supabase/admin.js";
 import {
   answerCallbackQuery,
+  deleteTelegramMessage,
   downloadTelegramFile as downloadTelegramFileByPath,
   editTelegramMessage,
   getTelegramFile,
@@ -219,6 +220,7 @@ async function renderTelegramScreen({
   preferMessageId,
   nav = true,
   cancel = true,
+  forceNew = false,
 }: {
   supabase: ReturnType<typeof getSupabaseAdmin>;
   chatId: string;
@@ -230,6 +232,7 @@ async function renderTelegramScreen({
   preferMessageId?: number | null;
   nav?: boolean;
   cancel?: boolean;
+  forceNew?: boolean;
 }) {
   const screenConnection = connection ?? (await getConnection(supabase, chatId));
   if (companyId && screenConnection && screenConnection.company_id !== companyId) {
@@ -242,7 +245,23 @@ async function renderTelegramScreen({
     screenConnection?.active_screen_message_id ??
     screenConnection?.last_bot_message_id ??
     screenConnection?.last_menu_message_id;
-  const result = await safeEditOrSend(chatId, targetMessageId, text, replyMarkup, `render_screen:${screen}`);
+
+  let result: { mode: string; messageId: number };
+  if (forceNew) {
+    const oldMessageId = targetMessageId;
+    if (oldMessageId) {
+      try {
+        await deleteTelegramMessage(chatId, oldMessageId, `delete_for_new:${screen}`);
+      } catch { /* ignore — message may already be gone */ }
+    }
+    const sent = await sendTelegramMessage(chatId, text, replyMarkup, `render_screen:${screen}`);
+    result = { mode: "force_new", messageId: sent.message_id };
+    console.log("telegram screen render", { mode: "force_new", screen, chatId, oldMessageId, newMessageId: sent.message_id });
+  } else {
+    const editResult = await safeEditOrSend(chatId, targetMessageId, text, replyMarkup, `render_screen:${screen}`);
+    result = editResult;
+    console.log("telegram screen render", { mode: result.mode, screen, chatId, oldMessageId: targetMessageId, newMessageId: result.messageId });
+  }
 
   if (screenConnection) {
     await updateConnectionMessageIds(supabase, chatId, screenConnection, {
@@ -252,7 +271,6 @@ async function renderTelegramScreen({
     });
   }
 
-  console.log("telegram screen render", { mode: result.mode, screen, chatId, messageId: result.messageId });
   return result;
 }
 
@@ -260,7 +278,7 @@ async function showMainMenu(
   supabase: ReturnType<typeof getSupabaseAdmin>,
   chatId: string,
   connection: TelegramConnection,
-  options: { messageId?: number | null } = {},
+  options: { messageId?: number | null; forceNew?: boolean } = {},
 ) {
   const result = await renderTelegramScreen({
     supabase,
@@ -272,6 +290,7 @@ async function showMainMenu(
     rows: mainMenuRows(),
     preferMessageId: options.messageId,
     nav: false,
+    forceNew: options.forceNew,
   });
   console.log("telegram menu render", { mode: result.mode, chatId, messageId: result.messageId });
   return result;
@@ -281,7 +300,7 @@ async function showCancelledMenu(
   supabase: ReturnType<typeof getSupabaseAdmin>,
   chatId: string,
   connection: TelegramConnection,
-  options: { messageId?: number | null } = {},
+  options: { messageId?: number | null; forceNew?: boolean } = {},
 ) {
   return renderTelegramScreen({
     supabase,
@@ -293,6 +312,7 @@ async function showCancelledMenu(
     rows: mainMenuRows(),
     preferMessageId: options.messageId,
     nav: false,
+    forceNew: options.forceNew,
   });
 }
 
@@ -366,6 +386,7 @@ async function renderMediaRetryScreen(
   companyId: string,
   text: string,
   connection?: TelegramConnection | null,
+  forceNew?: boolean,
 ) {
   return renderTelegramScreen({
     supabase,
@@ -375,6 +396,7 @@ async function renderMediaRetryScreen(
     screen: "wait_media",
     text,
     rows: [[{ text: "Пропустить медиа", callback_data: "media:skip" }]],
+    forceNew,
   });
 }
 
@@ -567,7 +589,7 @@ async function sendCategoryKeyboard(
   companyId: string,
   chatId: string,
   text = "Выберите категорию",
-  options: { connection?: TelegramConnection | null; messageId?: number | null; screen?: string } = {},
+  options: { connection?: TelegramConnection | null; messageId?: number | null; screen?: string; forceNew?: boolean } = {},
 ) {
   const categories = await getCategories(supabase, companyId);
   if (categories.length === 0) {
@@ -583,6 +605,7 @@ async function sendCategoryKeyboard(
     text,
     rows: categories.map((category) => [{ text: `${category.code} · ${category.name}`, callback_data: `cat:${category.id}` }]),
     preferMessageId: options.messageId,
+    forceNew: options.forceNew,
   });
   return true;
 }
@@ -701,7 +724,7 @@ async function askNextCustomField(
   supabase: ReturnType<typeof getSupabaseAdmin>,
   chatId: string,
   draft: TelegramDraft,
-  options: { connection?: TelegramConnection | null; messageId?: number | null } = {},
+  options: { connection?: TelegramConnection | null; messageId?: number | null; forceNew?: boolean } = {},
 ) {
   const fields = await getCustomFields(supabase, draft.company_id);
   const nextField = fields.find((field) => draft.custom_values?.[field.id] === undefined);
@@ -731,6 +754,7 @@ async function askNextCustomField(
         ...(!nextField.is_required ? [[{ text: "Пропустить", callback_data: `cfs:${nextField.id}` }]] : []),
       ],
       preferMessageId: options.messageId,
+      forceNew: options.forceNew,
     });
     return;
   }
@@ -746,6 +770,7 @@ async function askNextCustomField(
       text: prompt,
       rows,
       preferMessageId: options.messageId,
+      forceNew: options.forceNew,
     });
     return;
   }
@@ -759,6 +784,7 @@ async function askNextCustomField(
     text: prompt,
     rows: rows ?? [],
     preferMessageId: options.messageId,
+    forceNew: options.forceNew,
   });
 }
 
@@ -766,7 +792,7 @@ async function showAddPreview(
   supabase: ReturnType<typeof getSupabaseAdmin>,
   chatId: string,
   draft: TelegramDraft,
-  options: { connection?: TelegramConnection | null; messageId?: number | null } = {},
+  options: { connection?: TelegramConnection | null; messageId?: number | null; forceNew?: boolean } = {},
 ) {
   const { company, category } = await getCompanyAndCategory(supabase, draft);
   const sku = await buildUniqueSku(supabase, company, category);
@@ -803,6 +829,7 @@ async function showAddPreview(
       ],
     ],
     preferMessageId: options.messageId,
+    forceNew: options.forceNew,
   });
 }
 
@@ -905,7 +932,7 @@ async function sendProductList(
   supabase: ReturnType<typeof getSupabaseAdmin>,
   chatId: string,
   products: Product[],
-  options: { connection?: TelegramConnection | null; messageId?: number | null } = {},
+  options: { connection?: TelegramConnection | null; messageId?: number | null; forceNew?: boolean } = {},
 ) {
   const connection = options.connection ?? (await getConnection(supabase, chatId));
   const companyId = connection?.company_id ?? products[0]?.company_id;
@@ -921,6 +948,7 @@ async function sendProductList(
       rows: [[{ text: "🏠 Главное меню", callback_data: "nav:menu" }]],
       preferMessageId: options.messageId,
       nav: false,
+      forceNew: options.forceNew,
     });
     return;
   }
@@ -937,6 +965,7 @@ async function sendProductList(
     rows,
     preferMessageId: options.messageId,
     nav: false,
+    forceNew: options.forceNew,
   });
 }
 
@@ -945,7 +974,7 @@ async function openProductCard(
   chatId: string,
   companyId: string,
   productId: string,
-  options: { connection?: TelegramConnection | null; messageId?: number | null } = {},
+  options: { connection?: TelegramConnection | null; messageId?: number | null; forceNew?: boolean } = {},
 ) {
   const connection = options.connection ?? (await getConnection(supabase, chatId));
   const product = await getProduct(supabase, companyId, productId);
@@ -1005,6 +1034,7 @@ async function openProductCard(
     rows,
     preferMessageId: options.messageId,
     cancel: false,
+    forceNew: options.forceNew,
   });
 }
 
@@ -1013,7 +1043,7 @@ async function sendEditProductMenu(
   chatId: string,
   companyId: string,
   productId: string,
-  options: { connection?: TelegramConnection | null; messageId?: number | null } = {},
+  options: { connection?: TelegramConnection | null; messageId?: number | null; forceNew?: boolean } = {},
 ) {
   const connection = options.connection ?? (await getConnection(supabase, chatId));
   const product = await getProduct(supabase, companyId, productId);
@@ -1053,6 +1083,7 @@ async function sendEditProductMenu(
     rows,
     preferMessageId: options.messageId,
     cancel: false,
+    forceNew: options.forceNew,
   });
 }
 
@@ -1061,7 +1092,7 @@ async function startEditProduct(
   chatId: string,
   companyId: string,
   productId: string,
-  options: { connection?: TelegramConnection | null; messageId?: number | null } = {},
+  options: { connection?: TelegramConnection | null; messageId?: number | null; forceNew?: boolean } = {},
 ) {
   await createDraft(supabase, companyId, chatId, "edit", "edit_menu", { product_id: productId });
   await sendEditProductMenu(supabase, chatId, companyId, productId, options);
@@ -1112,7 +1143,7 @@ async function showStats(
   supabase: ReturnType<typeof getSupabaseAdmin>,
   chatId: string,
   companyId: string,
-  options: { connection?: TelegramConnection | null; messageId?: number | null } = {},
+  options: { connection?: TelegramConnection | null; messageId?: number | null; forceNew?: boolean } = {},
 ) {
   const connection = options.connection ?? (await getConnection(supabase, chatId));
   const startedAt = Date.now();
@@ -1168,13 +1199,14 @@ async function showStats(
     rows: [[{ text: "🏠 Главное меню", callback_data: "nav:menu" }]],
     preferMessageId: options.messageId,
     nav: false,
+    forceNew: options.forceNew,
   });
 }
 
 async function showHelp(
   supabase: ReturnType<typeof getSupabaseAdmin>,
   chatId: string,
-  options: { connection?: TelegramConnection | null; messageId?: number | null } = {},
+  options: { connection?: TelegramConnection | null; messageId?: number | null; forceNew?: boolean } = {},
 ) {
   const companyId = options.connection?.company_id ?? (await getConnection(supabase, chatId))?.company_id;
   const text = "Отправьте фото, чтобы быстро добавить товар.\nИли используйте меню:\n➕ Добавить товар\n🔎 Найти товар\n📦 Последние товары\n✏️ Изменить товар\n\nКоманды:\n/menu\n/cancel\n/status";
@@ -1189,6 +1221,7 @@ async function showHelp(
     rows: [[{ text: "🏠 Главное меню", callback_data: "nav:menu" }]],
     preferMessageId: options.messageId,
     nav: false,
+    forceNew: options.forceNew,
   });
 }
 
@@ -1200,7 +1233,7 @@ async function showBusyMessage(
   supabase: ReturnType<typeof getSupabaseAdmin>,
   chatId: string,
   connection: TelegramConnection,
-  messageId?: number,
+  options: { messageId?: number | null; forceNew?: boolean } = {},
 ) {
   const rows = [
     [
@@ -1217,8 +1250,9 @@ async function showBusyMessage(
     screen: "draft_busy",
     text: "У вас есть незавершённое действие",
     rows,
-    preferMessageId: messageId,
+    preferMessageId: options.messageId,
     nav: false,
+    forceNew: options.forceNew,
   });
 }
 
@@ -1227,7 +1261,7 @@ async function startAddWizard(
   chatId: string,
   connection: TelegramConnection,
   message?: TelegramMessage,
-  options: { messageId?: number | null } = {},
+  options: { messageId?: number | null; forceNew?: boolean } = {},
 ) {
   const media = message ? getMessageMedia(message) : null;
   const draft = await createDraft(supabase, connection.company_id, chatId, "add", media ? "choose_category" : "wait_media");
@@ -1237,10 +1271,10 @@ async function startAddWizard(
     } catch (error) {
       logTelegramError("media_upload", error, { companyId: connection.company_id, chatId });
       await updateDraft(supabase, draft, { step: "wait_media" });
-      await renderMediaRetryScreen(supabase, chatId, connection.company_id, mediaUploadErrorMessage(error), connection);
+      await renderMediaRetryScreen(supabase, chatId, connection.company_id, mediaUploadErrorMessage(error), connection, options.forceNew);
       return;
     }
-    await sendCategoryKeyboard(supabase, connection.company_id, chatId, "Фото получил ✅ Выберите категорию товара:", { connection, screen: "choose_category" });
+    await sendCategoryKeyboard(supabase, connection.company_id, chatId, "Фото получил ✅ Выберите категорию товара:", { connection, screen: "choose_category", forceNew: options.forceNew });
     return;
   }
   const rows = [[{ text: "Пропустить медиа", callback_data: "media:skip" }]];
@@ -1253,6 +1287,7 @@ async function startAddWizard(
     text: "Отправьте фото или видео",
     rows,
     preferMessageId: options.messageId,
+    forceNew: options.forceNew,
   });
 }
 
@@ -1262,10 +1297,10 @@ async function showEditFieldPrompt(
   companyId: string,
   productId: string,
   field: string,
-  options: { connection?: TelegramConnection | null; messageId?: number | null } = {},
+  options: { connection?: TelegramConnection | null; messageId?: number | null; forceNew?: boolean } = {},
 ) {
   const connection = options.connection ?? (await getConnection(supabase, chatId));
-  if (field === "category") return sendCategoryKeyboard(supabase, companyId, chatId, "Выберите категорию", { connection, messageId: options.messageId, screen: "edit_category" });
+  if (field === "category") return sendCategoryKeyboard(supabase, companyId, chatId, "Выберите категорию", { connection, messageId: options.messageId, screen: "edit_category", forceNew: options.forceNew });
   if (field === "status") {
     return renderTelegramScreen({
       supabase,
@@ -1282,6 +1317,7 @@ async function showEditFieldPrompt(
         [{ text: "Скрыт", callback_data: `st:hidden:${productId}` }],
       ],
       preferMessageId: options.messageId,
+      forceNew: options.forceNew,
     });
   }
   if (field === "media") {
@@ -1300,6 +1336,7 @@ async function showEditFieldPrompt(
         [{ text: "Удалить медиа", callback_data: `med:delete:${productId}` }],
       ],
       preferMessageId: options.messageId,
+      forceNew: options.forceNew,
     });
   }
   if (field === "custom") {
@@ -1314,6 +1351,7 @@ async function showEditFieldPrompt(
       text: "Выберите поле",
       rows: fields.map((item) => [{ text: item.name, callback_data: `ecf:${item.id}:${productId}` }]),
       preferMessageId: options.messageId,
+      forceNew: options.forceNew,
     });
   }
   const prompts: Record<string, string> = {
@@ -1331,6 +1369,7 @@ async function showEditFieldPrompt(
     text: prompts[field] ?? "Введите значение",
     rows: [],
     preferMessageId: options.messageId,
+    forceNew: options.forceNew,
   });
 }
 
@@ -1354,12 +1393,12 @@ async function handleEditText(supabase: ReturnType<typeof getSupabaseAdmin>, cha
   if (draft.edit_field === "description") update.description = text;
   if (draft.edit_field === "price") {
     const price = parsePrice(text);
-    if (price === null) return renderTelegramScreen({ supabase, chatId, companyId: draft.company_id, connection, screen: "edit_price", text: "Введите цену числом.", rows: [] });
+    if (price === null) return renderTelegramScreen({ supabase, chatId, companyId: draft.company_id, connection, screen: "edit_price", text: "Введите цену числом.", rows: [], forceNew: true });
     update.price = price;
   }
   if (draft.edit_field === "stock") {
     const stock = parseStock(text);
-    if (stock === null) return renderTelegramScreen({ supabase, chatId, companyId: draft.company_id, connection, screen: "edit_stock", text: "Введите остаток целым числом.", rows: [] });
+    if (stock === null) return renderTelegramScreen({ supabase, chatId, companyId: draft.company_id, connection, screen: "edit_stock", text: "Введите остаток целым числом.", rows: [], forceNew: true });
     update.stock = stock;
   }
   if (draft.edit_field.startsWith("custom:")) {
@@ -1367,16 +1406,16 @@ async function handleEditText(supabase: ReturnType<typeof getSupabaseAdmin>, cha
     const field = (await getCustomFields(supabase, draft.company_id)).find((item) => item.id === fieldId);
     if (!field) return sendMessage(chatId, "Поле не найдено.");
     const parsed = parseCustomValue(field, text);
-    if ("error" in parsed) return renderTelegramScreen({ supabase, chatId, companyId: draft.company_id, connection, screen: "edit_custom", text: parsed.error ?? "Введите корректное значение.", rows: [] });
+    if ("error" in parsed) return renderTelegramScreen({ supabase, chatId, companyId: draft.company_id, connection, screen: "edit_custom", text: parsed.error ?? "Введите корректное значение.", rows: [], forceNew: true });
     await saveOneCustomValue(supabase, draft.company_id, draft.product_id, field, parsed.value);
     await clearDrafts(supabase, draft.company_id, chatId);
-    await openProductCard(supabase, chatId, draft.company_id, draft.product_id, { connection: connection ?? undefined });
+    await openProductCard(supabase, chatId, draft.company_id, draft.product_id, { connection: connection ?? undefined, forceNew: true });
     return;
   }
   const { error } = await supabase.from("products").update(update).eq("company_id", draft.company_id).eq("id", draft.product_id);
   if (error) throw error;
   await clearDrafts(supabase, draft.company_id, chatId);
-  await openProductCard(supabase, chatId, draft.company_id, draft.product_id, { connection: connection ?? undefined });
+  await openProductCard(supabase, chatId, draft.company_id, draft.product_id, { connection: connection ?? undefined, forceNew: true });
 }
 
 async function saveOneCustomValue(
@@ -1414,17 +1453,17 @@ async function handleAddDraftText(supabase: ReturnType<typeof getSupabaseAdmin>,
   const connection = await getConnection(supabase, chatId);
   if (draft.step === "wait_name") {
     await updateDraft(supabase, draft, { name: text, step: "wait_price" });
-    return renderTelegramScreen({ supabase, chatId, companyId: draft.company_id, connection, screen: "wait_price", text: "Введите цену", rows: [] });
+    return renderTelegramScreen({ supabase, chatId, companyId: draft.company_id, connection, screen: "wait_price", text: "Введите цену", rows: [], forceNew: true });
   }
   if (draft.step === "wait_price") {
     const price = parsePrice(text);
-    if (price === null) return renderTelegramScreen({ supabase, chatId, companyId: draft.company_id, connection, screen: "wait_price", text: "Введите цену числом.", rows: [] });
+    if (price === null) return renderTelegramScreen({ supabase, chatId, companyId: draft.company_id, connection, screen: "wait_price", text: "Введите цену числом.", rows: [], forceNew: true });
     await updateDraft(supabase, draft, { price, step: "wait_stock" });
-    return renderTelegramScreen({ supabase, chatId, companyId: draft.company_id, connection, screen: "wait_stock", text: "Введите остаток", rows: [] });
+    return renderTelegramScreen({ supabase, chatId, companyId: draft.company_id, connection, screen: "wait_stock", text: "Введите остаток", rows: [], forceNew: true });
   }
   if (draft.step === "wait_stock") {
     const stock = parseStock(text);
-    if (stock === null) return renderTelegramScreen({ supabase, chatId, companyId: draft.company_id, connection, screen: "wait_stock", text: "Введите остаток целым числом.", rows: [] });
+    if (stock === null) return renderTelegramScreen({ supabase, chatId, companyId: draft.company_id, connection, screen: "wait_stock", text: "Введите остаток целым числом.", rows: [], forceNew: true });
     await updateDraft(supabase, draft, { stock, step: "wait_description" });
     return renderTelegramScreen({
       supabase,
@@ -1434,30 +1473,31 @@ async function handleAddDraftText(supabase: ReturnType<typeof getSupabaseAdmin>,
       screen: "wait_description",
       text: "Добавьте описание или нажмите Пропустить",
       rows: [[{ text: "Пропустить", callback_data: "desc:skip" }]],
+      forceNew: true,
     });
   }
   if (draft.step === "wait_description") {
     const nextDraft = await updateDraft(supabase, draft, { description: text });
-    return askNextCustomField(supabase, chatId, nextDraft, { connection });
+    return askNextCustomField(supabase, chatId, nextDraft, { connection, forceNew: true });
   }
   if (draft.step === "custom_fields" && draft.edit_field) {
     const field = (await getCustomFields(supabase, draft.company_id)).find((item) => item.id === draft.edit_field);
     if (!field) return sendMessage(chatId, "Поле не найдено.");
     const parsed = parseCustomValue(field, text);
-    if ("error" in parsed) return renderTelegramScreen({ supabase, chatId, companyId: draft.company_id, connection, screen: "custom_fields", text: parsed.error ?? "Введите корректное значение.", rows: [] });
+    if ("error" in parsed) return renderTelegramScreen({ supabase, chatId, companyId: draft.company_id, connection, screen: "custom_fields", text: parsed.error ?? "Введите корректное значение.", rows: [], forceNew: true });
     const nextDraft = await updateDraft(supabase, draft, {
       custom_values: { ...(draft.custom_values ?? {}), [field.id]: parsed.value },
       edit_field: null,
     });
-    return askNextCustomField(supabase, chatId, nextDraft, { connection });
+    return askNextCustomField(supabase, chatId, nextDraft, { connection, forceNew: true });
   }
   if (draft.step === "wait_find" || draft.step === "wait_edit_search") {
     const products = await findProducts(supabase, draft.company_id, text);
     await clearDrafts(supabase, draft.company_id, chatId);
-    if (draft.step === "wait_edit_search" && products.length === 1) return startEditProduct(supabase, chatId, draft.company_id, products[0].id);
-    return sendProductList(supabase, chatId, products);
+    if (draft.step === "wait_edit_search" && products.length === 1) return startEditProduct(supabase, chatId, draft.company_id, products[0].id, { forceNew: true });
+    return sendProductList(supabase, chatId, products, { forceNew: true });
   }
-  await renderTelegramScreen({ supabase, chatId, companyId: draft.company_id, connection, screen: draft.step, text: "Нажмите кнопку под сообщением.", rows: [] });
+  await renderTelegramScreen({ supabase, chatId, companyId: draft.company_id, connection, screen: draft.step, text: "Нажмите кнопку под сообщением.", rows: [], forceNew: true });
 }
 
 async function handleDraftMedia(supabase: ReturnType<typeof getSupabaseAdmin>, chatId: string, draft: TelegramDraft, message: TelegramMessage) {
@@ -1489,9 +1529,9 @@ async function handleDraftMedia(supabase: ReturnType<typeof getSupabaseAdmin>, c
       });
       if (error) throw error;
       await clearDrafts(supabase, draft.company_id, chatId);
-      return openProductCard(supabase, chatId, draft.company_id, product.id, { connection: connection ?? undefined });
+      return openProductCard(supabase, chatId, draft.company_id, product.id, { connection: connection ?? undefined, forceNew: true });
     } catch (error) {
-      return renderMediaRetryScreen(supabase, chatId, draft.company_id, mediaUploadErrorMessage(error), connection);
+      return renderMediaRetryScreen(supabase, chatId, draft.company_id, mediaUploadErrorMessage(error), connection, true);
     }
   }
   if (draft.mode === "add" && (draft.step === "wait_media" || draft.step === "choose_category")) {
@@ -1500,10 +1540,10 @@ async function handleDraftMedia(supabase: ReturnType<typeof getSupabaseAdmin>, c
     try {
       const nextDraft = await uploadDraftMediaFromMessage(supabase, draft, message, nextStep);
       if (!nextDraft) return sendMessage(chatId, "Отправьте фото или видео.");
-      return sendCategoryKeyboard(supabase, draft.company_id, chatId, "Фото получил ✅ Выберите категорию товара:", { connection });
+      return sendCategoryKeyboard(supabase, draft.company_id, chatId, "Фото получил ✅ Выберите категорию товара:", { connection, forceNew: true });
     } catch (error) {
       await updateDraft(supabase, draft, { step: "wait_media" });
-      return renderMediaRetryScreen(supabase, chatId, draft.company_id, mediaUploadErrorMessage(error), connection);
+      return renderMediaRetryScreen(supabase, chatId, draft.company_id, mediaUploadErrorMessage(error), connection, true);
     }
   }
   await sendMessage(chatId, "Сейчас ожидаю текст или кнопку.");
@@ -1515,20 +1555,21 @@ async function handleMenuAction(
   connection: TelegramConnection,
   action: string,
   messageId?: number,
+  forceNew?: boolean,
 ) {
-  if (action === "menu") return showMainMenu(supabase, chatId, connection, { messageId });
-  if (action === "help") return showHelp(supabase, chatId, { connection, messageId });
+  if (action === "menu") return showMainMenu(supabase, chatId, connection, { messageId, forceNew });
+  if (action === "help") return showHelp(supabase, chatId, { connection, messageId, forceNew });
 
   const activeDraft = await getActiveDraftBrief(supabase, connection.company_id, chatId);
-  if (isBusyDraft(activeDraft)) return showBusyMessage(supabase, chatId, connection, messageId);
-  if (action === "add_product" || action === "add") return startAddWizard(supabase, chatId, connection, undefined, { messageId });
+  if (isBusyDraft(activeDraft)) return showBusyMessage(supabase, chatId, connection, { messageId, forceNew });
+  if (action === "add_product" || action === "add") return startAddWizard(supabase, chatId, connection, undefined, { messageId, forceNew });
   if (action === "find_product" || action === "find") {
     await createDraft(supabase, connection.company_id, chatId, "find", "wait_find");
-    return renderTelegramScreen({ supabase, chatId, companyId: connection.company_id, connection, screen: "search_prompt", text: "Введите название, SKU или ключевое слово.", rows: [], preferMessageId: messageId });
+    return renderTelegramScreen({ supabase, chatId, companyId: connection.company_id, connection, screen: "search_prompt", text: "Введите название, SKU или ключевое слово.", rows: [], preferMessageId: messageId, forceNew });
   }
   if (action === "edit_product" || action === "edit") {
     await createDraft(supabase, connection.company_id, chatId, "edit_search", "wait_edit_search");
-    return renderTelegramScreen({ supabase, chatId, companyId: connection.company_id, connection, screen: "edit_search_prompt", text: "Введите SKU или название товара.", rows: [], preferMessageId: messageId });
+    return renderTelegramScreen({ supabase, chatId, companyId: connection.company_id, connection, screen: "edit_search_prompt", text: "Введите SKU или название товара.", rows: [], preferMessageId: messageId, forceNew });
   }
   if (action === "latest_products") {
     const { data, error } = await supabase
@@ -1538,9 +1579,9 @@ async function handleMenuAction(
       .order("updated_at", { ascending: false })
       .limit(5);
     if (error) throw error;
-    return sendProductList(supabase, chatId, ((data ?? []) as Product[]) ?? [], { connection, messageId });
+    return sendProductList(supabase, chatId, ((data ?? []) as Product[]) ?? [], { connection, messageId, forceNew });
   }
-  if (action === "stats") return showStats(supabase, chatId, connection.company_id, { connection, messageId });
+  if (action === "stats") return showStats(supabase, chatId, connection.company_id, { connection, messageId, forceNew });
 }
 
 async function showDraftNavigationMenu(
@@ -1942,7 +1983,7 @@ async function handleMessage(supabase: ReturnType<typeof getSupabaseAdmin>, mess
     const connection = await getConnection(supabase, chatId);
     logTiming("get connection", getConnectionStartedAt, chatId);
     if (!connection) return sendMessage(chatId, "Отправьте код подключения из CRM.");
-    const result = await showMainMenu(supabase, chatId, connection);
+    const result = await showMainMenu(supabase, chatId, connection, { forceNew: true });
     logTiming("handle action start", startedAt, chatId);
     return result;
   }
@@ -1958,7 +1999,7 @@ async function handleMessage(supabase: ReturnType<typeof getSupabaseAdmin>, mess
       const connected = await connectByCode(supabase, chatId, message.from, text);
       if (connected) {
         const nextConnection = await getConnection(supabase, chatId);
-        if (nextConnection) return showMainMenu(supabase, chatId, nextConnection);
+        if (nextConnection) return showMainMenu(supabase, chatId, nextConnection, { forceNew: true });
         return sendMessage(chatId, "Бот успешно подключён к компании.");
       }
       return sendMessage(chatId, "Код неверный или истёк. Сгенерируйте новый код в CRM.");
@@ -1967,24 +2008,24 @@ async function handleMessage(supabase: ReturnType<typeof getSupabaseAdmin>, mess
   }
   if (text === "/menu" || normalize(text) === normalize("Главное меню")) {
     const responseStartedAt = Date.now();
-    const result = await showMainMenu(supabase, chatId, connection);
+    const result = await showMainMenu(supabase, chatId, connection, { forceNew: true });
     logTiming("telegram response", responseStartedAt, chatId);
     logTiming("handle action menu", startedAt, chatId);
     return result;
   }
-  if (text === "/help") return showHelp(supabase, chatId, { connection });
+  if (text === "/help") return showHelp(supabase, chatId, { connection, forceNew: true });
   if (text === "/cancel") {
     await clearDrafts(supabase, connection.company_id, chatId);
-    return showCancelledMenu(supabase, chatId, connection);
+    return showCancelledMenu(supabase, chatId, connection, { forceNew: true });
   }
-  if (text === "/find") return handleMenuAction(supabase, chatId, connection, "find");
-  if (text === "/addproduct") return handleMenuAction(supabase, chatId, connection, "add");
+  if (text === "/find") return handleMenuAction(supabase, chatId, connection, "find", undefined, true);
+  if (text === "/addproduct") return handleMenuAction(supabase, chatId, connection, "add", undefined, true);
   const draft = await getActiveDraft(supabase, connection.company_id, chatId);
   if (media) {
-    if (!draft) return startAddWizard(supabase, chatId, connection, message);
+    if (!draft) return startAddWizard(supabase, chatId, connection, message, { forceNew: true });
     return handleDraftMedia(supabase, chatId, draft, message);
   }
-  if (!draft) return showMainMenu(supabase, chatId, connection);
+  if (!draft) return showMainMenu(supabase, chatId, connection, { forceNew: true });
   if (draft.mode === "edit") return handleEditText(supabase, chatId, draft, text);
   return handleAddDraftText(supabase, chatId, draft, text);
 }
