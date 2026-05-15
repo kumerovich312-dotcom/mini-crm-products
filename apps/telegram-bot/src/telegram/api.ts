@@ -41,9 +41,11 @@ function timeoutForMethod(method: TelegramMethod) {
   return 8000;
 }
 
+const RETRYABLE_ERROR_CODES = new Set(["etimedout", "econnreset", "enetunreach", "eai_again", "enotfound"]);
+
 function isFetchFailed(error: unknown) {
   const message = getErrorMessage(error).toLowerCase();
-  return (
+  if (
     message.includes("fetch failed") ||
     message.includes("network") ||
     message.includes("econnreset") ||
@@ -51,7 +53,14 @@ function isFetchFailed(error: unknown) {
     message.includes("timeout") ||
     message.includes("aborted") ||
     message.includes("terminated")
-  );
+  ) return true;
+  if (error instanceof Error && error.cause != null) {
+    const cause = error.cause as Record<string, unknown>;
+    if (typeof cause.code === "string" && RETRYABLE_ERROR_CODES.has(cause.code.toLowerCase())) return true;
+    const causeMsg = getErrorMessage(error.cause).toLowerCase();
+    if (causeMsg.includes("etimedout") || causeMsg.includes("timeout") || causeMsg.includes("aborted")) return true;
+  }
+  return false;
 }
 
 export function isNonCriticalTelegramError(error: unknown) {
@@ -86,12 +95,6 @@ function retryDelay(attempt: number) {
   return [300, 1000, 2500][attempt - 1] ?? 2500;
 }
 
-function safeFilePath(filePath: string) {
-  const parts = filePath.split("/");
-  const fileName = parts.at(-1) ?? filePath;
-  return fileName.length > 80 ? `${fileName.slice(0, 24)}...${fileName.slice(-24)}` : fileName;
-}
-
 async function parseTelegramBody(response: Response) {
   const text = await response.text();
   try {
@@ -103,7 +106,9 @@ async function parseTelegramBody(response: Response) {
 
 function isRetryableFileError(error: unknown) {
   if (error instanceof TelegramFileError) {
-    return error.code !== "file_too_large" && typeof error.status === "number" && error.status >= 500;
+    if (error.code === "file_too_large") return false;
+    if (typeof error.status !== "number") return true; // network failure, no HTTP status
+    return error.status >= 500;
   }
   return isFetchFailed(error);
 }
@@ -154,16 +159,19 @@ export async function editTelegramMessage(
   replyMarkup?: Record<string, unknown>,
   action = "edit_message",
 ) {
-  return telegramApi("editMessageText", { chat_id: chatId, message_id: messageId, text, reply_markup: replyMarkup }, { action, chatId });
+  try {
+    return await telegramApi("editMessageText", { chat_id: chatId, message_id: messageId, text, reply_markup: replyMarkup }, { action, chatId });
+  } catch (error) {
+    if (isNonCriticalTelegramError(error)) return null;
+    throw error;
+  }
 }
 
 export async function answerCallbackQuery(callbackQueryId: string, text?: string, chatId?: string) {
   try {
     return await telegramApi("answerCallbackQuery", { callback_query_id: callbackQueryId, text }, { action: "answer_callback", chatId });
   } catch (error) {
-    if (!isNonCriticalTelegramError(error)) {
-      console.warn("Telegram API answerCallbackQuery ignored", { message: getErrorMessage(error), cause: errorCause(error) });
-    }
+    console.warn("Telegram API answerCallbackQuery ignored", { message: getErrorMessage(error), cause: errorCause(error) });
     return null;
   }
 }
@@ -197,27 +205,29 @@ export async function getTelegramFile(fileId: string) {
         console.error("Telegram API error", {
           method: "getFile",
           action: "get_file",
+          fileId,
           message: body.description ?? `Telegram getFile failed with status ${response.status}`,
-          cause: undefined,
           status: response.status,
-          body,
         });
         throw new TelegramFileError(body.description ?? "Telegram getFile failed", "get_file", response.status, body);
       }
 
       return body.result ?? {};
     } catch (error) {
+      if (!(error instanceof TelegramFileError && error.status && error.status < 500)) {
+        console.error("Telegram file download error", {
+          stage: "getFile",
+          attempt,
+          fileId,
+          message: getErrorMessage(error),
+          cause: errorCause(error),
+        });
+      }
       if (attempt < 3 && isRetryableFileError(error)) {
         await sleep(retryDelay(attempt));
         continue;
       }
       if (!(error instanceof TelegramFileError)) {
-        console.error("Telegram API error", {
-          method: "getFile",
-          action: "get_file",
-          message: getErrorMessage(error),
-          cause: errorCause(error),
-        });
         throw new TelegramFileError(getErrorMessage(error), "get_file");
       }
       throw error;
@@ -230,10 +240,11 @@ export async function getTelegramFile(fileId: string) {
 }
 
 export async function downloadTelegramFile(filePath: string) {
+  const filePathSafe = filePath.split("/").pop() ?? filePath;
+
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 30000);
-    const filePathSafe = safeFilePath(filePath);
 
     try {
       const response = await fetch(`https://api.telegram.org/file/bot${getTelegramToken()}/${filePath}`, {
@@ -244,24 +255,23 @@ export async function downloadTelegramFile(filePath: string) {
       }
 
       const buffer = await response.arrayBuffer();
-      console.log("telegram file", { stage: "download", filePathSafe, attempt, bytes: buffer.byteLength });
+      console.log("telegram file", { stage: "download", attempt, filePathSafe, bytes: buffer.byteLength });
       return {
         buffer,
         bytes: buffer.byteLength,
         contentType: response.headers.get("content-type") ?? undefined,
       };
     } catch (error) {
+      console.error("Telegram file download error", {
+        stage: "download",
+        attempt,
+        filePathSafe,
+        message: getErrorMessage(error),
+        cause: errorCause(error),
+      });
       if (attempt < 3 && isRetryableFileError(error)) {
         await sleep(retryDelay(attempt));
         continue;
-      }
-      if (!(error instanceof TelegramFileError && error.status && error.status < 500)) {
-        console.error("Telegram API error", {
-          method: "getFile",
-          action: "download_file",
-          message: getErrorMessage(error),
-          cause: errorCause(error),
-        });
       }
       throw error instanceof TelegramFileError ? error : new TelegramFileError(getErrorMessage(error), "download_file");
     } finally {

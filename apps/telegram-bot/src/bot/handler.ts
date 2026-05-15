@@ -316,18 +316,13 @@ async function downloadTelegramFile(fileId: string) {
     throw new TelegramFileError("Telegram file is too large.", "file_too_large", undefined, { file_size: file.file_size });
   }
 
-  try {
-    const downloaded = await downloadTelegramFileByPath(file.file_path);
-    return {
-      buffer: downloaded.buffer,
-      filePath: file.file_path,
-      fileSize: file.file_size ?? downloaded.bytes,
-      contentType: downloaded.contentType,
-    };
-  } catch (error) {
-    logTelegramError("telegram_file_download", error, { action: "download_file", fileId });
-    throw error;
-  }
+  const downloaded = await downloadTelegramFileByPath(file.file_path);
+  return {
+    buffer: downloaded.buffer,
+    filePath: file.file_path,
+    fileSize: file.file_size ?? downloaded.bytes,
+    contentType: downloaded.contentType,
+  };
 }
 
 function shortId() {
@@ -360,10 +355,9 @@ function normalize(value: string) {
 
 function mediaUploadErrorMessage(error: unknown) {
   if (error instanceof TelegramFileError) {
-    if (error.code === "get_file") return "Не удалось получить файл из Telegram. Попробуйте отправить ещё раз.";
     if (error.code === "file_too_large") return "Файл слишком большой. Максимальный размер для загрузки: 300 MB.";
   }
-  return "Не удалось загрузить файл. Попробуйте ещё раз или нажмите Пропустить медиа.";
+  return "Не удалось загрузить файл из Telegram. Попробуйте отправить ещё раз или нажмите Пропустить медиа.";
 }
 
 async function renderMediaRetryScreen(
@@ -1497,7 +1491,6 @@ async function handleDraftMedia(supabase: ReturnType<typeof getSupabaseAdmin>, c
       await clearDrafts(supabase, draft.company_id, chatId);
       return openProductCard(supabase, chatId, draft.company_id, product.id, { connection: connection ?? undefined });
     } catch (error) {
-      logTelegramError("telegram_file_download", error, { action: "download_file", fileId: media.fileId });
       return renderMediaRetryScreen(supabase, chatId, draft.company_id, mediaUploadErrorMessage(error), connection);
     }
   }
@@ -1509,7 +1502,6 @@ async function handleDraftMedia(supabase: ReturnType<typeof getSupabaseAdmin>, c
       if (!nextDraft) return sendMessage(chatId, "Отправьте фото или видео.");
       return sendCategoryKeyboard(supabase, draft.company_id, chatId, "Фото получил ✅ Выберите категорию товара:", { connection });
     } catch (error) {
-      logTelegramError("telegram_file_download", error, { action: "download_file", fileId: getMessageMedia(message)?.fileId });
       await updateDraft(supabase, draft, { step: "wait_media" });
       return renderMediaRetryScreen(supabase, chatId, draft.company_id, mediaUploadErrorMessage(error), connection);
     }
