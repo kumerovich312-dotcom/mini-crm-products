@@ -5,6 +5,7 @@ import {
   downloadTelegramFile as downloadTelegramFileByPath,
   editTelegramMessage,
   getTelegramFile,
+  isNonCriticalDeleteMessageError,
   isNonCriticalTelegramError,
   sendTelegramMessage,
   TelegramFileError,
@@ -67,8 +68,10 @@ type DraftBrief = Pick<TelegramDraft, "id" | "step" | "mode" | "product_id" | "c
 
 const CONNECTION_CACHE_TTL_MS = 60_000;
 const RECENT_UPDATE_TTL_MS = 120_000;
+const CLEANUP_QUEUE_LIMIT = 10;
 const connectionCache = new Map<string, { value: CachedConnection | null; expiresAt: number }>();
 const recentUpdates = new Map<string, number>();
+const screenCleanupQueue = new Map<string, number[]>();
 
 function logTiming(action: string, startedAt: number, chatId?: string) {
   console.log("telegram timing", { action, ms: Date.now() - startedAt, chatId });
@@ -209,6 +212,44 @@ async function safeEditOrSend(
   return { mode: "send" as const, messageId: sent.message_id };
 }
 
+function enqueueScreenCleanup(chatId: string, messageId: number | null | undefined) {
+  if (!messageId) return;
+  const current = screenCleanupQueue.get(chatId) ?? [];
+  const next = [...current.filter((id) => id !== messageId), messageId].slice(-CLEANUP_QUEUE_LIMIT);
+  screenCleanupQueue.set(chatId, next);
+}
+
+async function safeDeleteMessage(chatId: string, messageId: number | null | undefined, action: string) {
+  if (!messageId) return true;
+  try {
+    await deleteTelegramMessage(chatId, messageId, action);
+    return true;
+  } catch (error) {
+    console.warn("telegram cleanup delete failed", {
+      chatId,
+      messageId,
+      action,
+      message: getErrorMessage(error),
+      cause: error instanceof Error && error.cause ? getErrorMessage(error.cause) : undefined,
+    });
+    return isNonCriticalDeleteMessageError(error);
+  }
+}
+
+async function flushScreenCleanupQueue(chatId: string, action: string) {
+  const queued = screenCleanupQueue.get(chatId);
+  if (!queued?.length) return;
+
+  screenCleanupQueue.delete(chatId);
+  const remaining: number[] = [];
+  for (const messageId of queued) {
+    const deleted = await safeDeleteMessage(chatId, messageId, action);
+    if (!deleted) remaining.push(messageId);
+  }
+
+  if (remaining.length) screenCleanupQueue.set(chatId, remaining.slice(-CLEANUP_QUEUE_LIMIT));
+}
+
 async function renderTelegramScreen({
   supabase,
   chatId,
@@ -246,14 +287,12 @@ async function renderTelegramScreen({
     screenConnection?.last_bot_message_id ??
     screenConnection?.last_menu_message_id;
 
+  void flushScreenCleanupQueue(chatId, `cleanup_queue:${screen}`);
+
   let result: { mode: string; messageId: number };
+  let oldMessageId: number | null | undefined;
   if (forceNew) {
-    const oldMessageId = targetMessageId;
-    if (oldMessageId) {
-      try {
-        await deleteTelegramMessage(chatId, oldMessageId, `delete_for_new:${screen}`);
-      } catch { /* ignore — message may already be gone */ }
-    }
+    oldMessageId = targetMessageId;
     const sent = await sendTelegramMessage(chatId, text, replyMarkup, `render_screen:${screen}`);
     result = { mode: "force_new", messageId: sent.message_id };
     console.log("telegram screen render", { mode: "force_new", screen, chatId, oldMessageId, newMessageId: sent.message_id });
@@ -268,6 +307,12 @@ async function renderTelegramScreen({
       active_screen_message_id: result.messageId,
       last_bot_message_id: result.messageId,
       ...(screen === "main_menu" ? { last_menu_message_id: result.messageId } : {}),
+    });
+  }
+
+  if (forceNew && oldMessageId && oldMessageId !== result.messageId) {
+    void safeDeleteMessage(chatId, oldMessageId, `delete_for_new:${screen}`).then((deleted) => {
+      if (!deleted) enqueueScreenCleanup(chatId, oldMessageId);
     });
   }
 
