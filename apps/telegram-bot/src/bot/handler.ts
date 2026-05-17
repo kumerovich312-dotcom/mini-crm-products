@@ -64,18 +64,20 @@ type CachedConnection = {
   last_bot_message_id: number | null;
   active_screen_message_id: number | null;
 };
-type DraftBrief = Pick<TelegramDraft, "id" | "step" | "mode" | "product_id" | "category_id" | "step_history">;
 
-const CONNECTION_CACHE_TTL_MS = 60_000;
-const CATEGORY_CACHE_TTL_MS = 120_000;
-const CUSTOM_FIELD_CACHE_TTL_MS = 120_000;
+const CONNECTION_CACHE_TTL_MS = 300_000;
+const CATEGORY_CACHE_TTL_MS = 300_000;
+const CUSTOM_FIELD_CACHE_TTL_MS = 300_000;
 const RECENT_UPDATE_TTL_MS = 120_000;
 const CLEANUP_QUEUE_LIMIT = 10;
+const CALLBACK_COLD_AFTER_MS = 60_000;
 const connectionCache = new Map<string, { value: CachedConnection | null; expiresAt: number }>();
 const categoryCache = new Map<string, { value: Category[]; expiresAt: number }>();
 const customFieldCache = new Map<string, { value: CustomField[]; expiresAt: number }>();
 const recentUpdates = new Map<string, number>();
 const screenCleanupQueue = new Map<string, number[]>();
+const chatQueues = new Map<string, Promise<void>>();
+let lastCallbackAt = 0;
 
 function logTiming(action: string, startedAt: number, chatId?: string) {
   console.log("telegram timing", { action, ms: Date.now() - startedAt, chatId });
@@ -101,6 +103,17 @@ function cachedConnectionToConnection(chatId: string, cached: CachedConnection):
 
 function clearConnectionCache(chatId: string) {
   connectionCache.delete(chatId);
+}
+
+function enqueueChatWork(chatId: string | undefined, work: () => Promise<void>) {
+  if (!chatId) return work();
+
+  const previous = chatQueues.get(chatId) ?? Promise.resolve();
+  const next = previous.catch(() => undefined).then(work);
+  chatQueues.set(chatId, next);
+  return next.finally(() => {
+    if (chatQueues.get(chatId) === next) chatQueues.delete(chatId);
+  });
 }
 
 function getCachedCompanyItems<T>(cache: Map<string, { value: T[]; expiresAt: number }>, companyId: string) {
@@ -234,12 +247,14 @@ function enqueueScreenCleanup(chatId: string, messageId: number | null | undefin
   const current = screenCleanupQueue.get(chatId) ?? [];
   const next = [...current.filter((id) => id !== messageId), messageId].slice(-CLEANUP_QUEUE_LIMIT);
   screenCleanupQueue.set(chatId, next);
+  console.log("telegram cleanup", { chatId, messageId, deleted: false, queued: true });
 }
 
 async function safeDeleteMessage(chatId: string, messageId: number | null | undefined, action: string) {
   if (!messageId) return true;
   try {
     await deleteTelegramMessage(chatId, messageId, action);
+    console.log("telegram cleanup", { chatId, messageId, deleted: true, queued: false });
     return true;
   } catch (error) {
     console.warn("telegram cleanup delete failed", {
@@ -249,7 +264,9 @@ async function safeDeleteMessage(chatId: string, messageId: number | null | unde
       message: getErrorMessage(error),
       cause: error instanceof Error && error.cause ? getErrorMessage(error.cause) : undefined,
     });
-    return isNonCriticalDeleteMessageError(error);
+    const deleted = isNonCriticalDeleteMessageError(error);
+    console.log("telegram cleanup", { chatId, messageId, deleted, queued: !deleted });
+    return deleted;
   }
 }
 
@@ -439,7 +456,137 @@ function mediaUploadErrorMessage(error: unknown) {
   if (error instanceof TelegramFileError) {
     if (error.code === "file_too_large") return "Файл слишком большой. Максимальный размер для загрузки: 300 MB.";
   }
-  return "Не удалось загрузить файл из Telegram. Попробуйте отправить ещё раз или нажмите Пропустить медиа.";
+  return "Не удалось загрузить файл из Telegram. Попробуйте отправить ещё раз или нажмите «Пропустить медиа».";
+}
+
+function notSpecified(kind: "male" | "female" | "neutral" = "neutral") {
+  if (kind === "male") return "не указан";
+  if (kind === "female") return "не указана";
+  return "не указано";
+}
+
+function hasCompletedStep(draft: TelegramDraft, step: string) {
+  return draft.step_history?.includes(step) || draft.step === "preview" || draft.step === "custom_fields";
+}
+
+function formatMoney(value: number) {
+  return Number.isFinite(Number(value)) ? String(Number(value)) : notSpecified("female");
+}
+
+function customFieldDisplayValue(field: CustomField, value: unknown) {
+  const formatted = formatCustomValue(field, value);
+  return formatted === "—" ? notSpecified() : formatted;
+}
+
+function isWeightField(field: CustomField) {
+  const key = `${field.key} ${field.name}`.toLowerCase();
+  return key.includes("weight") || key.includes("вес");
+}
+
+function draftCategoryLabel(category: Category | null) {
+  return category ? `${category.code} · ${category.name}` : notSpecified("female");
+}
+
+function draftSummaryLines(draft: TelegramDraft, category: Category | null, fields: CustomField[] = []) {
+  const fieldLines = fields.flatMap((field) => {
+    const value = draft.custom_values?.[field.id];
+    if (value === undefined || value === null || value === "") return [];
+    const icon = isWeightField(field) ? "⚖️" : "▫️";
+    return `${icon} ${field.name}: ${customFieldDisplayValue(field, value)}`;
+  });
+  return [
+    "Товар:",
+    `📦 Название: ${draft.name?.trim() || notSpecified("male")}`,
+    `🏷 Категория: ${draftCategoryLabel(category)}`,
+    `💰 Цена: ${hasCompletedStep(draft, "wait_price") ? formatMoney(draft.price) : notSpecified("female")}`,
+    `📦 Остаток: ${hasCompletedStep(draft, "wait_stock") ? String(Number(draft.stock) || 0) : notSpecified("male")}`,
+    `📝 Описание: ${draft.description?.trim() || notSpecified()}`,
+    `🖼 Медиа: ${(draft.media ?? []).length > 0 ? `загружено (${draft.media.length})` : "не загружено"}`,
+    ...fieldLines,
+  ];
+}
+
+function wizardStepMeta(draft: TelegramDraft, fields: CustomField[] = []) {
+  const total = 6 + fields.length;
+  if (draft.step === "wait_media") return { index: 1, total, title: "Медиа" };
+  if (draft.step === "choose_category") return { index: 2, total, title: "Категория" };
+  if (draft.step === "wait_name") return { index: 3, total, title: "Название" };
+  if (draft.step === "wait_price") return { index: 4, total, title: "Цена" };
+  if (draft.step === "wait_stock") return { index: 5, total, title: "Остаток" };
+  if (draft.step === "wait_description") return { index: 6, total, title: "Описание" };
+  if (draft.step === "custom_fields" && draft.edit_field) {
+    const fieldIndex = Math.max(fields.findIndex((field) => field.id === draft.edit_field), 0);
+    return { index: 7 + fieldIndex, total, title: fields[fieldIndex]?.name ?? "Доп. поле" };
+  }
+  return { index: Math.min(total, 1), total, title: "Товар" };
+}
+
+function wizardPrompt(draft: TelegramDraft, field?: CustomField) {
+  if (draft.step === "wait_media") return "Отправьте фото или видео товара.";
+  if (draft.step === "choose_category") return "Выберите категорию товара.";
+  if (draft.step === "wait_name") return "Введите название товара.";
+  if (draft.step === "wait_price") return "Введите цену товара.";
+  if (draft.step === "wait_stock") return "Введите остаток товара.";
+  if (draft.step === "wait_description") return "Добавьте описание товара.";
+  if (draft.step === "custom_fields" && field) return field.is_required ? `Введите ${field.name}.` : `Введите ${field.name} или пропустите поле.`;
+  return "Продолжайте заполнение товара.";
+}
+
+function optionalRowsForDraftStep(draft: TelegramDraft, field?: CustomField): InlineButton[][] {
+  if (draft.step === "wait_media") return [[{ text: "⏭ Пропустить медиа", callback_data: "media:skip" }]];
+  if (draft.step === "wait_description") return [[{ text: "⏭ Пропустить описание", callback_data: "desc:skip" }]];
+  if (draft.step === "custom_fields" && field && !field.is_required) return [[{ text: `⏭ Пропустить ${field.name}`, callback_data: `cfs:${field.id}` }]];
+  return [];
+}
+
+async function renderAddWizardScreen({
+  supabase,
+  chatId,
+  draft,
+  connection,
+  rows = [],
+  messageId,
+  forceNew,
+  error,
+  prompt,
+}: {
+  supabase: ReturnType<typeof getSupabaseAdmin>;
+  chatId: string;
+  draft: TelegramDraft;
+  connection?: TelegramConnection | null;
+  rows?: InlineButton[][];
+  messageId?: number | null;
+  forceNew?: boolean;
+  error?: string;
+  prompt?: string;
+}) {
+  const [category, fields] = await Promise.all([
+    draft.category_id ? getCategory(supabase, draft.company_id, draft.category_id) : Promise.resolve(null),
+    getCustomFields(supabase, draft.company_id),
+  ]);
+  const currentField = draft.step === "custom_fields" && draft.edit_field ? fields.find((field) => field.id === draft.edit_field) : undefined;
+  const meta = wizardStepMeta(draft, fields);
+  const text = [
+    `Шаг ${meta.index} из ${meta.total} — ${meta.title}`,
+    "",
+    ...draftSummaryLines(draft, category, fields),
+    "",
+    ...(error ? [`⚠️ ${error}`, ""] : []),
+    prompt ?? wizardPrompt(draft, currentField),
+  ].join("\n");
+  const finalRows = [...rows, ...optionalRowsForDraftStep(draft, currentField)];
+  console.log("telegram wizard", { action: "render", step: draft.step, chatId, draftId: draft.id, mode: draft.mode });
+  return renderTelegramScreen({
+    supabase,
+    chatId,
+    companyId: draft.company_id,
+    connection,
+    screen: draft.step,
+    text,
+    rows: finalRows,
+    preferMessageId: messageId,
+    forceNew,
+  });
 }
 
 async function renderMediaRetryScreen(
@@ -449,7 +596,11 @@ async function renderMediaRetryScreen(
   text: string,
   connection?: TelegramConnection | null,
   forceNew?: boolean,
+  draft?: TelegramDraft,
 ) {
+  if (draft) {
+    return renderAddWizardScreen({ supabase, chatId, draft, connection, forceNew, error: text });
+  }
   return renderTelegramScreen({
     supabase,
     chatId,
@@ -481,10 +632,12 @@ async function getConnection(supabase: ReturnType<typeof getSupabaseAdmin>, chat
   const cached = connectionCache.get(chatId);
   const now = Date.now();
   if (cached && cached.expiresAt > now) {
+    console.log("telegram cache", { type: "connection", hit: true, chatId });
     logTiming("get connection cache", cacheStartedAt, chatId);
     return cached.value?.is_active ? cachedConnectionToConnection(chatId, cached.value) : null;
   }
   if (cached) connectionCache.delete(chatId);
+  console.log("telegram cache", { type: "connection", hit: false, chatId });
 
   const { data, error } = await supabase
     .from("telegram_connections")
@@ -520,19 +673,6 @@ async function getActiveDraft(supabase: ReturnType<typeof getSupabaseAdmin>, com
     .limit(1);
   if (error) throw error;
   return ((data?.[0] ?? null) as TelegramDraft | null) ?? null;
-}
-
-async function getActiveDraftBrief(supabase: ReturnType<typeof getSupabaseAdmin>, companyId: string, chatId: string) {
-  const { data, error } = await supabase
-    .from("telegram_product_drafts")
-    .select("id, step, mode, product_id, category_id, step_history")
-    .eq("company_id", companyId)
-    .eq("telegram_chat_id", chatId)
-    .neq("step", "done")
-    .order("updated_at", { ascending: false })
-    .limit(1);
-  if (error) throw error;
-  return ((data?.[0] ?? null) as DraftBrief | null) ?? null;
 }
 
 async function clearDrafts(supabase: ReturnType<typeof getSupabaseAdmin>, companyId: string, chatId: string) {
@@ -626,7 +766,11 @@ async function connectByCode(supabase: ReturnType<typeof getSupabaseAdmin>, chat
 
 async function getCategories(supabase: ReturnType<typeof getSupabaseAdmin>, companyId: string) {
   const cached = getCachedCompanyItems(categoryCache, companyId);
-  if (cached) return cached;
+  if (cached) {
+    console.log("telegram cache", { type: "categories", hit: true, companyId });
+    return cached;
+  }
+  console.log("telegram cache", { type: "categories", hit: false, companyId });
 
   const { data, error } = await supabase
     .from("categories")
@@ -660,12 +804,26 @@ async function sendCategoryKeyboard(
   companyId: string,
   chatId: string,
   text = "Выберите категорию",
-  options: { connection?: TelegramConnection | null; messageId?: number | null; screen?: string; forceNew?: boolean } = {},
+  options: { connection?: TelegramConnection | null; messageId?: number | null; screen?: string; forceNew?: boolean; draft?: TelegramDraft | null } = {},
 ) {
   const categories = await getCategories(supabase, companyId);
   if (categories.length === 0) {
     await sendMessage(chatId, "Сначала создайте категорию в CRM.");
     return false;
+  }
+  const rows = categories.map((category) => [{ text: `${category.code} · ${category.name}`, callback_data: `cat:${category.id}` }]);
+  if (options.draft?.mode === "add") {
+    await renderAddWizardScreen({
+      supabase,
+      chatId,
+      draft: options.draft,
+      connection: options.connection,
+      rows,
+      messageId: options.messageId,
+      forceNew: options.forceNew,
+      prompt: text,
+    });
+    return true;
   }
   await renderTelegramScreen({
     supabase,
@@ -674,7 +832,7 @@ async function sendCategoryKeyboard(
     connection: options.connection,
     screen: options.screen ?? "choose_category",
     text,
-    rows: categories.map((category) => [{ text: `${category.code} · ${category.name}`, callback_data: `cat:${category.id}` }]),
+    rows,
     preferMessageId: options.messageId,
     forceNew: options.forceNew,
   });
@@ -753,7 +911,11 @@ async function getCompanyAndCategory(supabase: ReturnType<typeof getSupabaseAdmi
 
 async function getCustomFields(supabase: ReturnType<typeof getSupabaseAdmin>, companyId: string) {
   const cached = getCachedCompanyItems(customFieldCache, companyId);
-  if (cached) return cached;
+  if (cached) {
+    console.log("telegram cache", { type: "custom_fields", hit: true, companyId });
+    return cached;
+  }
+  console.log("telegram cache", { type: "custom_fields", hit: false, companyId });
 
   const { data, error } = await supabase
     .from("custom_fields")
@@ -809,57 +971,46 @@ async function askNextCustomField(
     return;
   }
 
-  await updateDraft(supabase, draft, { step: "custom_fields", edit_field: nextField.id });
+  const nextDraft = await updateDraft(supabase, draft, { step: "custom_fields", edit_field: nextField.id });
   const connection = options.connection ?? (await getConnection(supabase, chatId));
-  const suffix = nextField.is_required ? "" : " или нажмите Пропустить";
-  const prompt = `${nextField.name}${suffix}`;
   const type = fieldType(nextField);
   if (type === "boolean") {
-    await renderTelegramScreen({
+    await renderAddWizardScreen({
       supabase,
       chatId,
-      companyId: draft.company_id,
+      draft: nextDraft,
       connection,
-      screen: "custom_fields",
-      text: prompt,
       rows: [
         [
           { text: "Да", callback_data: `cfb:${nextField.id}:1` },
           { text: "Нет", callback_data: `cfb:${nextField.id}:0` },
         ],
-        ...(!nextField.is_required ? [[{ text: "Пропустить", callback_data: `cfs:${nextField.id}` }]] : []),
       ],
-      preferMessageId: options.messageId,
+      messageId: options.messageId,
       forceNew: options.forceNew,
     });
     return;
   }
   if (type === "select") {
     const rows = fieldOptions(nextField).map((option, index) => [{ text: option, callback_data: `cfo:${nextField.id}:${index}` }]);
-    if (!nextField.is_required) rows.push([{ text: "Пропустить", callback_data: `cfs:${nextField.id}` }]);
-    await renderTelegramScreen({
+    await renderAddWizardScreen({
       supabase,
       chatId,
-      companyId: draft.company_id,
+      draft: nextDraft,
       connection,
-      screen: "custom_fields",
-      text: prompt,
       rows,
-      preferMessageId: options.messageId,
+      messageId: options.messageId,
       forceNew: options.forceNew,
     });
     return;
   }
-  const rows = !nextField.is_required ? [[{ text: "Пропустить", callback_data: `cfs:${nextField.id}` }]] : undefined;
-  await renderTelegramScreen({
+  await renderAddWizardScreen({
     supabase,
     chatId,
-    companyId: draft.company_id,
+    draft: nextDraft,
     connection,
-    screen: "custom_fields",
-    text: prompt,
-    rows: rows ?? [],
-    preferMessageId: options.messageId,
+    rows: [],
+    messageId: options.messageId,
     forceNew: options.forceNew,
   });
 }
@@ -879,18 +1030,20 @@ async function showAddPreview(
   const fields = await getCustomFields(supabase, draft.company_id);
   const customLines = fields
     .filter((field) => draft.custom_values?.[field.id] !== undefined)
-    .map((field) => `${field.name}: ${formatCustomValue(field, draft.custom_values[field.id])}`);
+    .map((field) => `▫️ ${field.name}: ${customFieldDisplayValue(field, draft.custom_values[field.id])}`);
   const text = [
-    "Проверьте товар",
+    "Предпросмотр товара",
+    "",
     `SKU: ${sku}`,
-    `Категория: ${category.code} · ${category.name}`,
-    `Название: ${draft.name ?? ""}`,
-    `Цена: ${draft.price ?? 0}`,
-    `Остаток: ${draft.stock ?? 0}`,
-    `Описание: ${draft.description || "—"}`,
-    `Медиа: ${(draft.media ?? []).length} файлов`,
+    `📦 Название: ${draft.name?.trim() || notSpecified("male")}`,
+    `🏷 Категория: ${draftCategoryLabel(category)}`,
+    `💰 Цена: ${formatMoney(draft.price)}`,
+    `📦 Остаток: ${String(Number(draft.stock) || 0)}`,
+    `📝 Описание: ${draft.description?.trim() || notSpecified()}`,
+    `🖼 Медиа: ${(draft.media ?? []).length > 0 ? `загружено (${draft.media.length})` : "не загружено"}`,
     ...customLines,
   ].join("\n");
+  console.log("telegram wizard", { action: "preview", step: draft.step, chatId, draftId: draft.id, mode: draft.mode });
   await renderTelegramScreen({
     supabase,
     chatId,
@@ -900,7 +1053,7 @@ async function showAddPreview(
     text,
     rows: [
       [
-        { text: "✅ Сохранить", callback_data: `d:save:${sku}` },
+        { text: "✅ Сохранить товар", callback_data: `d:save:${sku}` },
         { text: "✏️ Изменить", callback_data: "d:edit" },
       ],
     ],
@@ -1305,18 +1458,71 @@ function isBusyDraft(draft: { step: string } | null) {
   return Boolean(draft && draft.step !== "idle" && draft.step !== "done");
 }
 
+function draftHasImportantData(draft: TelegramDraft | null) {
+  if (!draft) return false;
+  return Boolean(
+    draft.name?.trim() ||
+    draft.category_id ||
+    draft.description?.trim() ||
+    (draft.media ?? []).length > 0 ||
+    Object.keys(draft.custom_values ?? {}).length > 0 ||
+    hasCompletedStep(draft, "wait_price") ||
+    hasCompletedStep(draft, "wait_stock"),
+  );
+}
+
+async function showCancelConfirm(
+  supabase: ReturnType<typeof getSupabaseAdmin>,
+  chatId: string,
+  connection: TelegramConnection,
+  draft: TelegramDraft,
+  options: { messageId?: number | null; forceNew?: boolean } = {},
+) {
+  const category = draft.category_id ? await getCategory(supabase, draft.company_id, draft.category_id) : null;
+  const fields = await getCustomFields(supabase, draft.company_id);
+  return renderTelegramScreen({
+    supabase,
+    chatId,
+    companyId: connection.company_id,
+    connection,
+    screen: "cancel_confirm",
+    text: [
+      "Удалить черновик?",
+      "",
+      ...draftSummaryLines(draft, category, fields),
+      "",
+      "Это действие нельзя отменить.",
+    ].join("\n"),
+    rows: [
+      [
+        { text: "🗑 Да, удалить", callback_data: "draft:cancel_confirm" },
+        { text: "▶️ Продолжить", callback_data: "draft:resume" },
+      ],
+      [{ text: "🏠 Главное меню", callback_data: "nav:menu" }],
+    ],
+    preferMessageId: options.messageId,
+    nav: false,
+    forceNew: options.forceNew,
+  });
+}
+
 async function showBusyMessage(
   supabase: ReturnType<typeof getSupabaseAdmin>,
   chatId: string,
   connection: TelegramConnection,
+  draft?: TelegramDraft | null,
   options: { messageId?: number | null; forceNew?: boolean } = {},
 ) {
+  const fullDraft = draft ?? null;
+  const category = fullDraft?.category_id ? await getCategory(supabase, fullDraft.company_id, fullDraft.category_id) : null;
+  const fields = fullDraft ? await getCustomFields(supabase, fullDraft.company_id) : [];
   const rows = [
     [
-      { text: "Продолжить", callback_data: "draft:resume" },
-      { text: "Начать заново", callback_data: "draft:restart" },
+      { text: "▶️ Продолжить", callback_data: "draft:resume" },
+      { text: "🔄 Начать заново", callback_data: "draft:restart" },
     ],
-    [{ text: "Удалить черновик", callback_data: "draft:cancel" }],
+    [{ text: "🗑 Удалить черновик", callback_data: "draft:cancel" }],
+    [{ text: "🏠 Главное меню", callback_data: "nav:menu" }],
   ];
   await renderTelegramScreen({
     supabase,
@@ -1324,7 +1530,11 @@ async function showBusyMessage(
     companyId: connection.company_id,
     connection,
     screen: "draft_busy",
-    text: "У вас есть незавершённое действие",
+    text: [
+      "У вас есть незавершённый товар",
+      "",
+      ...(fullDraft ? draftSummaryLines(fullDraft, category, fields) : ["Продолжите действие или начните заново."]),
+    ].join("\n"),
     rows,
     preferMessageId: options.messageId,
     nav: false,
@@ -1341,28 +1551,27 @@ async function startAddWizard(
 ) {
   const media = message ? getMessageMedia(message) : null;
   const draft = await createDraft(supabase, connection.company_id, chatId, "add", media ? "choose_category" : "wait_media");
+  console.log("telegram wizard", { action: "start", step: draft.step, chatId, draftId: draft.id, mode: draft.mode });
   if (media) {
     try {
-      await uploadDraftMediaFromMessage(supabase, draft, message as TelegramMessage, "choose_category");
+      const nextDraft = await uploadDraftMediaFromMessage(supabase, draft, message as TelegramMessage, "choose_category");
+      if (!nextDraft) throw new Error("Медиа не найдено.");
+      await sendCategoryKeyboard(supabase, connection.company_id, chatId, "Фото получил. Выберите категорию товара.", { connection, screen: "choose_category", forceNew: options.forceNew, draft: nextDraft });
     } catch (error) {
       logTelegramError("media_upload", error, { companyId: connection.company_id, chatId });
-      await updateDraft(supabase, draft, { step: "wait_media" });
-      await renderMediaRetryScreen(supabase, chatId, connection.company_id, mediaUploadErrorMessage(error), connection, options.forceNew);
+      const retryDraft = await updateDraft(supabase, draft, { step: "wait_media" });
+      await renderMediaRetryScreen(supabase, chatId, connection.company_id, mediaUploadErrorMessage(error), connection, options.forceNew, retryDraft);
       return;
     }
-    await sendCategoryKeyboard(supabase, connection.company_id, chatId, "Фото получил ✅ Выберите категорию товара:", { connection, screen: "choose_category", forceNew: options.forceNew });
     return;
   }
-  const rows = [[{ text: "Пропустить медиа", callback_data: "media:skip" }]];
-  await renderTelegramScreen({
+  await renderAddWizardScreen({
     supabase,
     chatId,
-    companyId: connection.company_id,
+    draft,
     connection,
-    screen: "wait_media",
-    text: "Отправьте фото или видео",
-    rows,
-    preferMessageId: options.messageId,
+    rows: [],
+    messageId: options.messageId,
     forceNew: options.forceNew,
   });
 }
@@ -1527,40 +1736,58 @@ async function saveOneCustomValue(
 
 async function handleAddDraftText(supabase: ReturnType<typeof getSupabaseAdmin>, chatId: string, draft: TelegramDraft, text: string) {
   const connection = await getConnection(supabase, chatId);
+  console.log("telegram wizard", { action: "text", step: draft.step, chatId, draftId: draft.id, mode: draft.mode });
+
+  if (draft.mode === "add" && draft.edit_field && ["name", "price", "stock", "description"].includes(draft.edit_field)) {
+    if (draft.edit_field === "name") {
+      if (!text.trim()) return renderAddWizardScreen({ supabase, chatId, draft, connection, forceNew: true, error: "Название не может быть пустым. Введите название ещё раз." });
+      const nextDraft = await updateDraft(supabase, draft, { name: text.trim(), step: "preview", edit_field: null });
+      return showAddPreview(supabase, chatId, nextDraft, { connection, forceNew: true });
+    }
+    if (draft.edit_field === "price") {
+      const price = parsePrice(text);
+      if (price === null) return renderAddWizardScreen({ supabase, chatId, draft, connection, forceNew: true, error: "Цена должна быть числом. Введите цену ещё раз." });
+      const nextDraft = await updateDraft(supabase, draft, { price, step: "preview", edit_field: null });
+      return showAddPreview(supabase, chatId, nextDraft, { connection, forceNew: true });
+    }
+    if (draft.edit_field === "stock") {
+      const stock = parseStock(text);
+      if (stock === null) return renderAddWizardScreen({ supabase, chatId, draft, connection, forceNew: true, error: "Остаток должен быть целым числом. Введите остаток ещё раз." });
+      const nextDraft = await updateDraft(supabase, draft, { stock, step: "preview", edit_field: null });
+      return showAddPreview(supabase, chatId, nextDraft, { connection, forceNew: true });
+    }
+    if (draft.edit_field === "description") {
+      const nextDraft = await updateDraft(supabase, draft, { description: text.trim() || null, step: "preview", edit_field: null });
+      return showAddPreview(supabase, chatId, nextDraft, { connection, forceNew: true });
+    }
+  }
+
   if (draft.step === "wait_name") {
-    await updateDraft(supabase, draft, { name: text, step: "wait_price" });
-    return renderTelegramScreen({ supabase, chatId, companyId: draft.company_id, connection, screen: "wait_price", text: "Введите цену", rows: [], forceNew: true });
+    if (!text.trim()) return renderAddWizardScreen({ supabase, chatId, draft, connection, forceNew: true, error: "Название не может быть пустым. Введите название ещё раз." });
+    const nextDraft = await updateDraft(supabase, draft, { name: text.trim(), step: "wait_price" });
+    return renderAddWizardScreen({ supabase, chatId, draft: nextDraft, connection, forceNew: true });
   }
   if (draft.step === "wait_price") {
     const price = parsePrice(text);
-    if (price === null) return renderTelegramScreen({ supabase, chatId, companyId: draft.company_id, connection, screen: "wait_price", text: "Введите цену числом.", rows: [], forceNew: true });
-    await updateDraft(supabase, draft, { price, step: "wait_stock" });
-    return renderTelegramScreen({ supabase, chatId, companyId: draft.company_id, connection, screen: "wait_stock", text: "Введите остаток", rows: [], forceNew: true });
+    if (price === null) return renderAddWizardScreen({ supabase, chatId, draft, connection, forceNew: true, error: "Цена должна быть числом. Введите цену ещё раз." });
+    const nextDraft = await updateDraft(supabase, draft, { price, step: "wait_stock" });
+    return renderAddWizardScreen({ supabase, chatId, draft: nextDraft, connection, forceNew: true });
   }
   if (draft.step === "wait_stock") {
     const stock = parseStock(text);
-    if (stock === null) return renderTelegramScreen({ supabase, chatId, companyId: draft.company_id, connection, screen: "wait_stock", text: "Введите остаток целым числом.", rows: [], forceNew: true });
-    await updateDraft(supabase, draft, { stock, step: "wait_description" });
-    return renderTelegramScreen({
-      supabase,
-      chatId,
-      companyId: draft.company_id,
-      connection,
-      screen: "wait_description",
-      text: "Добавьте описание или нажмите Пропустить",
-      rows: [[{ text: "Пропустить", callback_data: "desc:skip" }]],
-      forceNew: true,
-    });
+    if (stock === null) return renderAddWizardScreen({ supabase, chatId, draft, connection, forceNew: true, error: "Остаток должен быть целым числом. Введите остаток ещё раз." });
+    const nextDraft = await updateDraft(supabase, draft, { stock, step: "wait_description" });
+    return renderAddWizardScreen({ supabase, chatId, draft: nextDraft, connection, forceNew: true });
   }
   if (draft.step === "wait_description") {
-    const nextDraft = await updateDraft(supabase, draft, { description: text });
+    const nextDraft = await updateDraft(supabase, draft, { description: text.trim() || null });
     return askNextCustomField(supabase, chatId, nextDraft, { connection, forceNew: true });
   }
   if (draft.step === "custom_fields" && draft.edit_field) {
     const field = (await getCustomFields(supabase, draft.company_id)).find((item) => item.id === draft.edit_field);
     if (!field) return sendMessage(chatId, "Поле не найдено.");
     const parsed = parseCustomValue(field, text);
-    if ("error" in parsed) return renderTelegramScreen({ supabase, chatId, companyId: draft.company_id, connection, screen: "custom_fields", text: parsed.error ?? "Введите корректное значение.", rows: [], forceNew: true });
+    if ("error" in parsed) return renderAddWizardScreen({ supabase, chatId, draft, connection, forceNew: true, error: parsed.error ?? "Введите корректное значение." });
     const nextDraft = await updateDraft(supabase, draft, {
       custom_values: { ...(draft.custom_values ?? {}), [field.id]: parsed.value },
       edit_field: null,
@@ -1616,10 +1843,14 @@ async function handleDraftMedia(supabase: ReturnType<typeof getSupabaseAdmin>, c
     try {
       const nextDraft = await uploadDraftMediaFromMessage(supabase, draft, message, nextStep);
       if (!nextDraft) return sendMessage(chatId, "Отправьте фото или видео.");
-      return sendCategoryKeyboard(supabase, draft.company_id, chatId, "Фото получил ✅ Выберите категорию товара:", { connection, forceNew: true });
+      if (draft.edit_field === "media") {
+        const previewDraft = await updateDraft(supabase, nextDraft, { step: "preview", edit_field: null });
+        return showAddPreview(supabase, chatId, previewDraft, { connection, forceNew: true });
+      }
+      return sendCategoryKeyboard(supabase, draft.company_id, chatId, "Фото получил. Выберите категорию товара.", { connection, forceNew: true, draft: nextDraft });
     } catch (error) {
-      await updateDraft(supabase, draft, { step: "wait_media" });
-      return renderMediaRetryScreen(supabase, chatId, draft.company_id, mediaUploadErrorMessage(error), connection, true);
+      const retryDraft = await updateDraft(supabase, draft, { step: "wait_media" });
+      return renderMediaRetryScreen(supabase, chatId, draft.company_id, mediaUploadErrorMessage(error), connection, true, retryDraft);
     }
   }
   await sendMessage(chatId, "Сейчас ожидаю текст или кнопку.");
@@ -1636,8 +1867,8 @@ async function handleMenuAction(
   if (action === "menu") return showMainMenu(supabase, chatId, connection, { messageId, forceNew });
   if (action === "help") return showHelp(supabase, chatId, { connection, messageId, forceNew });
 
-  const activeDraft = await getActiveDraftBrief(supabase, connection.company_id, chatId);
-  if (isBusyDraft(activeDraft)) return showBusyMessage(supabase, chatId, connection, { messageId, forceNew });
+  const activeDraft = await getActiveDraft(supabase, connection.company_id, chatId);
+  if (isBusyDraft(activeDraft)) return showBusyMessage(supabase, chatId, connection, activeDraft, { messageId, forceNew });
   if (action === "add_product" || action === "add") return startAddWizard(supabase, chatId, connection, undefined, { messageId, forceNew });
   if (action === "find_product" || action === "find") {
     await createDraft(supabase, connection.company_id, chatId, "find", "wait_find");
@@ -1761,6 +1992,12 @@ async function handleCallback(supabase: ReturnType<typeof getSupabaseAdmin>, cal
   if (data === "draft:resume") return draft ? resumeDraft(supabase, chatId, draft, { connection, messageId: callback.message?.message_id }) : showMainMenu(supabase, chatId, connection, { messageId: callback.message?.message_id });
   if (data === "draft:restart") return restartDraft(supabase, chatId, connection, draft);
   if (data === "draft:cancel") {
+    if (draftHasImportantData(draft)) return showCancelConfirm(supabase, chatId, connection, draft as TelegramDraft, { messageId: callback.message?.message_id });
+    await clearDrafts(supabase, connection.company_id, chatId);
+    if (callbackIdForAction) await answerCallbackQuery(callbackIdForAction, "Действие отменено", chatId);
+    return showCancelledMenu(supabase, chatId, connection, { messageId: callback.message?.message_id });
+  }
+  if (data === "draft:cancel_confirm") {
     await clearDrafts(supabase, connection.company_id, chatId);
     if (callbackIdForAction) await answerCallbackQuery(callbackIdForAction, "Действие отменено", chatId);
     return showCancelledMenu(supabase, chatId, connection, { messageId: callback.message?.message_id });
@@ -1774,8 +2011,12 @@ async function handleCallback(supabase: ReturnType<typeof getSupabaseAdmin>, cal
   if (data === "busy:menu") return showMainMenu(supabase, chatId, connection, { messageId: callback.message?.message_id });
   if (data === "media:skip") {
     if (!draft) return sendMessage(chatId, "Черновик не найден.");
-    await updateDraft(supabase, draft, { step: "choose_category" });
-    return sendCategoryKeyboard(supabase, connection.company_id, chatId, "Выберите категорию", { connection, messageId: callback.message?.message_id });
+    if (draft.edit_field === "media") {
+      const previewDraft = await updateDraft(supabase, draft, { step: "preview", edit_field: null });
+      return showAddPreview(supabase, chatId, previewDraft, { connection, messageId: callback.message?.message_id });
+    }
+    const nextDraft = await updateDraft(supabase, draft, { step: "choose_category" });
+    return sendCategoryKeyboard(supabase, connection.company_id, chatId, "Выберите категорию товара.", { connection, messageId: callback.message?.message_id, draft: nextDraft });
   }
   if (data.startsWith("cat:")) {
     if (!draft) return sendMessage(chatId, "Черновик не найден.");
@@ -1789,13 +2030,17 @@ async function handleCallback(supabase: ReturnType<typeof getSupabaseAdmin>, cal
       if (callbackIdForAction) await answerCallbackQuery(callbackIdForAction, "Сохранено", chatId);
       return openProductCard(supabase, chatId, connection.company_id, draft.product_id, { connection, messageId: callback.message?.message_id });
     }
-    const nextDraft = await updateDraft(supabase, draft, { category_id: categoryId, step: "wait_name" });
-    if (nextDraft.name) return showAddPreview(supabase, chatId, nextDraft, { connection, messageId: callback.message?.message_id });
-    return renderTelegramScreen({ supabase, chatId, companyId: connection.company_id, connection, screen: "wait_name", text: "Введите название", rows: [], preferMessageId: callback.message?.message_id });
+    const nextDraft = await updateDraft(supabase, draft, { category_id: categoryId, step: draft.edit_field === "category" ? "preview" : "wait_name", ...(draft.edit_field === "category" ? { edit_field: null } : {}) });
+    if (draft.edit_field === "category" || nextDraft.name) {
+      const previewDraft = nextDraft.step === "preview" ? nextDraft : await updateDraft(supabase, nextDraft, { step: "preview" });
+      return showAddPreview(supabase, chatId, previewDraft, { connection, messageId: callback.message?.message_id });
+    }
+    return renderAddWizardScreen({ supabase, chatId, draft: nextDraft, connection, messageId: callback.message?.message_id });
   }
   if (data === "desc:skip") {
     if (!draft) return sendMessage(chatId, "Черновик не найден.");
-    const nextDraft = await updateDraft(supabase, draft, { description: null });
+    const nextDraft = await updateDraft(supabase, draft, { description: null, ...(draft.edit_field === "description" ? { step: "preview", edit_field: null } : {}) });
+    if (draft.edit_field === "description") return showAddPreview(supabase, chatId, nextDraft, { connection, messageId: callback.message?.message_id });
     if (draft.mode === "add") return askNextCustomField(supabase, chatId, nextDraft, { connection, messageId: callback.message?.message_id });
     const previewDraft = await updateDraft(supabase, draft, { step: "preview" });
     return showAddPreview(supabase, chatId, previewDraft, { connection, messageId: callback.message?.message_id });
@@ -1808,6 +2053,7 @@ async function handleCallback(supabase: ReturnType<typeof getSupabaseAdmin>, cal
     return showMainMenu(supabase, chatId, connection, { messageId: callback.message?.message_id });
   }
   if (data === "d:cancel") {
+    if (draftHasImportantData(draft)) return showCancelConfirm(supabase, chatId, connection, draft as TelegramDraft, { messageId: callback.message?.message_id });
     await clearDrafts(supabase, connection.company_id, chatId);
     if (callbackIdForAction) await answerCallbackQuery(callbackIdForAction, "Действие отменено", chatId);
     return showCancelledMenu(supabase, chatId, connection, { messageId: callback.message?.message_id });
@@ -1838,12 +2084,10 @@ async function resumeDraft(
   options: { connection?: TelegramConnection | null; messageId?: number | null } = {},
 ) {
   const connection = options.connection ?? (await getConnection(supabase, chatId));
-  if (draft.step === "wait_media") return renderTelegramScreen({ supabase, chatId, companyId: draft.company_id, connection, screen: "wait_media", text: "Отправьте фото или видео", rows: [[{ text: "Пропустить медиа", callback_data: "media:skip" }]], preferMessageId: options.messageId });
-  if (draft.step === "choose_category") return sendCategoryKeyboard(supabase, draft.company_id, chatId, "Выберите категорию", { connection, messageId: options.messageId });
-  if (draft.step === "wait_name") return renderTelegramScreen({ supabase, chatId, companyId: draft.company_id, connection, screen: "wait_name", text: "Введите название", rows: [], preferMessageId: options.messageId });
-  if (draft.step === "wait_price") return renderTelegramScreen({ supabase, chatId, companyId: draft.company_id, connection, screen: "wait_price", text: "Введите цену", rows: [], preferMessageId: options.messageId });
-  if (draft.step === "wait_stock") return renderTelegramScreen({ supabase, chatId, companyId: draft.company_id, connection, screen: "wait_stock", text: "Введите остаток", rows: [], preferMessageId: options.messageId });
-  if (draft.step === "wait_description") return renderTelegramScreen({ supabase, chatId, companyId: draft.company_id, connection, screen: "wait_description", text: "Добавьте описание или нажмите Пропустить", rows: [[{ text: "Пропустить", callback_data: "desc:skip" }]], preferMessageId: options.messageId });
+  if (draft.mode === "add" && ["wait_media", "wait_name", "wait_price", "wait_stock", "wait_description"].includes(draft.step)) {
+    return renderAddWizardScreen({ supabase, chatId, draft, connection, messageId: options.messageId });
+  }
+  if (draft.step === "choose_category") return sendCategoryKeyboard(supabase, draft.company_id, chatId, "Выберите категорию товара.", { connection, messageId: options.messageId, draft });
   if (draft.step === "wait_find") return renderTelegramScreen({ supabase, chatId, companyId: draft.company_id, connection, screen: "search_prompt", text: "Введите название, SKU или ключевое слово.", rows: [], preferMessageId: options.messageId });
   if (draft.step === "wait_edit_search") return renderTelegramScreen({ supabase, chatId, companyId: draft.company_id, connection, screen: "edit_search_prompt", text: "Введите SKU или название товара.", rows: [], preferMessageId: options.messageId });
   if (draft.step === "custom_fields") return askNextCustomField(supabase, chatId, draft, { connection, messageId: options.messageId });
@@ -1863,25 +2107,33 @@ async function sendDraftEditMenu(
   options: { connection?: TelegramConnection | null; messageId?: number | null } = {},
 ) {
   if (!draft) return sendMessage(chatId, "Черновик не найден.");
+  const [category, fields] = await Promise.all([
+    draft.category_id ? getCategory(supabase, draft.company_id, draft.category_id) : Promise.resolve(null),
+    getCustomFields(supabase, draft.company_id),
+  ]);
   await renderTelegramScreen({
     supabase,
     chatId,
     companyId: draft.company_id,
     connection: options.connection,
     screen: "draft_edit_menu",
-    text: "Что изменить?",
+    text: [
+      "Что изменить?",
+      "",
+      ...draftSummaryLines(draft, category, fields),
+    ].join("\n"),
     rows: [
     [
-      { text: "Название", callback_data: "de:name" },
-      { text: "Категория", callback_data: "de:category" },
+      { text: "📦 Название", callback_data: "de:name" },
+      { text: "🏷 Категория", callback_data: "de:category" },
     ],
     [
-      { text: "Цена", callback_data: "de:price" },
-      { text: "Остаток", callback_data: "de:stock" },
+      { text: "💰 Цена", callback_data: "de:price" },
+      { text: "📦 Остаток", callback_data: "de:stock" },
     ],
     [
-      { text: "Описание", callback_data: "de:description" },
-      { text: "Медиа", callback_data: "de:media" },
+      { text: "📝 Описание", callback_data: "de:description" },
+      { text: "🖼 Фото/видео", callback_data: "de:media" },
     ],
     ],
     preferMessageId: options.messageId,
@@ -1899,24 +2151,20 @@ async function handleDraftEditChoice(
   if (!draft) return sendMessage(chatId, "Черновик не найден.");
   const connection = options.connection ?? (await getConnection(supabase, chatId));
   if (field === "category") {
-    await updateDraft(supabase, draft, { step: "choose_category" });
-    return sendCategoryKeyboard(supabase, companyId, chatId, "Выберите категорию", { connection, messageId: options.messageId });
+    const nextDraft = await updateDraft(supabase, draft, { step: "choose_category", edit_field: "category" });
+    return sendCategoryKeyboard(supabase, companyId, chatId, "Выберите категорию товара.", { connection, messageId: options.messageId, draft: nextDraft });
   }
   if (field === "media") {
-    await updateDraft(supabase, draft, { step: "wait_media", media: [] });
-    return renderTelegramScreen({ supabase, chatId, companyId, connection, screen: "wait_media", text: "Отправьте фото или видео", rows: [[{ text: "Пропустить медиа", callback_data: "media:skip" }]], preferMessageId: options.messageId });
+    const nextDraft = await updateDraft(supabase, draft, { step: "wait_media", media: [], edit_field: "media" });
+    return renderAddWizardScreen({ supabase, chatId, draft: nextDraft, connection, messageId: options.messageId });
   }
-  await updateDraft(supabase, draft, { step: `wait_${field}` });
-  const prompts: Record<string, string> = { name: "Введите название", price: "Введите цену", stock: "Введите остаток", description: "Добавьте описание или нажмите Пропустить" };
-  return renderTelegramScreen({
+  const nextDraft = await updateDraft(supabase, draft, { step: `wait_${field}`, edit_field: field });
+  return renderAddWizardScreen({
     supabase,
     chatId,
-    companyId,
+    draft: nextDraft,
     connection,
-    screen: `wait_${field}`,
-    text: prompts[field] ?? "Введите значение",
-    rows: field === "description" ? [[{ text: "Пропустить", callback_data: "desc:skip" }]] : [],
-    preferMessageId: options.messageId,
+    messageId: options.messageId,
   });
 }
 
@@ -2093,6 +2341,8 @@ async function handleMessage(supabase: ReturnType<typeof getSupabaseAdmin>, mess
   }
   if (text === "/help") return showHelp(supabase, chatId, { connection, forceNew: true });
   if (text === "/cancel") {
+    const draft = await getActiveDraft(supabase, connection.company_id, chatId);
+    if (draftHasImportantData(draft)) return showCancelConfirm(supabase, chatId, connection, draft as TelegramDraft, { forceNew: true });
     await clearDrafts(supabase, connection.company_id, chatId);
     return showCancelledMenu(supabase, chatId, connection, { forceNew: true });
   }
@@ -2123,24 +2373,32 @@ export async function processTelegramUpdate(update: TelegramUpdate) {
 
     let callbackAnswered = false;
     if (update.callback_query) {
+      const now = Date.now();
+      const cold = lastCallbackAt === 0 || now - lastCallbackAt > CALLBACK_COLD_AFTER_MS;
+      lastCallbackAt = now;
       const answerStartedAt = Date.now();
-      await answerCallbackQuery(update.callback_query.id, undefined, chatId);
+      void answerCallbackQuery(update.callback_query.id, undefined, chatId).then(() => {
+        const ms = Date.now() - answerStartedAt;
+        console.log("telegram timing", { action: "answer_callback", ms, chatId, cold });
+        if (cold && ms > 1000) console.warn("telegram slow first callback", { ms, chatId });
+      });
       callbackAnswered = true;
-      logTiming("answer_callback", answerStartedAt, chatId);
     }
     if (isDuplicateUpdate(update)) {
       logTotalTiming(`duplicate ${String(action)}`, startedAt, chatId);
       return;
     }
-    const supabase = getSupabaseAdmin();
-    if (update.callback_query) await handleCallback(supabase, update.callback_query, callbackAnswered);
-    else if (update.message) await handleMessage(supabase, update.message);
-    else {
-      console.log("telegram unknown update", {
-        updateId: update.update_id,
-        keys: Object.keys(update as Record<string, unknown>),
-      });
-    }
+    await enqueueChatWork(chatId, async () => {
+      const supabase = getSupabaseAdmin();
+      if (update.callback_query) await handleCallback(supabase, update.callback_query, callbackAnswered);
+      else if (update.message) await handleMessage(supabase, update.message);
+      else {
+        console.log("telegram unknown update", {
+          updateId: update.update_id,
+          keys: Object.keys(update as Record<string, unknown>),
+        });
+      }
+    });
     logTiming(String(action), startedAt, chatId);
     logTotalTiming(String(action), startedAt, chatId);
   } catch (error) {

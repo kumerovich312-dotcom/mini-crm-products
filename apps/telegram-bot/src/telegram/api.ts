@@ -5,6 +5,7 @@ type TelegramMethod =
   | "answerCallbackQuery"
   | "deleteMessage"
   | "editMessageText"
+  | "getMe"
   | "getFile"
   | "sendMessage"
   | "sendPhoto"
@@ -88,7 +89,12 @@ function isFetchFailed(error: unknown) {
 
 export function isNonCriticalTelegramError(error: unknown) {
   const message = getErrorMessage(error).toLowerCase();
-  return message.includes("query is too old") || message.includes("query id is invalid") || message.includes("message is not modified");
+  return (
+    message.includes("query is too old") ||
+    message.includes("query id is invalid") ||
+    message.includes("response timeout expired") ||
+    message.includes("message is not modified")
+  );
 }
 
 export function isNonCriticalDeleteMessageError(error: unknown) {
@@ -224,6 +230,7 @@ export async function answerCallbackQuery(callbackQueryId: string, text?: string
     return await telegramApi("answerCallbackQuery", { callback_query_id: callbackQueryId, text }, {
       action: "answer_callback",
       chatId,
+      timeoutMs: 1500,
       maxAttempts: 2,
       retryDelayMs: 200,
     });
@@ -231,6 +238,10 @@ export async function answerCallbackQuery(callbackQueryId: string, text?: string
     console.warn("Telegram API answerCallbackQuery ignored", { message: getErrorMessage(error), cause: errorCause(error) });
     return null;
   }
+}
+
+export async function getTelegramMe(action = "warmup_get_me") {
+  return telegramApi("getMe", {}, { action, timeoutMs: 5000, maxAttempts: 2, retryDelayMs: 200, suppressErrorLog: true });
 }
 
 export async function deleteTelegramMessage(chatId: string, messageId: number, action = "delete_message") {
