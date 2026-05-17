@@ -39,7 +39,7 @@ app.post<{ Body: TelegramUpdate }>("/telegram/webhook", async (request, reply) =
   return reply.send({ ok: true });
 });
 
-const port = Number(process.env.BOT_PORT ?? 3100);
+const port = Number(process.env.PORT ?? process.env.BOT_PORT ?? 3100);
 const host = process.env.BOT_HOST ?? "127.0.0.1";
 const warmupEnabled = process.env.ENABLE_BOT_WARMUP === "true";
 
@@ -77,6 +77,7 @@ function startWarmup() {
 
 app.listen({ port, host }).then(() => {
   console.log("telegram bot listening", {
+    service: "mini-crm-bot",
     port,
     host,
     nodeOptions: process.env.NODE_OPTIONS,
@@ -85,6 +86,15 @@ app.listen({ port, host }).then(() => {
   });
   startWarmup();
 }).catch((error: unknown) => {
+  if (error instanceof Error && "code" in error && error.code === "EADDRINUSE") {
+    console.error("Port 3100 already in use. Stop duplicate PM2 process: pm2 delete telegram-bot", {
+      service: "mini-crm-bot",
+      host,
+      port,
+      message: error.message,
+    });
+    process.exit(0);
+  }
   console.error(error);
   process.exit(1);
 });
