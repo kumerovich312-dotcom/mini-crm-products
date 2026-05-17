@@ -704,19 +704,23 @@ async function createDraft(
 }
 
 function getDraftHistoryKey(draft: Pick<TelegramDraft, "step" | "edit_field">) {
-  if (draft.step === "custom_fields" && draft.edit_field) return `custom_fields:${draft.edit_field}`;
+  if (draft.edit_field) return `${draft.step}:${draft.edit_field}`;
   return draft.step;
 }
 
 function draftValuesWithHistory(draft: TelegramDraft, values: Record<string, unknown>) {
   if ("step_history" in values) return values;
   const nextStep = typeof values.step === "string" ? values.step : draft.step;
-  const nextEditField = typeof values.edit_field === "string" ? values.edit_field : draft.edit_field;
+  const hasNextEditField = Object.prototype.hasOwnProperty.call(values, "edit_field");
+  const nextEditField = hasNextEditField
+    ? (typeof values.edit_field === "string" ? values.edit_field : null)
+    : draft.edit_field;
   const isSameStep = nextStep === draft.step;
   const isSameCustomField = draft.step === "custom_fields" && nextStep === "custom_fields" && nextEditField === draft.edit_field;
   if (isSameStep && (draft.step !== "custom_fields" || isSameCustomField)) return values;
   const currentKey = getDraftHistoryKey(draft);
   const history = Array.isArray(draft.step_history) ? draft.step_history : [];
+  if (history.at(-1) === currentKey) return values;
   return { ...values, step_history: [...history, currentKey] };
 }
 
@@ -958,6 +962,55 @@ function parseCustomValue(field: CustomField, value: string) {
   return { value: value.trim() };
 }
 
+async function renderCustomFieldScreen(
+  supabase: ReturnType<typeof getSupabaseAdmin>,
+  chatId: string,
+  draft: TelegramDraft,
+  field: CustomField,
+  options: { connection?: TelegramConnection | null; messageId?: number | null; forceNew?: boolean } = {},
+) {
+  const connection = options.connection ?? (await getConnection(supabase, chatId));
+  const type = fieldType(field);
+  if (type === "boolean") {
+    await renderAddWizardScreen({
+      supabase,
+      chatId,
+      draft,
+      connection,
+      rows: [
+        [
+          { text: "Да", callback_data: `cfb:${field.id}:1` },
+          { text: "Нет", callback_data: `cfb:${field.id}:0` },
+        ],
+      ],
+      messageId: options.messageId,
+      forceNew: options.forceNew,
+    });
+    return;
+  }
+  if (type === "select") {
+    await renderAddWizardScreen({
+      supabase,
+      chatId,
+      draft,
+      connection,
+      rows: fieldOptions(field).map((option, index) => [{ text: option, callback_data: `cfo:${field.id}:${index}` }]),
+      messageId: options.messageId,
+      forceNew: options.forceNew,
+    });
+    return;
+  }
+  await renderAddWizardScreen({
+    supabase,
+    chatId,
+    draft,
+    connection,
+    rows: [],
+    messageId: options.messageId,
+    forceNew: options.forceNew,
+  });
+}
+
 async function askNextCustomField(
   supabase: ReturnType<typeof getSupabaseAdmin>,
   chatId: string,
@@ -967,52 +1020,12 @@ async function askNextCustomField(
   const fields = await getCustomFields(supabase, draft.company_id);
   const nextField = fields.find((field) => draft.custom_values?.[field.id] === undefined);
   if (!nextField) {
-    await showAddPreview(supabase, chatId, await updateDraft(supabase, draft, { step: "preview" }), options);
+    await showAddPreview(supabase, chatId, await updateDraft(supabase, draft, { step: "preview", edit_field: null }), options);
     return;
   }
 
   const nextDraft = await updateDraft(supabase, draft, { step: "custom_fields", edit_field: nextField.id });
-  const connection = options.connection ?? (await getConnection(supabase, chatId));
-  const type = fieldType(nextField);
-  if (type === "boolean") {
-    await renderAddWizardScreen({
-      supabase,
-      chatId,
-      draft: nextDraft,
-      connection,
-      rows: [
-        [
-          { text: "Да", callback_data: `cfb:${nextField.id}:1` },
-          { text: "Нет", callback_data: `cfb:${nextField.id}:0` },
-        ],
-      ],
-      messageId: options.messageId,
-      forceNew: options.forceNew,
-    });
-    return;
-  }
-  if (type === "select") {
-    const rows = fieldOptions(nextField).map((option, index) => [{ text: option, callback_data: `cfo:${nextField.id}:${index}` }]);
-    await renderAddWizardScreen({
-      supabase,
-      chatId,
-      draft: nextDraft,
-      connection,
-      rows,
-      messageId: options.messageId,
-      forceNew: options.forceNew,
-    });
-    return;
-  }
-  await renderAddWizardScreen({
-    supabase,
-    chatId,
-    draft: nextDraft,
-    connection,
-    rows: [],
-    messageId: options.messageId,
-    forceNew: options.forceNew,
-  });
+  await renderCustomFieldScreen(supabase, chatId, nextDraft, nextField, options);
 }
 
 async function showAddPreview(
@@ -1790,7 +1803,6 @@ async function handleAddDraftText(supabase: ReturnType<typeof getSupabaseAdmin>,
     if ("error" in parsed) return renderAddWizardScreen({ supabase, chatId, draft, connection, forceNew: true, error: parsed.error ?? "Введите корректное значение." });
     const nextDraft = await updateDraft(supabase, draft, {
       custom_values: { ...(draft.custom_values ?? {}), [field.id]: parsed.value },
-      edit_field: null,
     });
     return askNextCustomField(supabase, chatId, nextDraft, { connection, forceNew: true });
   }
@@ -1916,19 +1928,106 @@ async function restartDraft(supabase: ReturnType<typeof getSupabaseAdmin>, chatI
   return startAddWizard(supabase, chatId, connection);
 }
 
-async function handleDraftBack(
+function parseStepHistoryEntry(entry: string) {
+  const separatorIndex = entry.indexOf(":");
+  if (separatorIndex === -1) return { step: entry, editField: null as string | null };
+  return {
+    step: entry.slice(0, separatorIndex),
+    editField: entry.slice(separatorIndex + 1) || null,
+  };
+}
+
+function fallbackWizardBackTarget(draft: TelegramDraft) {
+  if (draft.mode === "add") {
+    const previousStepByStep: Record<string, string> = {
+      choose_category: "wait_media",
+      wait_name: "choose_category",
+      wait_price: "wait_name",
+      wait_stock: "wait_price",
+      wait_description: "wait_stock",
+      custom_fields: "wait_description",
+      preview: "wait_description",
+    };
+    const step = previousStepByStep[draft.step];
+    return step ? { step, editField: null as string | null } : null;
+  }
+
+  if (draft.mode === "find" || draft.mode === "edit_search") return null;
+  if (draft.mode === "edit" && draft.product_id) {
+    if (draft.step === "edit_menu") return { step: `product:${draft.product_id}`, editField: null as string | null };
+    if (draft.step.startsWith("edit_")) return { step: "edit_menu", editField: null as string | null };
+  }
+
+  return null;
+}
+
+async function renderBackTarget(
+  supabase: ReturnType<typeof getSupabaseAdmin>,
+  chatId: string,
+  draft: TelegramDraft,
+  options: { connection?: TelegramConnection | null; messageId?: number | null } = {},
+) {
+  const connection = options.connection ?? (await getConnection(supabase, chatId));
+  if (draft.mode === "add") {
+    if (draft.step === "choose_category") {
+      return sendCategoryKeyboard(supabase, draft.company_id, chatId, "Выберите категорию товара.", { connection, messageId: options.messageId, draft });
+    }
+    if (["wait_media", "wait_name", "wait_price", "wait_stock", "wait_description"].includes(draft.step)) {
+      return renderAddWizardScreen({ supabase, chatId, draft, connection, messageId: options.messageId });
+    }
+    if (draft.step === "custom_fields" && draft.edit_field) {
+      const field = (await getCustomFields(supabase, draft.company_id)).find((item) => item.id === draft.edit_field);
+      if (field) return renderCustomFieldScreen(supabase, chatId, draft, field, { connection, messageId: options.messageId });
+    }
+    if (draft.step === "preview") return showAddPreview(supabase, chatId, draft, { connection, messageId: options.messageId });
+  }
+
+  return resumeDraft(supabase, chatId, draft, { connection, messageId: options.messageId });
+}
+
+async function handleWizardBack(
   supabase: ReturnType<typeof getSupabaseAdmin>,
   chatId: string,
   draft: TelegramDraft | null,
   options: { connection?: TelegramConnection | null; messageId?: number | null } = {},
 ) {
-  if (!draft) return sendMessage(chatId, "Нечего возвращать назад.");
-  const history = Array.isArray(draft.step_history) ? draft.step_history : [];
-  const previous = history.at(-1);
-  if (!previous) return resumeDraft(supabase, chatId, draft, options);
+  const connection = options.connection ?? (await getConnection(supabase, chatId));
+  if (!draft) {
+    console.warn("telegram wizard back ignored", { chatId, currentStep: null, reason: "no_draft" });
+    return connection ? showMainMenu(supabase, chatId, connection, { messageId: options.messageId }) : sendMessage(chatId, "Нечего возвращать назад.");
+  }
 
-  const stepHistory = history.slice(0, -1);
-  const [step, editField] = previous.split(":");
+  const history = Array.isArray(draft.step_history) ? draft.step_history : [];
+  const historyPrevious = history.at(-1);
+  const fallbackPrevious = historyPrevious ? null : fallbackWizardBackTarget(draft);
+  let previous = historyPrevious ? parseStepHistoryEntry(historyPrevious) : fallbackPrevious;
+  if (previous?.step === "custom_fields" && !previous.editField) {
+    previous = { step: "wait_description", editField: null };
+  }
+  if (!previous) {
+    console.warn("telegram wizard back ignored", { chatId, draftId: draft.id, currentStep: draft.step, reason: "first_step" });
+    return connection ? showMainMenu(supabase, chatId, connection, { messageId: options.messageId }) : resumeDraft(supabase, chatId, draft, options);
+  }
+
+  const stepHistory = historyPrevious ? history.slice(0, -1) : history;
+  const { step, editField } = previous;
+  console.log("telegram wizard back", {
+    chatId,
+    draftId: draft.id,
+    fromStep: draft.step,
+    toStep: step,
+    historyLength: stepHistory.length,
+  });
+
+  if (step.startsWith("product:")) {
+    const productId = step.slice("product:".length);
+    await updateDraft(supabase, { ...draft, step_history: stepHistory } as TelegramDraft, {
+      step: "edit_menu",
+      edit_field: null,
+      step_history: stepHistory,
+    });
+    return openProductCard(supabase, chatId, draft.company_id, productId, { connection: connection ?? undefined, messageId: options.messageId });
+  }
   if (step === "edit_menu" && draft.product_id) {
     await updateDraft(supabase, { ...draft, step_history: stepHistory } as TelegramDraft, {
       step: "edit_menu",
@@ -1939,10 +2038,10 @@ async function handleDraftBack(
   }
   const nextDraft = await updateDraft(supabase, { ...draft, step_history: stepHistory } as TelegramDraft, {
     step,
+    edit_field: editField,
     step_history: stepHistory,
-    ...(step === "custom_fields" ? { edit_field: editField ?? draft.edit_field } : {}),
   });
-  return resumeDraft(supabase, chatId, nextDraft, options);
+  return renderBackTarget(supabase, chatId, nextDraft, { connection, messageId: options.messageId });
 }
 
 async function handleCallback(supabase: ReturnType<typeof getSupabaseAdmin>, callback: TelegramCallbackQuery, callbackAnswered = false) {
@@ -1988,7 +2087,7 @@ async function handleCallback(supabase: ReturnType<typeof getSupabaseAdmin>, cal
   }
 
   const draft = await getActiveDraft(supabase, connection.company_id, chatId);
-  if (data === "nav:back") return handleDraftBack(supabase, chatId, draft, { connection, messageId: callback.message?.message_id });
+  if (data === "nav:back") return handleWizardBack(supabase, chatId, draft, { connection, messageId: callback.message?.message_id });
   if (data === "draft:resume") return draft ? resumeDraft(supabase, chatId, draft, { connection, messageId: callback.message?.message_id }) : showMainMenu(supabase, chatId, connection, { messageId: callback.message?.message_id });
   if (data === "draft:restart") return restartDraft(supabase, chatId, connection, draft);
   if (data === "draft:cancel") {
@@ -2184,7 +2283,7 @@ async function handleCustomCallback(
   if (kind === "cfs") value = "";
   if (kind === "cfb") value = raw === "1";
   if (kind === "cfo") value = fieldOptions(field)[Number(raw)] ?? "";
-  const nextDraft = await updateDraft(supabase, draft, { custom_values: { ...(draft.custom_values ?? {}), [field.id]: value }, edit_field: null });
+  const nextDraft = await updateDraft(supabase, draft, { custom_values: { ...(draft.custom_values ?? {}), [field.id]: value } });
   return askNextCustomField(supabase, chatId, nextDraft, options);
 }
 
