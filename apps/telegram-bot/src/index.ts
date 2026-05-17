@@ -2,9 +2,6 @@ import dns from "node:dns";
 import { Agent, setGlobalDispatcher } from "undici";
 import "dotenv/config";
 import Fastify from "fastify";
-import { logTelegramWebhookParseError, processTelegramUpdate } from "./bot/handler.js";
-import { getSupabaseAdmin } from "./supabase/admin.js";
-import { getTelegramMe } from "./telegram/api.js";
 import type { TelegramUpdate } from "./telegram/types.js";
 
 dns.setDefaultResultOrder("ipv4first");
@@ -29,9 +26,10 @@ app.post<{ Body: TelegramUpdate }>("/telegram/webhook", async (request, reply) =
 
   const update = request.body;
   setImmediate(() => {
-    processTelegramUpdate(update).catch((error: unknown) => {
-      logTelegramWebhookParseError(error);
-      console.error(error);
+    processUpdateAsync(update).catch((error: unknown) => {
+      console.error("Telegram bot async import error", {
+        message: error instanceof Error ? error.message : String(error),
+      });
     });
   });
 
@@ -39,9 +37,20 @@ app.post<{ Body: TelegramUpdate }>("/telegram/webhook", async (request, reply) =
   return reply.send({ ok: true });
 });
 
-const port = Number(process.env.PORT ?? process.env.BOT_PORT ?? 3100);
+const port = Number(process.env.PORT || 3100);
 const host = process.env.BOT_HOST ?? "127.0.0.1";
 const warmupEnabled = process.env.ENABLE_BOT_WARMUP === "true";
+const warmupDebug = process.env.BOT_WARMUP_DEBUG === "true";
+
+async function processUpdateAsync(update: TelegramUpdate) {
+  const { logTelegramWebhookParseError, processTelegramUpdate } = await import("./bot/handler.js");
+  try {
+    await processTelegramUpdate(update);
+  } catch (error: unknown) {
+    logTelegramWebhookParseError(error);
+    console.error(error);
+  }
+}
 
 function startWarmup() {
   if (!warmupEnabled) return;
@@ -49,8 +58,9 @@ function startWarmup() {
   const warmupTelegram = async () => {
     const startedAt = Date.now();
     try {
+      const { getTelegramMe } = await import("./telegram/api.js");
       await getTelegramMe();
-      console.log("telegram warmup", { target: "telegram", ms: Date.now() - startedAt });
+      if (warmupDebug) console.debug("telegram warmup", { target: "telegram", ms: Date.now() - startedAt });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.warn("telegram warmup failed", { target: "telegram", message });
@@ -60,9 +70,10 @@ function startWarmup() {
   const warmupSupabase = async () => {
     const startedAt = Date.now();
     try {
+      const { getSupabaseAdmin } = await import("./supabase/admin.js");
       const { error } = await getSupabaseAdmin().from("telegram_connections").select("id").limit(1);
       if (error) throw error;
-      console.log("telegram warmup", { target: "supabase", ms: Date.now() - startedAt });
+      if (warmupDebug) console.debug("telegram warmup", { target: "supabase", ms: Date.now() - startedAt });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.warn("telegram warmup failed", { target: "supabase", message });
@@ -71,19 +82,34 @@ function startWarmup() {
 
   setInterval(() => void warmupTelegram(), 45_000).unref();
   setInterval(() => void warmupSupabase(), 60_000).unref();
-  void warmupTelegram();
-  void warmupSupabase();
+  setTimeout(() => void warmupTelegram(), 1000).unref();
+  setTimeout(() => void warmupSupabase(), 1500).unref();
+}
+
+function preloadRuntimeModules() {
+  setTimeout(() => {
+    Promise.all([
+      import("./bot/handler.js"),
+      import("./telegram/api.js"),
+      import("./supabase/admin.js"),
+    ]).then(() => {
+      if (warmupDebug) console.debug("telegram startup preload", { service: "mini-crm-bot" });
+    }).catch((error: unknown) => {
+      console.warn("telegram startup preload failed", {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    });
+  }, 250).unref();
 }
 
 app.listen({ port, host }).then(() => {
   console.log("telegram bot listening", {
     service: "mini-crm-bot",
-    port,
     host,
-    nodeOptions: process.env.NODE_OPTIONS,
-    dnsDefaultResultOrder: dns.getDefaultResultOrder(),
+    port,
     warmupEnabled,
   });
+  preloadRuntimeModules();
   startWarmup();
 }).catch((error: unknown) => {
   if (error instanceof Error && "code" in error && error.code === "EADDRINUSE") {

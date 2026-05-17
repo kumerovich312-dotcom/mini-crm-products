@@ -29,7 +29,7 @@ export ENABLE_BOT_WARMUP=true
 set +a
 
 pm2 delete telegram-bot 2>/dev/null || true
-pm2 restart mini-crm-bot --update-env || pm2 start npm --name mini-crm-bot -- start
+pm2 restart mini-crm-bot --update-env || pm2 start dist/index.js --name mini-crm-bot --cwd /var/www/mini-crm-products/apps/telegram-bot
 pm2 save
 pm2 status
 ```
