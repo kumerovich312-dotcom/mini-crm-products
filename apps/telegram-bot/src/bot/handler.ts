@@ -67,9 +67,13 @@ type CachedConnection = {
 type DraftBrief = Pick<TelegramDraft, "id" | "step" | "mode" | "product_id" | "category_id" | "step_history">;
 
 const CONNECTION_CACHE_TTL_MS = 60_000;
+const CATEGORY_CACHE_TTL_MS = 120_000;
+const CUSTOM_FIELD_CACHE_TTL_MS = 120_000;
 const RECENT_UPDATE_TTL_MS = 120_000;
 const CLEANUP_QUEUE_LIMIT = 10;
 const connectionCache = new Map<string, { value: CachedConnection | null; expiresAt: number }>();
+const categoryCache = new Map<string, { value: Category[]; expiresAt: number }>();
+const customFieldCache = new Map<string, { value: CustomField[]; expiresAt: number }>();
 const recentUpdates = new Map<string, number>();
 const screenCleanupQueue = new Map<string, number[]>();
 
@@ -97,6 +101,19 @@ function cachedConnectionToConnection(chatId: string, cached: CachedConnection):
 
 function clearConnectionCache(chatId: string) {
   connectionCache.delete(chatId);
+}
+
+function getCachedCompanyItems<T>(cache: Map<string, { value: T[]; expiresAt: number }>, companyId: string) {
+  const cached = cache.get(companyId);
+  if (!cached || cached.expiresAt <= Date.now()) {
+    if (cached) cache.delete(companyId);
+    return null;
+  }
+  return cached.value;
+}
+
+function setCachedCompanyItems<T>(cache: Map<string, { value: T[]; expiresAt: number }>, companyId: string, value: T[], ttlMs: number) {
+  cache.set(companyId, { value, expiresAt: Date.now() + ttlMs });
 }
 
 function cleanupRecentUpdates(now = Date.now()) {
@@ -608,6 +625,9 @@ async function connectByCode(supabase: ReturnType<typeof getSupabaseAdmin>, chat
 }
 
 async function getCategories(supabase: ReturnType<typeof getSupabaseAdmin>, companyId: string) {
+  const cached = getCachedCompanyItems(categoryCache, companyId);
+  if (cached) return cached;
+
   const { data, error } = await supabase
     .from("categories")
     .select("*")
@@ -615,10 +635,16 @@ async function getCategories(supabase: ReturnType<typeof getSupabaseAdmin>, comp
     .eq("is_active", true)
     .order("sort_order", { ascending: true });
   if (error) throw error;
-  return ((data ?? []) as Category[]) ?? [];
+  const categories = ((data ?? []) as Category[]) ?? [];
+  setCachedCompanyItems(categoryCache, companyId, categories, CATEGORY_CACHE_TTL_MS);
+  return categories;
 }
 
 async function getCategory(supabase: ReturnType<typeof getSupabaseAdmin>, companyId: string, categoryId: string) {
+  const cached = getCachedCompanyItems(categoryCache, companyId);
+  const cachedCategory = cached?.find((category) => category.id === categoryId);
+  if (cachedCategory) return cachedCategory;
+
   const { data, error } = await supabase
     .from("categories")
     .select("*")
@@ -675,7 +701,7 @@ async function uploadTelegramMedia(
     }),
     30000,
     "Supabase storage upload timed out.",
-  );
+  ) as { error?: unknown };
   const { error: uploadError } = uploadResult;
   if (uploadError) throw uploadError;
   const { data } = supabase.storage.from(MEDIA_BUCKET).getPublicUrl(storagePath);
@@ -726,13 +752,18 @@ async function getCompanyAndCategory(supabase: ReturnType<typeof getSupabaseAdmi
 }
 
 async function getCustomFields(supabase: ReturnType<typeof getSupabaseAdmin>, companyId: string) {
+  const cached = getCachedCompanyItems(customFieldCache, companyId);
+  if (cached) return cached;
+
   const { data, error } = await supabase
     .from("custom_fields")
     .select("*")
     .eq("company_id", companyId)
     .order("sort_order", { ascending: true });
   if (error) throw error;
-  return ((data ?? []) as CustomField[]) ?? [];
+  const fields = ((data ?? []) as CustomField[]) ?? [];
+  setCachedCompanyItems(customFieldCache, companyId, fields, CUSTOM_FIELD_CACHE_TTL_MS);
+  return fields;
 }
 
 function fieldType(field: CustomField) {
@@ -1690,8 +1721,10 @@ async function handleCallback(supabase: ReturnType<typeof getSupabaseAdmin>, cal
   if (!chatId) return answerCallbackQuery(callback.id, "Чат не найден.");
   if (!callbackAnswered) {
     await answerCallbackQuery(callback.id, undefined, chatId);
+    callbackAnswered = true;
     logTiming("answer_callback", startedAt, chatId);
   }
+  const callbackIdForAction = callbackAnswered ? undefined : callback.id;
   const getConnectionStartedAt = Date.now();
   const connection = await getConnection(supabase, chatId);
   logTiming("get connection", getConnectionStartedAt, chatId);
@@ -1729,13 +1762,13 @@ async function handleCallback(supabase: ReturnType<typeof getSupabaseAdmin>, cal
   if (data === "draft:restart") return restartDraft(supabase, chatId, connection, draft);
   if (data === "draft:cancel") {
     await clearDrafts(supabase, connection.company_id, chatId);
-    await answerCallbackQuery(callback.id, "Действие отменено", chatId);
+    if (callbackIdForAction) await answerCallbackQuery(callbackIdForAction, "Действие отменено", chatId);
     return showCancelledMenu(supabase, chatId, connection, { messageId: callback.message?.message_id });
   }
   if (data === "busy:cont") return draft ? resumeDraft(supabase, chatId, draft, { connection, messageId: callback.message?.message_id }) : showMainMenu(supabase, chatId, connection, { messageId: callback.message?.message_id });
   if (data === "busy:new") {
     await clearDrafts(supabase, connection.company_id, chatId);
-    await answerCallbackQuery(callback.id, "Начните заново", chatId);
+    if (callbackIdForAction) await answerCallbackQuery(callbackIdForAction, "Начните заново", chatId);
     return showMainMenu(supabase, chatId, connection, { messageId: callback.message?.message_id });
   }
   if (data === "busy:menu") return showMainMenu(supabase, chatId, connection, { messageId: callback.message?.message_id });
@@ -1753,7 +1786,7 @@ async function handleCallback(supabase: ReturnType<typeof getSupabaseAdmin>, cal
       const { error } = await supabase.from("products").update({ category_id: categoryId }).eq("company_id", connection.company_id).eq("id", draft.product_id);
       if (error) throw error;
       await clearDrafts(supabase, connection.company_id, chatId);
-      await answerCallbackQuery(callback.id, "Сохранено", chatId);
+      if (callbackIdForAction) await answerCallbackQuery(callbackIdForAction, "Сохранено", chatId);
       return openProductCard(supabase, chatId, connection.company_id, draft.product_id, { connection, messageId: callback.message?.message_id });
     }
     const nextDraft = await updateDraft(supabase, draft, { category_id: categoryId, step: "wait_name" });
@@ -1771,12 +1804,12 @@ async function handleCallback(supabase: ReturnType<typeof getSupabaseAdmin>, cal
   if (data.startsWith("d:save:")) {
     if (!draft) return sendMessage(chatId, "Черновик не найден.");
     const result = await saveDraftAsProduct(supabase, draft, data.slice(7));
-    await answerCallbackQuery(callback.id, `Товар сохранён как черновик: ${result.sku}`, chatId);
+    if (callbackIdForAction) await answerCallbackQuery(callbackIdForAction, `Товар сохранён как черновик: ${result.sku}`, chatId);
     return showMainMenu(supabase, chatId, connection, { messageId: callback.message?.message_id });
   }
   if (data === "d:cancel") {
     await clearDrafts(supabase, connection.company_id, chatId);
-    await answerCallbackQuery(callback.id, "Действие отменено", chatId);
+    if (callbackIdForAction) await answerCallbackQuery(callbackIdForAction, "Действие отменено", chatId);
     return showCancelledMenu(supabase, chatId, connection, { messageId: callback.message?.message_id });
   }
   if (data === "d:edit") return sendDraftEditMenu(supabase, chatId, draft, { connection, messageId: callback.message?.message_id });
@@ -1786,16 +1819,16 @@ async function handleCallback(supabase: ReturnType<typeof getSupabaseAdmin>, cal
     return openProductCard(supabase, chatId, connection.company_id, data.slice(4), { connection, messageId: callback.message?.message_id });
   }
   if (data.startsWith("p:e:")) return startEditProduct(supabase, chatId, connection.company_id, data.slice(4), { connection, messageId: callback.message?.message_id });
-  if (data.startsWith("p:a:")) return toggleApi(supabase, chatId, connection.company_id, data.slice(4), { connection, messageId: callback.message?.message_id, callbackId: callback.id });
-  if (data.startsWith("p:v:")) return toggleVisibility(supabase, chatId, connection.company_id, data.slice(4), { connection, messageId: callback.message?.message_id, callbackId: callback.id });
+  if (data.startsWith("p:a:")) return toggleApi(supabase, chatId, connection.company_id, data.slice(4), { connection, messageId: callback.message?.message_id, callbackId: callbackIdForAction });
+  if (data.startsWith("p:v:")) return toggleVisibility(supabase, chatId, connection.company_id, data.slice(4), { connection, messageId: callback.message?.message_id, callbackId: callbackIdForAction });
   if (data.startsWith("efp:")) {
     const [, field, productId] = data.split(":");
     return askFieldValue(supabase, chatId, connection.company_id, productId, field, { connection, messageId: callback.message?.message_id });
   }
-  if (data.startsWith("st:")) return updateProductStatus(supabase, chatId, connection.company_id, data, { connection, messageId: callback.message?.message_id, callbackId: callback.id });
-  if (data.startsWith("med:")) return handleMediaCallback(supabase, chatId, connection.company_id, data, { connection, messageId: callback.message?.message_id, callbackId: callback.id });
+  if (data.startsWith("st:")) return updateProductStatus(supabase, chatId, connection.company_id, data, { connection, messageId: callback.message?.message_id, callbackId: callbackIdForAction });
+  if (data.startsWith("med:")) return handleMediaCallback(supabase, chatId, connection.company_id, data, { connection, messageId: callback.message?.message_id, callbackId: callbackIdForAction });
   if (data.startsWith("ecf:")) return handleEditCustomFieldChoice(supabase, chatId, connection.company_id, data, { connection, messageId: callback.message?.message_id });
-  if (data.startsWith("ecfb:") || data.startsWith("ecfo:")) return handleEditCustomCallback(supabase, chatId, connection.company_id, data, { connection, messageId: callback.message?.message_id, callbackId: callback.id });
+  if (data.startsWith("ecfb:") || data.startsWith("ecfo:")) return handleEditCustomCallback(supabase, chatId, connection.company_id, data, { connection, messageId: callback.message?.message_id, callbackId: callbackIdForAction });
 }
 
 async function resumeDraft(

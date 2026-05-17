@@ -42,6 +42,14 @@ class TelegramApiError extends Error {
   }
 }
 
+function errorCode(error: unknown) {
+  if (error instanceof Error && error.cause && typeof error.cause === "object" && "code" in error.cause) {
+    const code = (error.cause as { code?: unknown }).code;
+    return typeof code === "string" ? code : undefined;
+  }
+  return undefined;
+}
+
 function getTelegramToken() {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   if (!token) throw new Error("TELEGRAM_BOT_TOKEN is missing.");
@@ -80,7 +88,7 @@ function isFetchFailed(error: unknown) {
 
 export function isNonCriticalTelegramError(error: unknown) {
   const message = getErrorMessage(error).toLowerCase();
-  return message.includes("query is too old") || message.includes("message is not modified");
+  return message.includes("query is too old") || message.includes("query id is invalid") || message.includes("message is not modified");
 }
 
 export function isNonCriticalDeleteMessageError(error: unknown) {
@@ -107,6 +115,7 @@ function logTelegramApiError(method: TelegramMethod, action: string, chatId: str
     status,
     responseBody,
     message: getErrorMessage(error),
+    code: errorCode(error),
     cause: errorCause(error),
     networkError: isFetchFailed(error),
   });
@@ -120,10 +129,14 @@ function retryDelay(attempt: number) {
   return [300, 1000, 2500][attempt - 1] ?? 2500;
 }
 
+function safeTelegramFilePath(filePath: string) {
+  return filePath.split("/").at(-1) ?? "telegram-file";
+}
+
 function telegramApiRetryDelay(options: TelegramApiOptions, attempt: number) {
   if (typeof options.retryDelayMs === "function") return options.retryDelayMs(attempt);
   if (typeof options.retryDelayMs === "number") return options.retryDelayMs;
-  return retryDelay(attempt);
+  return 200;
 }
 
 async function parseTelegramBody(response: Response) {
@@ -152,7 +165,7 @@ function isRetryableTelegramApiError(error: unknown) {
 export async function telegramApi<T>(method: TelegramMethod, payload: Record<string, unknown>, options: TelegramApiOptions = {}) {
   const action = options.action ?? method;
   const chatId = options.chatId ?? (typeof payload.chat_id === "string" || typeof payload.chat_id === "number" ? String(payload.chat_id) : undefined);
-  const maxAttempts = options.maxAttempts ?? (isRetryableMethod(method) ? 3 : 1);
+  const maxAttempts = options.maxAttempts ?? (isRetryableMethod(method) ? 2 : 1);
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     const controller = new AbortController();
@@ -225,8 +238,8 @@ export async function deleteTelegramMessage(chatId: string, messageId: number, a
     action,
     chatId,
     timeoutMs: 5000,
-    maxAttempts: 3,
-    retryDelayMs: retryDelay,
+    maxAttempts: 2,
+    retryDelayMs: 200,
     suppressErrorLog: true,
   });
 }
@@ -266,10 +279,13 @@ export async function getTelegramFile(fileId: string) {
       return body.result ?? {};
     } catch (error) {
       if (!(error instanceof TelegramFileError && error.status && error.status < 500)) {
-        console.error("telegram file download error", {
+        console.error("Telegram file download error", {
+          stage: "getFile",
           message: getErrorMessage(error),
+          code: errorCode(error),
           cause: errorCause(error),
           attempt,
+          fileId,
         });
       }
       if (attempt < 3 && isRetryableFileError(error)) {
@@ -289,6 +305,7 @@ export async function getTelegramFile(fileId: string) {
 }
 
 export async function downloadTelegramFile(filePath: string) {
+  const path = safeTelegramFilePath(filePath);
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 30000);
@@ -302,17 +319,20 @@ export async function downloadTelegramFile(filePath: string) {
       }
 
       const buffer = await response.arrayBuffer();
-      console.log("telegram file", { stage: "download", attempt, bytes: buffer.byteLength });
+      console.log("telegram file", { stage: "download", attempt, bytes: buffer.byteLength, path });
       return {
         buffer,
         bytes: buffer.byteLength,
         contentType: response.headers.get("content-type") ?? undefined,
       };
     } catch (error) {
-      console.error("telegram file download error", {
+      console.error("Telegram file download error", {
+        stage: "download",
         message: getErrorMessage(error),
+        code: errorCode(error),
         cause: errorCause(error),
         attempt,
+        path,
       });
       if (attempt < 3 && isRetryableFileError(error)) {
         await sleep(retryDelay(attempt));

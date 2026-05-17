@@ -7,7 +7,7 @@
 - Deprecated CRM endpoint: `/api/telegram/webhook`
 - Telegram bot port: `3100`
 - Telegram bot should listen on `127.0.0.1`; Nginx proxies public traffic to it.
-- PM2 processes: `mini-crm` and `telegram-bot`
+- PM2 processes: `mini-crm` and `mini-crm-bot`
 - Run the Next.js CRM and Telegram bot as separate PM2 processes.
 - Required bot env: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`, Supabase env values, and `NODE_OPTIONS=--dns-result-order=ipv4first`.
 
