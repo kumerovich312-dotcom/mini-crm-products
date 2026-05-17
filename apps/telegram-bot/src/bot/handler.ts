@@ -64,6 +64,7 @@ type CachedConnection = {
   last_bot_message_id: number | null;
   active_screen_message_id: number | null;
 };
+type ProductListSource = "search" | "latest" | "unknown";
 
 const CONNECTION_CACHE_TTL_MS = 300_000;
 const CATEGORY_CACHE_TTL_MS = 300_000;
@@ -77,6 +78,7 @@ const customFieldCache = new Map<string, { value: CustomField[]; expiresAt: numb
 const recentUpdates = new Map<string, number>();
 const screenCleanupQueue = new Map<string, number[]>();
 const chatQueues = new Map<string, Promise<void>>();
+const searchResultsCache = new Map<string, { products: Product[]; companyId: string; expiresAt: number }>();
 let lastCallbackAt = 0;
 
 function logTiming(action: string, startedAt: number, chatId?: string) {
@@ -170,7 +172,7 @@ function keyboard(rows: InlineButton[][]) {
 function navRows(includeCancel = true): InlineButton[][] {
   return [
     [
-      { text: "⬅️ Назад", callback_data: "nav:back" },
+      { text: "⬅️ Назад", callback_data: "wizard:back" },
       { text: "🏠 Главное меню", callback_data: "nav:menu" },
     ],
     ...(includeCancel ? [[{ text: "❌ Отмена", callback_data: "draft:cancel" }]] : []),
@@ -232,8 +234,23 @@ async function safeEditOrSend(
       await editTelegramMessage(chatId, messageId, text, replyMarkup, action);
       return { mode: "edit" as const, messageId };
     } catch (error) {
-      if (isNonCriticalTelegramError(error)) {
+      const message = getErrorMessage(error).toLowerCase();
+      if (message.includes("message is not modified")) {
         return { mode: "edit" as const, messageId };
+      }
+      if (
+        message.includes("message to edit not found") ||
+        message.includes("message can't be edited") ||
+        isNonCriticalTelegramError(error)
+      ) {
+        console.warn("telegram screen edit fallback", {
+          action,
+          chatId,
+          messageId,
+          reason: getErrorMessage(error),
+        });
+      } else {
+        throw error;
       }
     }
   }
@@ -248,6 +265,11 @@ function enqueueScreenCleanup(chatId: string, messageId: number | null | undefin
   const next = [...current.filter((id) => id !== messageId), messageId].slice(-CLEANUP_QUEUE_LIMIT);
   screenCleanupQueue.set(chatId, next);
   console.log("telegram cleanup", { chatId, messageId, deleted: false, queued: true });
+}
+
+function isQueuedForCleanup(chatId: string, messageId: number | null | undefined) {
+  if (!messageId) return false;
+  return (screenCleanupQueue.get(chatId) ?? []).includes(messageId);
 }
 
 async function safeDeleteMessage(chatId: string, messageId: number | null | undefined, action: string) {
@@ -270,13 +292,18 @@ async function safeDeleteMessage(chatId: string, messageId: number | null | unde
   }
 }
 
-async function flushScreenCleanupQueue(chatId: string, action: string) {
+async function flushScreenCleanupQueue(chatId: string, action: string, protectedMessageIds: Array<number | null | undefined> = []) {
   const queued = screenCleanupQueue.get(chatId);
   if (!queued?.length) return;
 
   screenCleanupQueue.delete(chatId);
   const remaining: number[] = [];
+  const protectedIds = new Set(protectedMessageIds.filter((id): id is number => typeof id === "number"));
   for (const messageId of queued) {
+    if (protectedIds.has(messageId)) {
+      remaining.push(messageId);
+      continue;
+    }
     const deleted = await safeDeleteMessage(chatId, messageId, action);
     if (!deleted) remaining.push(messageId);
   }
@@ -320,8 +347,25 @@ async function renderTelegramScreen({
     screenConnection?.active_screen_message_id ??
     screenConnection?.last_bot_message_id ??
     screenConnection?.last_menu_message_id;
+  const targetQueuedForCleanup = isQueuedForCleanup(chatId, targetMessageId);
+  const canEditTarget = Boolean(targetMessageId && !targetQueuedForCleanup);
 
-  void flushScreenCleanupQueue(chatId, `cleanup_queue:${screen}`);
+  console.log("telegram screen render decision", {
+    mode: forceNew ? "force_new" : "edit_or_send",
+    screen,
+    chatId,
+    oldMessageId: targetMessageId,
+    willEdit: !forceNew && canEditTarget,
+    willSend: forceNew || !canEditTarget,
+    reason: forceNew ? "force_new" : targetQueuedForCleanup ? "target_queued_for_cleanup" : targetMessageId ? "target_available" : "no_target",
+  });
+
+  void flushScreenCleanupQueue(chatId, `cleanup_queue:${screen}`, [
+    targetMessageId,
+    screenConnection?.active_screen_message_id,
+    screenConnection?.last_bot_message_id,
+    screenConnection?.last_menu_message_id,
+  ]);
 
   let result: { mode: string; messageId: number };
   let oldMessageId: number | null | undefined;
@@ -331,8 +375,17 @@ async function renderTelegramScreen({
     result = { mode: "force_new", messageId: sent.message_id };
     console.log("telegram screen render", { mode: "force_new", screen, chatId, oldMessageId, newMessageId: sent.message_id });
   } else {
-    const editResult = await safeEditOrSend(chatId, targetMessageId, text, replyMarkup, `render_screen:${screen}`);
+    const editResult = await safeEditOrSend(chatId, canEditTarget ? targetMessageId : null, text, replyMarkup, `render_screen:${screen}`);
     result = editResult;
+    if (targetMessageId && result.mode === "send") {
+      console.warn("telegram screen fallback", {
+        from: "edit",
+        to: "send",
+        reason: targetQueuedForCleanup ? "target_queued_for_cleanup" : "edit_failed_or_missing_target",
+        oldMessageId: targetMessageId,
+        newMessageId: result.messageId,
+      });
+    }
     console.log("telegram screen render", { mode: result.mode, screen, chatId, oldMessageId: targetMessageId, newMessageId: result.messageId });
   }
 
@@ -347,6 +400,12 @@ async function renderTelegramScreen({
   if (forceNew && oldMessageId && oldMessageId !== result.messageId) {
     void safeDeleteMessage(chatId, oldMessageId, `delete_for_new:${screen}`).then((deleted) => {
       if (!deleted) enqueueScreenCleanup(chatId, oldMessageId);
+      const cached = connectionCache.get(chatId);
+      if (deleted && cached?.value) {
+        if (cached.value.active_screen_message_id === oldMessageId) cached.value.active_screen_message_id = result.messageId;
+        if (cached.value.last_bot_message_id === oldMessageId) cached.value.last_bot_message_id = result.messageId;
+        if (cached.value.last_menu_message_id === oldMessageId && screen === "main_menu") cached.value.last_menu_message_id = result.messageId;
+      }
     });
   }
 
@@ -450,6 +509,40 @@ function parseStock(value: string) {
 
 function normalize(value: string) {
   return value.trim().toLowerCase();
+}
+
+function sourceToCode(source: ProductListSource) {
+  if (source === "search") return "s";
+  if (source === "latest") return "l";
+  return "u";
+}
+
+function codeToSource(code: string | undefined): ProductListSource {
+  if (code === "s") return "search";
+  if (code === "l") return "latest";
+  return "unknown";
+}
+
+function productOpenCallback(productId: string, source: ProductListSource) {
+  const code = sourceToCode(source);
+  return code === "u" ? `p:o:${productId}` : `p:o:${productId}:${code}`;
+}
+
+function productBackCallback(productId: string, source: ProductListSource) {
+  return `p:b:${productId}:${sourceToCode(source)}`;
+}
+
+function setSearchResultsCache(chatId: string, companyId: string, products: Product[]) {
+  searchResultsCache.set(chatId, { companyId, products, expiresAt: Date.now() + 10 * 60_000 });
+}
+
+function getSearchResultsCache(chatId: string, companyId: string) {
+  const cached = searchResultsCache.get(chatId);
+  if (!cached || cached.companyId !== companyId || cached.expiresAt <= Date.now()) {
+    if (cached) searchResultsCache.delete(chatId);
+    return null;
+  }
+  return cached.products;
 }
 
 function mediaUploadErrorMessage(error: unknown) {
@@ -1148,6 +1241,16 @@ function productStatusLabel(status: string) {
   return labels[status] ?? status;
 }
 
+function productApiSummary(product: Product) {
+  return [
+    "Товар:",
+    `📦 Название: ${product.name?.trim() || "не указано"}`,
+    `🆔 SKU: ${product.sku || "не указан"}`,
+    `Статус: ${productStatusLabel(product.status || "hidden")}`,
+    `API/Бот: ${product.is_visible_in_api ? "да" : "нет"}`,
+  ];
+}
+
 async function getProduct(supabase: ReturnType<typeof getSupabaseAdmin>, companyId: string, productId: string) {
   const { data, error } = await supabase.from("products").select("*").eq("company_id", companyId).eq("id", productId).maybeSingle();
   if (error) throw error;
@@ -1174,10 +1277,11 @@ async function sendProductList(
   supabase: ReturnType<typeof getSupabaseAdmin>,
   chatId: string,
   products: Product[],
-  options: { connection?: TelegramConnection | null; messageId?: number | null; forceNew?: boolean } = {},
+  options: { connection?: TelegramConnection | null; messageId?: number | null; forceNew?: boolean; source?: ProductListSource; expired?: boolean } = {},
 ) {
   const connection = options.connection ?? (await getConnection(supabase, chatId));
   const companyId = connection?.company_id ?? products[0]?.company_id;
+  const source = options.source ?? "search";
   if (products.length === 0) {
     if (!companyId) return sendMessage(chatId, "Товары не найдены.");
     await renderTelegramScreen({
@@ -1186,7 +1290,7 @@ async function sendProductList(
       companyId,
       connection,
       screen: "search_results",
-      text: "Товары не найдены.",
+      text: options.expired ? "Результаты поиска устарели.\n\nТовары не найдены." : "Товары не найдены.",
       rows: [[{ text: "🏠 Главное меню", callback_data: "nav:menu" }]],
       preferMessageId: options.messageId,
       nav: false,
@@ -1194,9 +1298,16 @@ async function sendProductList(
     });
     return;
   }
-  const text = ["Товары", ...products.map((product) => `${product.sku} — ${product.name}`)].join("\n");
-  const rows = products.map((product) => [{ text: `${product.sku} — ${product.name}`, callback_data: `p:o:${product.id}` }]);
-  rows.push([{ text: "🏠 Главное меню", callback_data: "nav:menu" }]);
+  if (source === "search") setSearchResultsCache(chatId, products[0].company_id, products);
+  const title = source === "latest" ? "Последние товары" : options.expired ? "Результаты поиска устарели" : "Товары";
+  const text = [title, ...products.map((product) => `${product.sku} — ${product.name}`)].join("\n");
+  const rows = products.map((product) => [{ text: `${product.sku} — ${product.name}`, callback_data: productOpenCallback(product.id, source) }]);
+  rows.push(source === "search"
+    ? [
+      { text: "⬅️ Назад", callback_data: "search:back" },
+      { text: "🏠 Главное меню", callback_data: "nav:menu" },
+    ]
+    : [{ text: "🏠 Главное меню", callback_data: "nav:menu" }]);
   await renderTelegramScreen({
     supabase,
     chatId,
@@ -1216,7 +1327,7 @@ async function openProductCard(
   chatId: string,
   companyId: string,
   productId: string,
-  options: { connection?: TelegramConnection | null; messageId?: number | null; forceNew?: boolean } = {},
+  options: { connection?: TelegramConnection | null; messageId?: number | null; forceNew?: boolean; source?: ProductListSource } = {},
 ) {
   const connection = options.connection ?? (await getConnection(supabase, chatId));
   const product = await getProduct(supabase, companyId, productId);
@@ -1259,11 +1370,15 @@ async function openProductCard(
     ],
     [
       { text: "📦 Остаток", callback_data: `efp:stock:${product.id}` },
-      { text: "🤖 API", callback_data: `p:a:${product.id}` },
+      { text: "🤖 API", callback_data: `p:a:${product.id}:${sourceToCode(options.source ?? "unknown")}` },
     ],
     [
       { text: product.status === "hidden" ? "🙈 Показать" : "🙈 Скрыть", callback_data: `p:v:${product.id}` },
       { text: "🖼 Медиа", callback_data: `efp:media:${product.id}` },
+    ],
+    [
+      { text: "⬅️ Назад", callback_data: productBackCallback(product.id, options.source ?? "unknown") },
+      { text: "🏠 Главное меню", callback_data: "nav:menu" },
     ],
   ];
   await renderTelegramScreen({
@@ -1275,7 +1390,7 @@ async function openProductCard(
     text,
     rows,
     preferMessageId: options.messageId,
-    cancel: false,
+    nav: false,
     forceNew: options.forceNew,
   });
 }
@@ -1340,7 +1455,7 @@ async function startEditProduct(
   await sendEditProductMenu(supabase, chatId, companyId, productId, options);
 }
 
-type CallbackRenderOptions = { connection?: TelegramConnection; messageId?: number | null; callbackId?: string };
+type CallbackRenderOptions = { connection?: TelegramConnection; messageId?: number | null; callbackId?: string; source?: ProductListSource };
 
 async function toggleVisibility(
   supabase: ReturnType<typeof getSupabaseAdmin>,
@@ -1363,6 +1478,145 @@ async function toggleVisibility(
   await openProductCard(supabase, chatId, companyId, productId, options);
 }
 
+async function showProductApiScreen(
+  supabase: ReturnType<typeof getSupabaseAdmin>,
+  chatId: string,
+  companyId: string,
+  productId: string,
+  options: CallbackRenderOptions & { error?: boolean; retryAction?: "activate" | "activate_enable" | "enable" | "disable" } = {},
+) {
+  const connection = options.connection ?? (await getConnection(supabase, chatId));
+  const product = await getProduct(supabase, companyId, productId);
+  if (!product) return sendMessage(chatId, "Товар не найден.");
+
+  const active = product.status === "active";
+  const enabled = Boolean(product.is_visible_in_api);
+  const sourceCode = sourceToCode(options.source ?? "unknown");
+  console.log("telegram product api", {
+    action: options.error ? "error_screen" : "screen",
+    productId,
+    chatId,
+    enabled,
+    active,
+  });
+
+  if (options.error) {
+    return renderTelegramScreen({
+      supabase,
+      chatId,
+      companyId,
+      connection,
+      screen: "product_api_error",
+      text: [
+        "Не удалось изменить API-доступ. Попробуйте ещё раз.",
+        "",
+        ...productApiSummary(product),
+      ].join("\n"),
+      rows: [
+        [{ text: "🔄 Повторить", callback_data: options.retryAction ? `p:api:${options.retryAction}:${product.id}:${sourceCode}` : `p:a:${product.id}:${sourceCode}` }],
+        [
+          { text: "⬅️ Назад к товару", callback_data: `p:api:back:${product.id}:${sourceCode}` },
+          { text: "🏠 Главное меню", callback_data: "nav:menu" },
+        ],
+      ],
+      preferMessageId: options.messageId,
+      nav: false,
+    });
+  }
+
+  if (!active) {
+    return renderTelegramScreen({
+      supabase,
+      chatId,
+      companyId,
+      connection,
+      screen: "product_api_unavailable",
+      text: [
+        "⚠️ API-доступ недоступен",
+        "",
+        "Чтобы включить API/бот-доступ, сначала активируйте товар.",
+        "",
+        ...productApiSummary(product),
+      ].join("\n"),
+      rows: [
+        [{ text: "✅ Активировать и включить API", callback_data: `p:api:activate_enable:${product.id}:${sourceCode}` }],
+        [{ text: "✅ Только активировать", callback_data: `p:api:activate:${product.id}:${sourceCode}` }],
+        [
+          { text: "⬅️ Назад к товару", callback_data: `p:api:back:${product.id}:${sourceCode}` },
+          { text: "🏠 Главное меню", callback_data: "nav:menu" },
+        ],
+      ],
+      preferMessageId: options.messageId,
+      nav: false,
+    });
+  }
+
+  return renderTelegramScreen({
+    supabase,
+    chatId,
+    companyId,
+    connection,
+    screen: "product_api",
+    text: [
+      "🤖 API/Бот-доступ",
+      "",
+      ...productApiSummary(product),
+    ].join("\n"),
+    rows: [
+      [
+        enabled
+          ? { text: "🚫 Отключить API", callback_data: `p:api:disable:${product.id}:${sourceCode}` }
+          : { text: "✅ Включить API", callback_data: `p:api:enable:${product.id}:${sourceCode}` },
+      ],
+      [
+        { text: "⬅️ Назад к товару", callback_data: `p:api:back:${product.id}:${sourceCode}` },
+        { text: "🏠 Главное меню", callback_data: "nav:menu" },
+      ],
+    ],
+    preferMessageId: options.messageId,
+    nav: false,
+  });
+}
+
+async function updateProductApiAccess(
+  supabase: ReturnType<typeof getSupabaseAdmin>,
+  chatId: string,
+  companyId: string,
+  productId: string,
+  action: "activate" | "activate_enable" | "enable" | "disable",
+  options: CallbackRenderOptions = {},
+) {
+  const enabled = action === "activate_enable" || action === "enable";
+  const active = action === "activate" || action === "activate_enable";
+  const payload =
+    action === "activate"
+      ? { status: "active" as ProductStatus }
+      : action === "activate_enable"
+        ? { status: "active" as ProductStatus, is_visible_in_api: true }
+        : { is_visible_in_api: enabled };
+
+  console.log("telegram product api", { action, productId, chatId, enabled, active });
+
+  try {
+    const { error } = await supabase
+      .from("products")
+      .update(payload)
+      .eq("company_id", companyId)
+      .eq("id", productId);
+    if (error) throw error;
+  } catch (error) {
+    console.warn("telegram product api update failed", {
+      action,
+      productId,
+      chatId,
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return showProductApiScreen(supabase, chatId, companyId, productId, { ...options, error: true, retryAction: action });
+  }
+
+  return openProductCard(supabase, chatId, companyId, productId, options);
+}
+
 async function toggleApi(
   supabase: ReturnType<typeof getSupabaseAdmin>,
   chatId: string,
@@ -1370,15 +1624,7 @@ async function toggleApi(
   productId: string,
   options: CallbackRenderOptions = {},
 ) {
-  const product = await getProduct(supabase, companyId, productId);
-  if (!product) return sendMessage(chatId, "Товар не найден.");
-  if (product.status !== "active") return sendMessage(chatId, "Сначала активируйте товар.");
-  if (product.stock <= 0) return sendMessage(chatId, "Нельзя включить API: остаток 0.");
-  const nextValue = !product.is_visible_in_api;
-  const { error } = await supabase.from("products").update({ is_visible_in_api: nextValue }).eq("company_id", companyId).eq("id", productId);
-  if (error) throw error;
-  if (options.callbackId) await answerCallbackQuery(options.callbackId, nextValue ? "API включён" : "API выключен", chatId);
-  await openProductCard(supabase, chatId, companyId, productId, options);
+  return showProductApiScreen(supabase, chatId, companyId, productId, options);
 }
 
 async function showStats(
@@ -1810,7 +2056,7 @@ async function handleAddDraftText(supabase: ReturnType<typeof getSupabaseAdmin>,
     const products = await findProducts(supabase, draft.company_id, text);
     await clearDrafts(supabase, draft.company_id, chatId);
     if (draft.step === "wait_edit_search" && products.length === 1) return startEditProduct(supabase, chatId, draft.company_id, products[0].id, { forceNew: true });
-    return sendProductList(supabase, chatId, products, { forceNew: true });
+    return sendProductList(supabase, chatId, products, { connection, forceNew: true, source: "search" });
   }
   await renderTelegramScreen({ supabase, chatId, companyId: draft.company_id, connection, screen: draft.step, text: "Нажмите кнопку под сообщением.", rows: [], forceNew: true });
 }
@@ -1891,14 +2137,7 @@ async function handleMenuAction(
     return renderTelegramScreen({ supabase, chatId, companyId: connection.company_id, connection, screen: "edit_search_prompt", text: "Введите SKU или название товара.", rows: [], preferMessageId: messageId, forceNew });
   }
   if (action === "latest_products") {
-    const { data, error } = await supabase
-      .from("products")
-      .select("id, company_id, sku, name, price, stock, status, is_visible_in_api, updated_at")
-      .eq("company_id", connection.company_id)
-      .order("updated_at", { ascending: false })
-      .limit(5);
-    if (error) throw error;
-    return sendProductList(supabase, chatId, ((data ?? []) as Product[]) ?? [], { connection, messageId, forceNew });
+    return showLatestProductsScreen(supabase, chatId, connection, { messageId, forceNew });
   }
   if (action === "stats") return showStats(supabase, chatId, connection.company_id, { connection, messageId, forceNew });
 }
@@ -1926,6 +2165,85 @@ async function restartDraft(supabase: ReturnType<typeof getSupabaseAdmin>, chatI
   }
   if (mode === "edit" && productId) return startEditProduct(supabase, chatId, connection.company_id, productId);
   return startAddWizard(supabase, chatId, connection);
+}
+
+async function showLatestProductsScreen(
+  supabase: ReturnType<typeof getSupabaseAdmin>,
+  chatId: string,
+  connection: TelegramConnection,
+  options: { messageId?: number | null; forceNew?: boolean } = {},
+) {
+  const { data, error } = await supabase
+    .from("products")
+    .select("id, company_id, sku, name, price, stock, status, is_visible_in_api, updated_at")
+    .eq("company_id", connection.company_id)
+    .order("updated_at", { ascending: false })
+    .limit(5);
+  if (error) throw error;
+  return sendProductList(supabase, chatId, ((data ?? []) as Product[]) ?? [], {
+    connection,
+    messageId: options.messageId,
+    forceNew: options.forceNew,
+    source: "latest",
+  });
+}
+
+async function showExpiredSearchFallback(
+  supabase: ReturnType<typeof getSupabaseAdmin>,
+  chatId: string,
+  connection: TelegramConnection,
+  messageId?: number | null,
+) {
+  return renderTelegramScreen({
+    supabase,
+    chatId,
+    companyId: connection.company_id,
+    connection,
+    screen: "main_menu",
+    text: "Результаты поиска устарели.\n\nГлавное меню",
+    rows: mainMenuRows(),
+    preferMessageId: messageId,
+    nav: false,
+  });
+}
+
+async function handleProductBack(
+  supabase: ReturnType<typeof getSupabaseAdmin>,
+  chatId: string,
+  connection: TelegramConnection,
+  productId: string,
+  source: ProductListSource,
+  messageId?: number | null,
+) {
+  const fromScreen = "product_card";
+  if (source === "search") {
+    const cached = getSearchResultsCache(chatId, connection.company_id);
+    console.log("telegram nav back", { chatId, context: "product", fromScreen, toScreen: cached ? "search_results" : "main_menu", productId });
+    if (cached) return sendProductList(supabase, chatId, cached, { connection, messageId, source: "search" });
+    console.warn("telegram nav back fallback", { chatId, reason: "search_results_expired", action: "p:b" });
+    return showExpiredSearchFallback(supabase, chatId, connection, messageId);
+  }
+
+  if (source === "latest") {
+    console.log("telegram nav back", { chatId, context: "product", fromScreen, toScreen: "latest_products", productId });
+    return showLatestProductsScreen(supabase, chatId, connection, { messageId });
+  }
+
+  console.warn("telegram nav back fallback", { chatId, reason: "unknown_product_source", action: "p:b" });
+  console.log("telegram nav back", { chatId, context: "product", fromScreen, toScreen: "main_menu", productId });
+  return showMainMenu(supabase, chatId, connection, { messageId });
+}
+
+async function handleProductApiBack(
+  supabase: ReturnType<typeof getSupabaseAdmin>,
+  chatId: string,
+  connection: TelegramConnection,
+  productId: string,
+  source: ProductListSource,
+  messageId?: number | null,
+) {
+  console.log("telegram nav back", { chatId, context: "product_api", fromScreen: "product_api", toScreen: "product_card", productId });
+  return openProductCard(supabase, chatId, connection.company_id, productId, { connection, messageId, source });
 }
 
 function parseStepHistoryEntry(entry: string) {
@@ -1994,7 +2312,7 @@ async function handleWizardBack(
   const connection = options.connection ?? (await getConnection(supabase, chatId));
   if (!draft) {
     console.warn("telegram wizard back ignored", { chatId, currentStep: null, reason: "no_draft" });
-    return connection ? showMainMenu(supabase, chatId, connection, { messageId: options.messageId }) : sendMessage(chatId, "Нечего возвращать назад.");
+    return;
   }
 
   const history = Array.isArray(draft.step_history) ? draft.step_history : [];
@@ -2086,8 +2404,66 @@ async function handleCallback(supabase: ReturnType<typeof getSupabaseAdmin>, cal
     return;
   }
 
+  if (data.startsWith("p:o:")) {
+    const [, , productId, sourceCode] = data.split(":");
+    await clearDrafts(supabase, connection.company_id, chatId);
+    return openProductCard(supabase, chatId, connection.company_id, productId, {
+      connection,
+      messageId: callback.message?.message_id,
+      source: codeToSource(sourceCode),
+    });
+  }
+  if (data.startsWith("p:b:")) {
+    const [, , productId, sourceCode] = data.split(":");
+    return handleProductBack(supabase, chatId, connection, productId, codeToSource(sourceCode), callback.message?.message_id);
+  }
+  if (data.startsWith("p:api:back:")) {
+    const [, , , productId, sourceCode] = data.split(":");
+    return handleProductApiBack(supabase, chatId, connection, productId, codeToSource(sourceCode), callback.message?.message_id);
+  }
+  if (data.startsWith("p:api:")) {
+    const [, , apiAction, productId, sourceCode] = data.split(":");
+    if (!productId) return sendMessage(chatId, "Товар не найден.");
+    if (apiAction === "activate" || apiAction === "activate_enable" || apiAction === "enable" || apiAction === "disable") {
+      return updateProductApiAccess(supabase, chatId, connection.company_id, productId, apiAction, {
+        connection,
+        messageId: callback.message?.message_id,
+        source: codeToSource(sourceCode),
+      });
+    }
+    return sendMessage(chatId, "Действие API не найдено.");
+  }
+  if (data.startsWith("p:a:")) {
+    const [, , productId, sourceCode] = data.split(":");
+    return toggleApi(supabase, chatId, connection.company_id, productId, {
+      connection,
+      messageId: callback.message?.message_id,
+      callbackId: callbackIdForAction,
+      source: codeToSource(sourceCode),
+    });
+  }
+  if (data === "search:back") {
+    console.log("telegram nav back", { chatId, context: "search", fromScreen: "search_results", toScreen: "search_prompt" });
+    await createDraft(supabase, connection.company_id, chatId, "find", "wait_find");
+    return renderTelegramScreen({
+      supabase,
+      chatId,
+      companyId: connection.company_id,
+      connection,
+      screen: "search_prompt",
+      text: "Введите название, SKU или ключевое слово.",
+      rows: [],
+      preferMessageId: callback.message?.message_id,
+    });
+  }
+
   const draft = await getActiveDraft(supabase, connection.company_id, chatId);
-  if (data === "nav:back") return handleWizardBack(supabase, chatId, draft, { connection, messageId: callback.message?.message_id });
+  if (data === "wizard:back") return handleWizardBack(supabase, chatId, draft, { connection, messageId: callback.message?.message_id });
+  if (data === "nav:back") {
+    if (draft) return handleWizardBack(supabase, chatId, draft, { connection, messageId: callback.message?.message_id });
+    console.warn("telegram nav back fallback", { chatId, reason: "legacy_nav_back_without_draft", action: "nav:back" });
+    return;
+  }
   if (data === "draft:resume") return draft ? resumeDraft(supabase, chatId, draft, { connection, messageId: callback.message?.message_id }) : showMainMenu(supabase, chatId, connection, { messageId: callback.message?.message_id });
   if (data === "draft:restart") return restartDraft(supabase, chatId, connection, draft);
   if (data === "draft:cancel") {
@@ -2159,12 +2535,7 @@ async function handleCallback(supabase: ReturnType<typeof getSupabaseAdmin>, cal
   }
   if (data === "d:edit") return sendDraftEditMenu(supabase, chatId, draft, { connection, messageId: callback.message?.message_id });
   if (data.startsWith("de:")) return handleDraftEditChoice(supabase, chatId, connection.company_id, draft, data.slice(3), { connection, messageId: callback.message?.message_id });
-  if (data.startsWith("p:o:")) {
-    await clearDrafts(supabase, connection.company_id, chatId);
-    return openProductCard(supabase, chatId, connection.company_id, data.slice(4), { connection, messageId: callback.message?.message_id });
-  }
   if (data.startsWith("p:e:")) return startEditProduct(supabase, chatId, connection.company_id, data.slice(4), { connection, messageId: callback.message?.message_id });
-  if (data.startsWith("p:a:")) return toggleApi(supabase, chatId, connection.company_id, data.slice(4), { connection, messageId: callback.message?.message_id, callbackId: callbackIdForAction });
   if (data.startsWith("p:v:")) return toggleVisibility(supabase, chatId, connection.company_id, data.slice(4), { connection, messageId: callback.message?.message_id, callbackId: callbackIdForAction });
   if (data.startsWith("efp:")) {
     const [, field, productId] = data.split(":");

@@ -93,7 +93,9 @@ export function isNonCriticalTelegramError(error: unknown) {
     message.includes("query is too old") ||
     message.includes("query id is invalid") ||
     message.includes("response timeout expired") ||
-    message.includes("message is not modified")
+    message.includes("message is not modified") ||
+    message.includes("message to edit not found") ||
+    message.includes("message can't be edited")
   );
 }
 
@@ -220,7 +222,7 @@ export async function editTelegramMessage(
   try {
     return await telegramApi("editMessageText", { chat_id: chatId, message_id: messageId, text, reply_markup: replyMarkup }, { action, chatId });
   } catch (error) {
-    if (isNonCriticalTelegramError(error)) return null;
+    if (getErrorMessage(error).toLowerCase().includes("message is not modified")) return null;
     throw error;
   }
 }
