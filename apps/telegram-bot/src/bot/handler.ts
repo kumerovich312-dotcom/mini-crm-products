@@ -2102,13 +2102,18 @@ export async function processTelegramUpdate(update: TelegramUpdate) {
     const supabase = getSupabaseAdmin();
     if (update.callback_query) await handleCallback(supabase, update.callback_query, callbackAnswered);
     else if (update.message) await handleMessage(supabase, update.message);
+    else {
+      console.log("telegram unknown update", {
+        updateId: update.update_id,
+        keys: Object.keys(update as Record<string, unknown>),
+      });
+    }
     logTiming(String(action), startedAt, chatId);
     logTotalTiming(String(action), startedAt, chatId);
   } catch (error) {
     logTelegramError("webhook_async", error, { action, chatId });
     logTiming("webhook_error", startedAt);
     logTotalTiming("webhook_error", startedAt);
-    throw error;
   } finally {
     console.log("telegram async processing", { ms: Date.now() - startedAt });
   }

@@ -30,9 +30,15 @@ app.post<{ Body: TelegramUpdate }>("/telegram/webhook", async (request, reply) =
 });
 
 const port = Number(process.env.BOT_PORT ?? 3100);
+const host = process.env.BOT_HOST ?? "127.0.0.1";
 
-app.listen({ port, host: "0.0.0.0" }).then(() => {
-  console.log("telegram bot listening", { port });
+app.listen({ port, host }).then(() => {
+  console.log("telegram bot listening", {
+    port,
+    host,
+    nodeOptions: process.env.NODE_OPTIONS,
+    dnsDefaultResultOrder: dns.getDefaultResultOrder(),
+  });
 }).catch((error: unknown) => {
   console.error(error);
   process.exit(1);

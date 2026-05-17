@@ -98,12 +98,17 @@ function errorCause(error: unknown) {
 }
 
 function logTelegramApiError(method: TelegramMethod, action: string, chatId: string | undefined, error: unknown) {
+  const status = error instanceof TelegramApiError ? error.status : undefined;
+  const responseBody = error instanceof TelegramApiError ? error.body : undefined;
   console.error("Telegram API error", {
     method,
     action,
     chatId,
+    status,
+    responseBody,
     message: getErrorMessage(error),
     cause: errorCause(error),
+    networkError: isFetchFailed(error),
   });
 }
 
@@ -117,7 +122,8 @@ function retryDelay(attempt: number) {
 
 function telegramApiRetryDelay(options: TelegramApiOptions, attempt: number) {
   if (typeof options.retryDelayMs === "function") return options.retryDelayMs(attempt);
-  return options.retryDelayMs ?? 200;
+  if (typeof options.retryDelayMs === "number") return options.retryDelayMs;
+  return retryDelay(attempt);
 }
 
 async function parseTelegramBody(response: Response) {
@@ -146,7 +152,7 @@ function isRetryableTelegramApiError(error: unknown) {
 export async function telegramApi<T>(method: TelegramMethod, payload: Record<string, unknown>, options: TelegramApiOptions = {}) {
   const action = options.action ?? method;
   const chatId = options.chatId ?? (typeof payload.chat_id === "string" || typeof payload.chat_id === "number" ? String(payload.chat_id) : undefined);
-  const maxAttempts = options.maxAttempts ?? (isRetryableMethod(method) ? 2 : 1);
+  const maxAttempts = options.maxAttempts ?? (isRetryableMethod(method) ? 3 : 1);
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     const controller = new AbortController();
@@ -202,7 +208,12 @@ export async function editTelegramMessage(
 
 export async function answerCallbackQuery(callbackQueryId: string, text?: string, chatId?: string) {
   try {
-    return await telegramApi("answerCallbackQuery", { callback_query_id: callbackQueryId, text }, { action: "answer_callback", chatId });
+    return await telegramApi("answerCallbackQuery", { callback_query_id: callbackQueryId, text }, {
+      action: "answer_callback",
+      chatId,
+      maxAttempts: 2,
+      retryDelayMs: 200,
+    });
   } catch (error) {
     console.warn("Telegram API answerCallbackQuery ignored", { message: getErrorMessage(error), cause: errorCause(error) });
     return null;
