@@ -1,4 +1,7 @@
 import { getSupabaseAdmin } from "../supabase/admin.js";
+import { AiUnavailableError, generateProductAi, transcribeAudio, type ProductAiResult } from "../ai/client.js";
+import type { ProductAiAction, ProductAiInput } from "../ai/productPrompts.js";
+import { parseProductVoiceTranscript, type ProductVoiceParseResult, type VoiceDraftContext } from "../ai/productVoiceParser.js";
 import {
   answerCallbackQuery,
   deleteTelegramMessage,
@@ -17,6 +20,12 @@ import { createId, getErrorMessage } from "./utils.js";
 const MEDIA_BUCKET = "product-media";
 const NOT_CONNECTED = "Сначала подключите бота. Откройте CRM → Настройки → Telegram-бот и отправьте сюда код подключения.";
 const TELEGRAM_FILE_SIZE_LIMIT_BYTES = 300 * 1024 * 1024;
+const AI_VOICE_FILE_SIZE_LIMIT_BYTES = 25 * 1024 * 1024;
+const VOICE_TRANSCRIPT_KEY = "__voice_transcript";
+const VOICE_ATTRIBUTES_KEY = "__voice_attributes";
+const VOICE_WEIGHT_KEY = "__voice_weight";
+const VOICE_MISSING_KEY = "__voice_missing_required";
+const VOICE_CATEGORY_SUGGESTION_KEY = "__voice_category_suggestion";
 
 type TelegramConnection = {
   id: string;
@@ -65,6 +74,15 @@ type CachedConnection = {
   active_screen_message_id: number | null;
 };
 type ProductListSource = "search" | "latest" | "unknown";
+type ProductAiCacheItem = {
+  chatId: string;
+  companyId: string;
+  productId: string;
+  action: ProductAiAction;
+  result: ProductAiResult;
+  source: ProductListSource;
+  expiresAt: number;
+};
 
 const CONNECTION_CACHE_TTL_MS = 300_000;
 const CATEGORY_CACHE_TTL_MS = 300_000;
@@ -79,6 +97,7 @@ const recentUpdates = new Map<string, number>();
 const screenCleanupQueue = new Map<string, number[]>();
 const chatQueues = new Map<string, Promise<void>>();
 const searchResultsCache = new Map<string, { products: Product[]; companyId: string; expiresAt: number }>();
+const productAiCache = new Map<string, ProductAiCacheItem>();
 let lastCallbackAt = 0;
 
 function logTiming(action: string, startedAt: number, chatId?: string) {
@@ -467,6 +486,18 @@ function getMessageMedia(message: TelegramMessage) {
   };
 }
 
+function getMessageVoiceMedia(message: TelegramMessage) {
+  const voice = message.voice ?? null;
+  const audio = message.audio ?? null;
+  const videoNote = message.video_note ?? null;
+  if (!voice && !audio && !videoNote) return null;
+  const fileId = voice?.file_id ?? audio?.file_id ?? videoNote?.file_id ?? "";
+  const fileSize = voice?.file_size ?? audio?.file_size ?? videoNote?.file_size ?? null;
+  const contentType = voice?.mime_type ?? audio?.mime_type ?? (videoNote ? "video/mp4" : undefined);
+  const fileName = audio?.file_name ?? (voice ? "voice.oga" : "video-note.mp4");
+  return { fileId, fileSize, contentType, fileName };
+}
+
 async function downloadTelegramFile(fileId: string) {
   const file = await getTelegramFile(fileId);
   if (!file.file_path) throw new Error("Telegram did not return file_path.");
@@ -475,6 +506,25 @@ async function downloadTelegramFile(fileId: string) {
   }
 
   const downloaded = await downloadTelegramFileByPath(file.file_path);
+  return {
+    buffer: downloaded.buffer,
+    filePath: file.file_path,
+    fileSize: file.file_size ?? downloaded.bytes,
+    contentType: downloaded.contentType,
+  };
+}
+
+async function downloadTelegramVoiceFile(fileId: string) {
+  const file = await getTelegramFile(fileId);
+  if (!file.file_path) throw new Error("Telegram did not return file_path.");
+  if (file.file_size && file.file_size > AI_VOICE_FILE_SIZE_LIMIT_BYTES) {
+    throw new TelegramFileError("Telegram voice file is too large.", "file_too_large", undefined, { file_size: file.file_size });
+  }
+
+  const downloaded = await downloadTelegramFileByPath(file.file_path);
+  if (downloaded.bytes > AI_VOICE_FILE_SIZE_LIMIT_BYTES) {
+    throw new TelegramFileError("Telegram voice file is too large.", "file_too_large", undefined, { file_size: downloaded.bytes });
+  }
   return {
     buffer: downloaded.buffer,
     filePath: file.file_path,
@@ -1205,7 +1255,7 @@ async function saveDraftAsProduct(supabase: ReturnType<typeof getSupabaseAdmin>,
       stock: Number(draft.stock) || 0,
       status: "draft",
       description: draft.description?.trim() || null,
-      keywords: [],
+      keywords: Array.isArray(draft.keywords) ? draft.keywords : [],
       is_visible_in_api: false,
     })
     .select("id")
@@ -1371,6 +1421,9 @@ async function openProductCard(
     [
       { text: "📦 Остаток", callback_data: `efp:stock:${product.id}` },
       { text: "🤖 API", callback_data: `p:a:${product.id}:${sourceToCode(options.source ?? "unknown")}` },
+    ],
+    [
+      { text: "🤖 AI", callback_data: `p:ai:screen:${product.id}:${sourceToCode(options.source ?? "unknown")}` },
     ],
     [
       { text: product.status === "hidden" ? "🙈 Показать" : "🙈 Скрыть", callback_data: `p:v:${product.id}` },
@@ -1627,6 +1680,691 @@ async function toggleApi(
   return showProductApiScreen(supabase, chatId, companyId, productId, options);
 }
 
+function codeToAiAction(code: string | undefined): ProductAiAction | null {
+  const actions: Record<string, ProductAiAction> = {
+    id: "improve_description",
+    wd: "write_description",
+    in: "improve_name",
+    kw: "generate_keywords",
+    cat: "suggest_category",
+  };
+  return code ? actions[code] ?? null : null;
+}
+
+function aiCacheToken() {
+  return createId().replace(/[^a-zA-Z0-9]/g, "").slice(0, 12);
+}
+
+function setProductAiCache(item: Omit<ProductAiCacheItem, "expiresAt">) {
+  const token = aiCacheToken();
+  productAiCache.set(token, { ...item, expiresAt: Date.now() + 10 * 60_000 });
+  return token;
+}
+
+function getProductAiCache(token: string, chatId: string) {
+  const item = productAiCache.get(token);
+  if (!item || item.chatId !== chatId || item.expiresAt <= Date.now()) {
+    if (item) productAiCache.delete(token);
+    return null;
+  }
+  return item;
+}
+
+function productAiResultText(action: ProductAiAction, result: ProductAiResult) {
+  if (action === "generate_keywords") {
+    return result.keywords.length ? result.keywords.join(", ") : result.text;
+  }
+  if (action === "suggest_category") {
+    return result.categoryName || result.text || "Категория не определена.";
+  }
+  return result.text;
+}
+
+async function buildProductAiInput(
+  supabase: ReturnType<typeof getSupabaseAdmin>,
+  companyId: string,
+  product: Product,
+  category: Category | null,
+): Promise<ProductAiInput> {
+  const categories = await getCategories(supabase, companyId);
+  return {
+    name: product.name || "",
+    sku: product.sku || "",
+    category: category?.name ?? null,
+    price: Number(product.price) || 0,
+    stock: Number(product.stock) || 0,
+    description: product.description ?? null,
+    keywords: Array.isArray(product.keywords) ? product.keywords : [],
+    categories: categories.map((item) => ({ id: item.id, name: item.name, code: item.code })),
+  };
+}
+
+async function showProductAiScreen(
+  supabase: ReturnType<typeof getSupabaseAdmin>,
+  chatId: string,
+  companyId: string,
+  productId: string,
+  options: CallbackRenderOptions = {},
+) {
+  const connection = options.connection ?? (await getConnection(supabase, chatId));
+  const product = await getProduct(supabase, companyId, productId);
+  if (!product) return sendMessage(chatId, "Товар не найден.");
+  const category = product.category_id ? await getCategory(supabase, companyId, product.category_id) : null;
+  const sourceCode = sourceToCode(options.source ?? "unknown");
+  return renderTelegramScreen({
+    supabase,
+    chatId,
+    companyId,
+    connection,
+    screen: "product_ai",
+    text: [
+      "🤖 AI-помощник товара",
+      "",
+      "Товар:",
+      `📦 Название: ${product.name?.trim() || "не указано"}`,
+      `🏷 Категория: ${category?.name ?? "не указана"}`,
+      `💰 Цена: ${Number.isFinite(Number(product.price)) ? product.price : 0}`,
+      `📦 Остаток: ${Number.isFinite(Number(product.stock)) ? product.stock : 0}`,
+      `📝 Описание: ${product.description?.trim() || "не указано"}`,
+    ].join("\n"),
+    rows: [
+      [{ text: "✨ Улучшить описание", callback_data: `p:ai:r:id:${product.id}:${sourceCode}` }],
+      [{ text: "📝 Написать описание", callback_data: `p:ai:r:wd:${product.id}:${sourceCode}` }],
+      [{ text: "🏷 Предложить категорию", callback_data: `p:ai:r:cat:${product.id}:${sourceCode}` }],
+      [{ text: "🔑 Ключевые слова", callback_data: `p:ai:r:kw:${product.id}:${sourceCode}` }],
+      [{ text: "✍️ Улучшить название", callback_data: `p:ai:r:in:${product.id}:${sourceCode}` }],
+      [
+        { text: "⬅️ Назад к товару", callback_data: `p:ai:back:${product.id}:${sourceCode}` },
+        { text: "🏠 Главное меню", callback_data: "nav:menu" },
+      ],
+    ],
+    preferMessageId: options.messageId,
+    nav: false,
+  });
+}
+
+async function showProductAiGenerating(
+  supabase: ReturnType<typeof getSupabaseAdmin>,
+  chatId: string,
+  companyId: string,
+  productId: string,
+  options: CallbackRenderOptions = {},
+) {
+  const connection = options.connection ?? (await getConnection(supabase, chatId));
+  return renderTelegramScreen({
+    supabase,
+    chatId,
+    companyId,
+    connection,
+    screen: "product_ai_generating",
+    text: "🤖 Генерирую вариант...\nЭто может занять несколько секунд.",
+    rows: [
+      [
+        { text: "⬅️ Назад к товару", callback_data: `p:ai:back:${productId}:${sourceToCode(options.source ?? "unknown")}` },
+        { text: "🏠 Главное меню", callback_data: "nav:menu" },
+      ],
+    ],
+    preferMessageId: options.messageId,
+    nav: false,
+  });
+}
+
+async function showProductAiPreview(
+  supabase: ReturnType<typeof getSupabaseAdmin>,
+  chatId: string,
+  companyId: string,
+  token: string,
+  item: ProductAiCacheItem,
+  options: CallbackRenderOptions = {},
+) {
+  const connection = options.connection ?? (await getConnection(supabase, chatId));
+  const text = productAiResultText(item.action, item.result);
+  return renderTelegramScreen({
+    supabase,
+    chatId,
+    companyId,
+    connection,
+    screen: "product_ai_preview",
+    text: [
+      "AI предложил:",
+      "",
+      text || "Пустой результат.",
+      item.action === "suggest_category" && item.result.categoryName ? `\nКатегория: ${item.result.categoryName}` : "",
+    ].filter(Boolean).join("\n"),
+    rows: [
+      [
+        { text: "✅ Применить", callback_data: `p:ai:ap:${token}` },
+        { text: "🔄 Сгенерировать ещё", callback_data: `p:ai:rg:${token}` },
+      ],
+      [
+        { text: "❌ Отмена", callback_data: `p:ai:s:${item.productId}:${sourceToCode(item.source)}` },
+        { text: "⬅️ Назад к AI", callback_data: `p:ai:s:${item.productId}:${sourceToCode(item.source)}` },
+      ],
+    ],
+    preferMessageId: options.messageId,
+    nav: false,
+  });
+}
+
+async function runProductAiAction(
+  supabase: ReturnType<typeof getSupabaseAdmin>,
+  chatId: string,
+  companyId: string,
+  productId: string,
+  action: ProductAiAction,
+  options: CallbackRenderOptions = {},
+) {
+  const startedAt = Date.now();
+  await showProductAiGenerating(supabase, chatId, companyId, productId, options);
+  try {
+    const product = await getProduct(supabase, companyId, productId);
+    if (!product) return sendMessage(chatId, "Товар не найден.");
+    const category = product.category_id ? await getCategory(supabase, companyId, product.category_id) : null;
+    const input = await buildProductAiInput(supabase, companyId, product, category);
+    const result = await generateProductAi(action, input);
+    const token = setProductAiCache({ chatId, companyId, productId, action, result, source: options.source ?? "unknown" });
+    console.log("telegram ai", { action, productId, chatId, ms: Date.now() - startedAt });
+    return showProductAiPreview(supabase, chatId, companyId, token, productAiCache.get(token) as ProductAiCacheItem, options);
+  } catch (error) {
+    const message = error instanceof AiUnavailableError ? error.message : "Не удалось выполнить AI-действие. Попробуйте ещё раз.";
+    console.warn("telegram ai failed", { action, productId, chatId, message: error instanceof Error ? error.message : String(error) });
+    return renderTelegramScreen({
+      supabase,
+      chatId,
+      companyId,
+      connection: options.connection,
+      screen: "product_ai_unavailable",
+      text: message,
+      rows: [
+        [
+          { text: "⬅️ Назад к AI", callback_data: `p:ai:s:${productId}:${sourceToCode(options.source ?? "unknown")}` },
+          { text: "🏠 Главное меню", callback_data: "nav:menu" },
+        ],
+      ],
+      preferMessageId: options.messageId,
+      nav: false,
+    });
+  }
+}
+
+async function applyProductAiResult(
+  supabase: ReturnType<typeof getSupabaseAdmin>,
+  chatId: string,
+  token: string,
+  options: CallbackRenderOptions = {},
+) {
+  const item = getProductAiCache(token, chatId);
+  if (!item) {
+    console.warn("telegram ai failed", { action: "apply_expired", productId: undefined, chatId, message: "AI preview expired" });
+    return showMainMenu(supabase, chatId, options.connection as TelegramConnection, { messageId: options.messageId });
+  }
+
+  const payload: Record<string, unknown> = {};
+  if (item.action === "improve_description" || item.action === "write_description") payload.description = item.result.text || null;
+  if (item.action === "improve_name") payload.name = item.result.text || undefined;
+  if (item.action === "generate_keywords") payload.keywords = item.result.keywords;
+  if (item.action === "suggest_category" && item.result.categoryId) {
+    const category = await getCategory(supabase, item.companyId, item.result.categoryId);
+    if (category) payload.category_id = category.id;
+  }
+
+  if (Object.keys(payload).length > 0) {
+    const { error } = await supabase.from("products").update(payload).eq("company_id", item.companyId).eq("id", item.productId);
+    if (error) {
+      console.warn("telegram ai failed", { action: `apply_${item.action}`, productId: item.productId, chatId, message: error.message });
+      return renderTelegramScreen({
+        supabase,
+        chatId,
+        companyId: item.companyId,
+        connection: options.connection,
+        screen: "product_ai_apply_error",
+        text: "Не удалось применить AI-результат. Попробуйте ещё раз.",
+        rows: [
+          [{ text: "🔄 Повторить", callback_data: `p:ai:ap:${token}` }],
+          [
+            { text: "⬅️ Назад к AI", callback_data: `p:ai:s:${item.productId}:${sourceToCode(item.source)}` },
+            { text: "🏠 Главное меню", callback_data: "nav:menu" },
+          ],
+        ],
+        preferMessageId: options.messageId,
+        nav: false,
+      });
+    }
+  }
+  productAiCache.delete(token);
+  console.log("telegram ai", { action: `apply_${item.action}`, productId: item.productId, chatId, ms: 0 });
+  return openProductCard(supabase, chatId, item.companyId, item.productId, { connection: options.connection, messageId: options.messageId, source: item.source });
+}
+
+function voiceValueObject(value: unknown) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function getVoiceAttributes(draft: TelegramDraft) {
+  return Object.fromEntries(
+    Object.entries(voiceValueObject(draft.custom_values?.[VOICE_ATTRIBUTES_KEY]))
+      .flatMap(([key, value]) => {
+        const text = typeof value === "string" ? value.trim() : String(value ?? "").trim();
+        return key.trim() && text ? [[key.trim(), text]] : [];
+      }),
+  );
+}
+
+function getVoiceTranscript(draft: TelegramDraft) {
+  const value = draft.custom_values?.[VOICE_TRANSCRIPT_KEY];
+  return typeof value === "string" ? value : "";
+}
+
+function getVoiceWeight(draft: TelegramDraft) {
+  const value = draft.custom_values?.[VOICE_WEIGHT_KEY];
+  return typeof value === "string" ? value : "";
+}
+
+function getVoiceMissingRequired(draft: TelegramDraft) {
+  const missing: string[] = [];
+  if (!draft.name?.trim()) missing.push("название");
+  if (!draft.category_id) missing.push("категория");
+  if (!hasCompletedStep(draft, "wait_price")) missing.push("цена");
+  if (!hasCompletedStep(draft, "wait_stock")) missing.push("остаток");
+  return missing;
+}
+
+function parseAttributesText(text: string) {
+  const attributes: Record<string, string> = {};
+  for (const line of text.split(/\r?\n|,/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const separator = trimmed.includes(":") ? ":" : trimmed.includes("-") ? "-" : null;
+    if (!separator) continue;
+    const [rawKey, ...rawValue] = trimmed.split(separator);
+    const key = rawKey.trim();
+    const value = rawValue.join(separator).trim();
+    if (key && value) attributes[key] = value;
+  }
+  return attributes;
+}
+
+function categoryNameScore(input: string, category: Category) {
+  const needle = normalize(input);
+  const haystack = normalize(`${category.name} ${category.code}`);
+  if (!needle) return 0;
+  if (normalize(category.name) === needle || normalize(category.code) === needle) return 1;
+  if (haystack.includes(needle) || needle.includes(normalize(category.name))) return 0.82;
+  const words = needle.split(/\s+/).filter(Boolean);
+  if (words.length === 0) return 0;
+  const matches = words.filter((word) => haystack.includes(word)).length;
+  return matches / words.length * 0.7;
+}
+
+function matchVoiceCategory(categories: Category[], parsed: ProductVoiceParseResult) {
+  if (!parsed.categoryName || parsed.confidence.category < 0.45) return null;
+  const ranked = categories
+    .map((category) => ({ category, score: categoryNameScore(parsed.categoryName as string, category) }))
+    .sort((a, b) => b.score - a.score);
+  const best = ranked[0];
+  if (!best || best.score < 0.55) return null;
+  return best.category;
+}
+
+function buildVoiceDraftContext(draft: TelegramDraft, category: Category | null): VoiceDraftContext {
+  return {
+    title: draft.name,
+    categoryName: category?.name ?? null,
+    price: hasCompletedStep(draft, "wait_price") ? Number(draft.price) : null,
+    stock: hasCompletedStep(draft, "wait_stock") ? Number(draft.stock) : null,
+    description: draft.description,
+    weight: getVoiceWeight(draft) || null,
+    attributes: getVoiceAttributes(draft),
+    keywords: Array.isArray(draft.keywords) ? draft.keywords : [],
+  };
+}
+
+function voiceCompletedSteps(parsed: ProductVoiceParseResult, category: Category | null) {
+  const steps: string[] = ["wait_voice"];
+  if (parsed.title) steps.push("wait_name");
+  if (category) steps.push("choose_category");
+  if (parsed.price !== null) steps.push("wait_price");
+  if (parsed.stock !== null) steps.push("wait_stock");
+  if (parsed.description) steps.push("wait_description");
+  return steps;
+}
+
+function mergeStepHistory(history: string[], steps: string[]) {
+  const result = [...history];
+  for (const step of steps) {
+    if (!result.includes(step)) result.push(step);
+  }
+  return result;
+}
+
+function voiceAttributesLines(attributes: Record<string, string>) {
+  const entries = Object.entries(attributes);
+  if (entries.length === 0) return ["Характеристики: не указаны"];
+  return ["Характеристики:", ...entries.map(([key, value]) => `- ${key}: ${value}`)];
+}
+
+async function applyVoiceCustomValues(
+  supabase: ReturnType<typeof getSupabaseAdmin>,
+  companyId: string,
+  draft: TelegramDraft,
+  parsed: ProductVoiceParseResult,
+) {
+  const fields = await getCustomFields(supabase, companyId);
+  const nextValues: Record<string, unknown> = { ...(draft.custom_values ?? {}) };
+  const attributes = { ...getVoiceAttributes(draft), ...parsed.attributes };
+  if (parsed.weight) {
+    attributes.вес = parsed.weight;
+    nextValues[VOICE_WEIGHT_KEY] = parsed.weight;
+  }
+  nextValues[VOICE_ATTRIBUTES_KEY] = attributes;
+
+  for (const field of fields) {
+    const fieldKey = normalize(`${field.key} ${field.name}`);
+    const attribute = Object.entries(attributes).find(([key]) => fieldKey.includes(normalize(key)) || normalize(key).includes(normalize(field.name)));
+    if (!attribute) continue;
+    const parsedValue = parseCustomValue(field, attribute[1]);
+    if (!("error" in parsedValue)) nextValues[field.id] = parsedValue.value;
+  }
+  const weightField = fields.find(isWeightField);
+  if (weightField && parsed.weight) {
+    const parsedWeight = parseCustomValue(weightField, parsed.weight);
+    if (!("error" in parsedWeight)) nextValues[weightField.id] = parsedWeight.value;
+  }
+  return nextValues;
+}
+
+async function showVoicePrompt(
+  supabase: ReturnType<typeof getSupabaseAdmin>,
+  chatId: string,
+  connection: TelegramConnection,
+  draft: TelegramDraft,
+  options: { messageId?: number | null; forceNew?: boolean } = {},
+) {
+  return renderTelegramScreen({
+    supabase,
+    chatId,
+    companyId: connection.company_id,
+    connection,
+    screen: "voice_prompt",
+    text: [
+      "🎙 Продиктуйте товар",
+      "",
+      "Просто расскажите голосом:",
+      "- что это за товар",
+      "- цена",
+      "- остаток",
+      "- категория",
+      "- важные характеристики",
+      "- описание, если хотите",
+      "",
+      "Пример:",
+      "«Кроссовки Nike Air Max, размер 42, черные, цена 5500, остаток 3, состояние новые.»",
+    ].join("\n"),
+    rows: [
+      [
+        { text: "⬅️ Назад", callback_data: "voice:back" },
+        { text: "🏠 Главное меню", callback_data: "nav:menu" },
+      ],
+      [{ text: "❌ Отмена", callback_data: "draft:cancel" }],
+    ],
+    preferMessageId: options.messageId,
+    forceNew: options.forceNew,
+    nav: false,
+  });
+}
+
+async function startVoiceWizard(
+  supabase: ReturnType<typeof getSupabaseAdmin>,
+  chatId: string,
+  connection: TelegramConnection,
+  options: { messageId?: number | null; forceNew?: boolean } = {},
+) {
+  const draft = await createDraft(supabase, connection.company_id, chatId, "add_voice", "wait_voice");
+  console.log("telegram wizard", { action: "voice_start", step: draft.step, chatId, draftId: draft.id, mode: draft.mode });
+  return showVoicePrompt(supabase, chatId, connection, draft, options);
+}
+
+async function renderVoiceStatus(
+  supabase: ReturnType<typeof getSupabaseAdmin>,
+  chatId: string,
+  connection: TelegramConnection,
+  text: string,
+  options: { messageId?: number | null; forceNew?: boolean } = {},
+) {
+  return renderTelegramScreen({
+    supabase,
+    chatId,
+    companyId: connection.company_id,
+    connection,
+    screen: "voice_status",
+    text,
+    rows: [
+      [
+        { text: "✍️ Заполнить вручную", callback_data: "add:manual" },
+        { text: "❌ Отмена", callback_data: "draft:cancel" },
+      ],
+      [{ text: "🏠 Главное меню", callback_data: "nav:menu" }],
+    ],
+    preferMessageId: options.messageId,
+    forceNew: options.forceNew,
+    nav: false,
+  });
+}
+
+async function showVoicePreview(
+  supabase: ReturnType<typeof getSupabaseAdmin>,
+  chatId: string,
+  draft: TelegramDraft,
+  options: { connection?: TelegramConnection | null; messageId?: number | null; forceNew?: boolean } = {},
+) {
+  const connection = options.connection ?? (await getConnection(supabase, chatId));
+  const category = draft.category_id ? await getCategory(supabase, draft.company_id, draft.category_id) : null;
+  const missing = getVoiceMissingRequired(draft);
+  const attributes = getVoiceAttributes(draft);
+  const transcript = getVoiceTranscript(draft);
+  const weight = getVoiceWeight(draft);
+  const sku = missing.length === 0 ? await buildUniqueSku(supabase, (await getCompanyAndCategory(supabase, draft)).company, category as Category) : null;
+  const rows: InlineButton[][] = [
+    ...(missing.length === 0 && sku ? [[{ text: "✅ Сохранить", callback_data: `d:save:${sku}` }]] : []),
+    [
+      { text: "✏️ Исправить поле", callback_data: "voice:edit" },
+      { text: "🎙 Продиктовать ещё", callback_data: "voice:again" },
+    ],
+    [{ text: "➡️ Заполнить недостающее вручную", callback_data: "voice:missing" }],
+    [
+      { text: "❌ Отмена", callback_data: "draft:cancel" },
+      { text: "🏠 Главное меню", callback_data: "nav:menu" },
+    ],
+  ];
+  return renderTelegramScreen({
+    supabase,
+    chatId,
+    companyId: draft.company_id,
+    connection,
+    screen: "voice_preview",
+    text: [
+      "🤖 Я распознал товар",
+      "",
+      "🎙 Текст:",
+      `«${transcript || "не распознан"}»`,
+      "",
+      `📦 Название: ${draft.name?.trim() || notSpecified("male")}`,
+      `🏷 Категория: ${category?.name ?? draft.custom_values?.[VOICE_CATEGORY_SUGGESTION_KEY] ?? notSpecified("female")}`,
+      `💰 Цена: ${hasCompletedStep(draft, "wait_price") ? formatMoney(draft.price) : notSpecified("female")}`,
+      `📦 Остаток: ${hasCompletedStep(draft, "wait_stock") ? String(Number(draft.stock) || 0) : notSpecified("male")}`,
+      `⚖️ Вес: ${weight || notSpecified("male")}`,
+      `📝 Описание: ${draft.description?.trim() || notSpecified()}`,
+      ...voiceAttributesLines(attributes),
+      ...(missing.length ? ["", "⚠️ Нужно уточнить:", ...missing.map((item) => `- ${item}`)] : []),
+    ].join("\n"),
+    rows,
+    preferMessageId: options.messageId,
+    forceNew: options.forceNew,
+    nav: false,
+  });
+}
+
+async function handleVoiceMessage(
+  supabase: ReturnType<typeof getSupabaseAdmin>,
+  chatId: string,
+  connection: TelegramConnection,
+  draft: TelegramDraft | null,
+  message: TelegramMessage,
+) {
+  const voice = getMessageVoiceMedia(message);
+  if (!voice) return sendMessage(chatId, "Отправьте голосовое или аудио.");
+  let workingDraft = draft;
+  if (!workingDraft || (workingDraft.mode !== "add_voice" && workingDraft.step !== "wait_voice" && workingDraft.step !== "voice_preview")) {
+    workingDraft = await createDraft(supabase, connection.company_id, chatId, "add_voice", "wait_voice");
+  }
+
+  const totalStartedAt = Date.now();
+  let stage = "download";
+  try {
+    if (voice.fileSize && voice.fileSize > AI_VOICE_FILE_SIZE_LIMIT_BYTES) {
+      throw new TelegramFileError("Voice file is too large.", "file_too_large", undefined, { file_size: voice.fileSize });
+    }
+    const downloadStartedAt = Date.now();
+    const downloaded = await downloadTelegramVoiceFile(voice.fileId);
+    console.log("telegram ai voice", { stage: "download", chatId, ms: Date.now() - downloadStartedAt, bytes: downloaded.fileSize });
+
+    stage = "transcribe";
+    const transcribeStartedAt = Date.now();
+    const fileName = voice.fileName || `voice${getExtension(downloaded.filePath, ".oga")}`;
+    const transcript = await transcribeAudio({ buffer: downloaded.buffer, fileName, contentType: downloaded.contentType ?? voice.contentType });
+    console.log("telegram ai voice", { stage: "transcribe", chatId, ms: Date.now() - transcribeStartedAt, bytes: downloaded.fileSize });
+
+    await renderVoiceStatus(supabase, chatId, connection, "🤖 Распознал речь. Разбираю товар...", { forceNew: true });
+
+    const categories = await getCategories(supabase, connection.company_id);
+    const currentCategory = workingDraft.category_id ? await getCategory(supabase, connection.company_id, workingDraft.category_id) : null;
+    stage = "parse";
+    const parseStartedAt = Date.now();
+    const parsed = await parseProductVoiceTranscript(transcript, categories, buildVoiceDraftContext(workingDraft, currentCategory));
+    const matchedCategory = matchVoiceCategory(categories, parsed);
+    console.log("telegram ai parse", { chatId, ms: Date.now() - parseStartedAt, missingRequiredFields: parsed.missingRequiredFields });
+
+    const customValues = await applyVoiceCustomValues(supabase, connection.company_id, workingDraft, parsed);
+    customValues[VOICE_TRANSCRIPT_KEY] = transcript;
+    if (parsed.categoryName && !matchedCategory) customValues[VOICE_CATEGORY_SUGGESTION_KEY] = parsed.categoryName;
+
+    const nextDraft = await updateDraft(supabase, workingDraft, {
+      step: "voice_preview",
+      mode: "add_voice",
+      name: parsed.title ?? workingDraft.name,
+      category_id: matchedCategory?.id ?? workingDraft.category_id,
+      price: parsed.price ?? workingDraft.price,
+      stock: parsed.stock ?? workingDraft.stock,
+      description: parsed.description ?? workingDraft.description,
+      keywords: parsed.keywords.length ? parsed.keywords : workingDraft.keywords,
+      custom_values: customValues,
+      step_history: mergeStepHistory(workingDraft.step_history ?? [], voiceCompletedSteps(parsed, matchedCategory)),
+    });
+    const missing = getVoiceMissingRequired(nextDraft);
+    await updateDraft(supabase, nextDraft, { custom_values: { ...(nextDraft.custom_values ?? {}), [VOICE_MISSING_KEY]: missing } });
+    console.log("telegram ai voice", { stage: "total", chatId, ms: Date.now() - totalStartedAt, bytes: downloaded.fileSize });
+    return showVoicePreview(supabase, chatId, { ...nextDraft, custom_values: { ...(nextDraft.custom_values ?? {}), [VOICE_MISSING_KEY]: missing } }, { connection, forceNew: true });
+  } catch (error) {
+    const message = error instanceof AiUnavailableError
+      ? error.message
+      : error instanceof TelegramFileError
+        ? "Не удалось скачать голосовое. Попробуйте ещё раз."
+        : stage === "parse"
+          ? "Я распознал текст, но не смог разобрать товар. Можно заполнить вручную."
+          : "Не удалось распознать голос. Попробуйте ещё раз или заполните вручную.";
+    console.warn("telegram ai voice failed", { stage, chatId, message: getErrorMessage(error) });
+    return renderVoiceStatus(supabase, chatId, connection, message, { forceNew: true });
+  }
+}
+
+async function showVoiceEditMenu(
+  supabase: ReturnType<typeof getSupabaseAdmin>,
+  chatId: string,
+  draft: TelegramDraft | null,
+  options: { connection?: TelegramConnection | null; messageId?: number | null } = {},
+) {
+  if (!draft) return sendMessage(chatId, "Черновик не найден.");
+  return renderTelegramScreen({
+    supabase,
+    chatId,
+    companyId: draft.company_id,
+    connection: options.connection,
+    screen: "voice_edit_menu",
+    text: "Что исправить?",
+    rows: [
+      [
+        { text: "Название", callback_data: "voice:field:name" },
+        { text: "Категория", callback_data: "voice:field:category" },
+      ],
+      [
+        { text: "Цена", callback_data: "voice:field:price" },
+        { text: "Остаток", callback_data: "voice:field:stock" },
+      ],
+      [
+        { text: "Вес", callback_data: "voice:field:weight" },
+        { text: "Описание", callback_data: "voice:field:description" },
+      ],
+      [{ text: "Характеристики", callback_data: "voice:field:attributes" }],
+      [{ text: "⬅️ Назад к preview", callback_data: "voice:preview" }],
+    ],
+    preferMessageId: options.messageId,
+    nav: false,
+  });
+}
+
+async function handleVoiceFieldChoice(
+  supabase: ReturnType<typeof getSupabaseAdmin>,
+  chatId: string,
+  connection: TelegramConnection,
+  draft: TelegramDraft | null,
+  field: string,
+  messageId?: number | null,
+) {
+  if (!draft) return sendMessage(chatId, "Черновик не найден.");
+  if (field === "category") {
+    const nextDraft = await updateDraft(supabase, draft, { step: "choose_category", edit_field: "category" });
+    return sendCategoryKeyboard(supabase, connection.company_id, chatId, "Выберите категорию товара.", { connection, messageId, draft: nextDraft });
+  }
+  if (field === "weight") {
+    const nextDraft = await updateDraft(supabase, draft, { step: "wait_voice_weight", edit_field: "voice_weight" });
+    return renderTelegramScreen({ supabase, chatId, companyId: connection.company_id, connection, screen: "voice_weight", text: "Введите вес товара.", rows: [], preferMessageId: messageId });
+  }
+  if (field === "attributes") {
+    const nextDraft = await updateDraft(supabase, draft, { step: "wait_voice_attributes", edit_field: "voice_attributes" });
+    return renderTelegramScreen({ supabase, chatId, companyId: connection.company_id, connection, screen: "voice_attributes", text: "Введите характеристики в формате:\nцвет: черный\nразмер: 42", rows: [], preferMessageId: messageId });
+  }
+  const stepByField: Record<string, string> = {
+    name: "wait_name",
+    price: "wait_price",
+    stock: "wait_stock",
+    description: "wait_description",
+  };
+  const step = stepByField[field];
+  if (!step) return sendMessage(chatId, "Поле не найдено.");
+  const nextDraft = await updateDraft(supabase, draft, { step, edit_field: field });
+  return renderAddWizardScreen({ supabase, chatId, draft: nextDraft, connection, messageId });
+}
+
+async function fillVoiceMissingManually(
+  supabase: ReturnType<typeof getSupabaseAdmin>,
+  chatId: string,
+  connection: TelegramConnection,
+  draft: TelegramDraft | null,
+  messageId?: number | null,
+) {
+  if (!draft) return sendMessage(chatId, "Черновик не найден.");
+  const missing = getVoiceMissingRequired(draft);
+  const first = missing[0];
+  if (!first) return showVoicePreview(supabase, chatId, draft, { connection, messageId });
+  const fieldByLabel: Record<string, string> = {
+    название: "name",
+    категория: "category",
+    цена: "price",
+    остаток: "stock",
+  };
+  return handleVoiceFieldChoice(supabase, chatId, connection, draft, fieldByLabel[first] ?? "name", messageId);
+}
+
 async function showStats(
   supabase: ReturnType<typeof getSupabaseAdmin>,
   chatId: string,
@@ -1798,6 +2536,30 @@ async function showBusyMessage(
     preferMessageId: options.messageId,
     nav: false,
     forceNew: options.forceNew,
+  });
+}
+
+async function showAddProductChoice(
+  supabase: ReturnType<typeof getSupabaseAdmin>,
+  chatId: string,
+  connection: TelegramConnection,
+  options: { messageId?: number | null; forceNew?: boolean } = {},
+) {
+  return renderTelegramScreen({
+    supabase,
+    chatId,
+    companyId: connection.company_id,
+    connection,
+    screen: "add_product_choice",
+    text: "Как добавить товар?",
+    rows: [
+      [{ text: "✍️ Заполнить вручную", callback_data: "add:manual" }],
+      [{ text: "🎙 Продиктовать товар", callback_data: "add:voice" }],
+      [{ text: "🏠 Главное меню", callback_data: "nav:menu" }],
+    ],
+    preferMessageId: options.messageId,
+    forceNew: options.forceNew,
+    nav: false,
   });
 }
 
@@ -1996,29 +2758,58 @@ async function saveOneCustomValue(
 async function handleAddDraftText(supabase: ReturnType<typeof getSupabaseAdmin>, chatId: string, draft: TelegramDraft, text: string) {
   const connection = await getConnection(supabase, chatId);
   console.log("telegram wizard", { action: "text", step: draft.step, chatId, draftId: draft.id, mode: draft.mode });
+  const showEditedPreview = (nextDraft: TelegramDraft) => draft.mode === "add_voice"
+    ? showVoicePreview(supabase, chatId, nextDraft, { connection, forceNew: true })
+    : showAddPreview(supabase, chatId, nextDraft, { connection, forceNew: true });
 
-  if (draft.mode === "add" && draft.edit_field && ["name", "price", "stock", "description"].includes(draft.edit_field)) {
+  if ((draft.mode === "add" || draft.mode === "add_voice") && draft.edit_field && ["name", "price", "stock", "description"].includes(draft.edit_field)) {
     if (draft.edit_field === "name") {
       if (!text.trim()) return renderAddWizardScreen({ supabase, chatId, draft, connection, forceNew: true, error: "Название не может быть пустым. Введите название ещё раз." });
-      const nextDraft = await updateDraft(supabase, draft, { name: text.trim(), step: "preview", edit_field: null });
-      return showAddPreview(supabase, chatId, nextDraft, { connection, forceNew: true });
+      const nextDraft = await updateDraft(supabase, draft, { name: text.trim(), step: draft.mode === "add_voice" ? "voice_preview" : "preview", edit_field: null });
+      return showEditedPreview(nextDraft);
     }
     if (draft.edit_field === "price") {
       const price = parsePrice(text);
       if (price === null) return renderAddWizardScreen({ supabase, chatId, draft, connection, forceNew: true, error: "Цена должна быть числом. Введите цену ещё раз." });
-      const nextDraft = await updateDraft(supabase, draft, { price, step: "preview", edit_field: null });
-      return showAddPreview(supabase, chatId, nextDraft, { connection, forceNew: true });
+      const nextDraft = await updateDraft(supabase, draft, { price, step: draft.mode === "add_voice" ? "voice_preview" : "preview", edit_field: null });
+      return showEditedPreview(nextDraft);
     }
     if (draft.edit_field === "stock") {
       const stock = parseStock(text);
       if (stock === null) return renderAddWizardScreen({ supabase, chatId, draft, connection, forceNew: true, error: "Остаток должен быть целым числом. Введите остаток ещё раз." });
-      const nextDraft = await updateDraft(supabase, draft, { stock, step: "preview", edit_field: null });
-      return showAddPreview(supabase, chatId, nextDraft, { connection, forceNew: true });
+      const nextDraft = await updateDraft(supabase, draft, { stock, step: draft.mode === "add_voice" ? "voice_preview" : "preview", edit_field: null });
+      return showEditedPreview(nextDraft);
     }
     if (draft.edit_field === "description") {
-      const nextDraft = await updateDraft(supabase, draft, { description: text.trim() || null, step: "preview", edit_field: null });
-      return showAddPreview(supabase, chatId, nextDraft, { connection, forceNew: true });
+      const nextDraft = await updateDraft(supabase, draft, { description: text.trim() || null, step: draft.mode === "add_voice" ? "voice_preview" : "preview", edit_field: null });
+      return showEditedPreview(nextDraft);
     }
+  }
+
+  if (draft.step === "wait_voice_weight") {
+    const nextDraft = await updateDraft(supabase, draft, {
+      step: "voice_preview",
+      edit_field: null,
+      custom_values: {
+        ...(draft.custom_values ?? {}),
+        [VOICE_WEIGHT_KEY]: text.trim(),
+        [VOICE_ATTRIBUTES_KEY]: { ...getVoiceAttributes(draft), вес: text.trim() },
+      },
+    });
+    return showVoicePreview(supabase, chatId, nextDraft, { connection, forceNew: true });
+  }
+
+  if (draft.step === "wait_voice_attributes") {
+    const attributes = parseAttributesText(text);
+    const nextDraft = await updateDraft(supabase, draft, {
+      step: "voice_preview",
+      edit_field: null,
+      custom_values: {
+        ...(draft.custom_values ?? {}),
+        [VOICE_ATTRIBUTES_KEY]: { ...getVoiceAttributes(draft), ...attributes },
+      },
+    });
+    return showVoicePreview(supabase, chatId, nextDraft, { connection, forceNew: true });
   }
 
   if (draft.step === "wait_name") {
@@ -2127,7 +2918,7 @@ async function handleMenuAction(
 
   const activeDraft = await getActiveDraft(supabase, connection.company_id, chatId);
   if (isBusyDraft(activeDraft)) return showBusyMessage(supabase, chatId, connection, activeDraft, { messageId, forceNew });
-  if (action === "add_product" || action === "add") return startAddWizard(supabase, chatId, connection, undefined, { messageId, forceNew });
+  if (action === "add_product" || action === "add") return showAddProductChoice(supabase, chatId, connection, { messageId, forceNew });
   if (action === "find_product" || action === "find") {
     await createDraft(supabase, connection.company_id, chatId, "find", "wait_find");
     return renderTelegramScreen({ supabase, chatId, companyId: connection.company_id, connection, screen: "search_prompt", text: "Введите название, SKU или ключевое слово.", rows: [], preferMessageId: messageId, forceNew });
@@ -2163,6 +2954,7 @@ async function restartDraft(supabase: ReturnType<typeof getSupabaseAdmin>, chatI
     await createDraft(supabase, connection.company_id, chatId, "edit_search", "wait_edit_search");
     return renderTelegramScreen({ supabase, chatId, companyId: connection.company_id, connection, screen: "edit_search_prompt", text: "Введите SKU или название товара.", rows: [] });
   }
+  if (mode === "add_voice") return startVoiceWizard(supabase, chatId, connection);
   if (mode === "edit" && productId) return startEditProduct(supabase, chatId, connection.company_id, productId);
   return startAddWizard(supabase, chatId, connection);
 }
@@ -2404,6 +3196,13 @@ async function handleCallback(supabase: ReturnType<typeof getSupabaseAdmin>, cal
     return;
   }
 
+  if (data === "add:manual") {
+    return startAddWizard(supabase, chatId, connection, undefined, { messageId: callback.message?.message_id });
+  }
+  if (data === "add:voice") {
+    return startVoiceWizard(supabase, chatId, connection, { messageId: callback.message?.message_id });
+  }
+
   if (data.startsWith("p:o:")) {
     const [, , productId, sourceCode] = data.split(":");
     await clearDrafts(supabase, connection.company_id, chatId);
@@ -2433,6 +3232,45 @@ async function handleCallback(supabase: ReturnType<typeof getSupabaseAdmin>, cal
     }
     return sendMessage(chatId, "Действие API не найдено.");
   }
+  if (data.startsWith("p:ai:")) {
+    const [, , aiAction, a, b, c] = data.split(":");
+    if (aiAction === "screen" || aiAction === "s") {
+      return showProductAiScreen(supabase, chatId, connection.company_id, a, {
+        connection,
+        messageId: callback.message?.message_id,
+        source: codeToSource(b),
+      });
+    }
+    if (aiAction === "back") {
+      return openProductCard(supabase, chatId, connection.company_id, a, {
+        connection,
+        messageId: callback.message?.message_id,
+        source: codeToSource(b),
+      });
+    }
+    if (aiAction === "r") {
+      const action = codeToAiAction(a);
+      if (!action) return sendMessage(chatId, "AI-действие не найдено.");
+      return runProductAiAction(supabase, chatId, connection.company_id, b, action, {
+        connection,
+        messageId: callback.message?.message_id,
+        source: codeToSource(c),
+      });
+    }
+    if (aiAction === "ap") {
+      return applyProductAiResult(supabase, chatId, a, { connection, messageId: callback.message?.message_id });
+    }
+    if (aiAction === "rg") {
+      const item = getProductAiCache(a, chatId);
+      if (!item) return showMainMenu(supabase, chatId, connection, { messageId: callback.message?.message_id });
+      return runProductAiAction(supabase, chatId, item.companyId, item.productId, item.action, {
+        connection,
+        messageId: callback.message?.message_id,
+        source: item.source,
+      });
+    }
+    return sendMessage(chatId, "AI-действие не найдено.");
+  }
   if (data.startsWith("p:a:")) {
     const [, , productId, sourceCode] = data.split(":");
     return toggleApi(supabase, chatId, connection.company_id, productId, {
@@ -2458,6 +3296,20 @@ async function handleCallback(supabase: ReturnType<typeof getSupabaseAdmin>, cal
   }
 
   const draft = await getActiveDraft(supabase, connection.company_id, chatId);
+  if (data === "voice:back") return showAddProductChoice(supabase, chatId, connection, { messageId: callback.message?.message_id });
+  if (data === "voice:again") {
+    if (!draft) return startVoiceWizard(supabase, chatId, connection, { messageId: callback.message?.message_id });
+    const nextDraft = await updateDraft(supabase, draft, { step: "wait_voice", edit_field: null });
+    return showVoicePrompt(supabase, chatId, connection, nextDraft, { messageId: callback.message?.message_id });
+  }
+  if (data === "voice:preview") {
+    return draft ? showVoicePreview(supabase, chatId, draft, { connection, messageId: callback.message?.message_id }) : showAddProductChoice(supabase, chatId, connection, { messageId: callback.message?.message_id });
+  }
+  if (data === "voice:edit") return showVoiceEditMenu(supabase, chatId, draft, { connection, messageId: callback.message?.message_id });
+  if (data === "voice:missing") return fillVoiceMissingManually(supabase, chatId, connection, draft, callback.message?.message_id);
+  if (data.startsWith("voice:field:")) {
+    return handleVoiceFieldChoice(supabase, chatId, connection, draft, data.slice("voice:field:".length), callback.message?.message_id);
+  }
   if (data === "wizard:back") return handleWizardBack(supabase, chatId, draft, { connection, messageId: callback.message?.message_id });
   if (data === "nav:back") {
     if (draft) return handleWizardBack(supabase, chatId, draft, { connection, messageId: callback.message?.message_id });
@@ -2505,8 +3357,12 @@ async function handleCallback(supabase: ReturnType<typeof getSupabaseAdmin>, cal
       if (callbackIdForAction) await answerCallbackQuery(callbackIdForAction, "Сохранено", chatId);
       return openProductCard(supabase, chatId, connection.company_id, draft.product_id, { connection, messageId: callback.message?.message_id });
     }
-    const nextDraft = await updateDraft(supabase, draft, { category_id: categoryId, step: draft.edit_field === "category" ? "preview" : "wait_name", ...(draft.edit_field === "category" ? { edit_field: null } : {}) });
+    const nextDraft = await updateDraft(supabase, draft, { category_id: categoryId, step: draft.edit_field === "category" ? (draft.mode === "add_voice" ? "voice_preview" : "preview") : "wait_name", ...(draft.edit_field === "category" ? { edit_field: null } : {}) });
     if (draft.edit_field === "category" || nextDraft.name) {
+      if (draft.mode === "add_voice") {
+        const previewDraft = nextDraft.step === "voice_preview" ? nextDraft : await updateDraft(supabase, nextDraft, { step: "voice_preview" });
+        return showVoicePreview(supabase, chatId, previewDraft, { connection, messageId: callback.message?.message_id });
+      }
       const previewDraft = nextDraft.step === "preview" ? nextDraft : await updateDraft(supabase, nextDraft, { step: "preview" });
       return showAddPreview(supabase, chatId, previewDraft, { connection, messageId: callback.message?.message_id });
     }
@@ -2515,7 +3371,13 @@ async function handleCallback(supabase: ReturnType<typeof getSupabaseAdmin>, cal
   if (data === "desc:skip") {
     if (!draft) return sendMessage(chatId, "Черновик не найден.");
     const nextDraft = await updateDraft(supabase, draft, { description: null, ...(draft.edit_field === "description" ? { step: "preview", edit_field: null } : {}) });
-    if (draft.edit_field === "description") return showAddPreview(supabase, chatId, nextDraft, { connection, messageId: callback.message?.message_id });
+    if (draft.edit_field === "description") {
+      if (draft.mode === "add_voice") {
+        const previewDraft = nextDraft.step === "voice_preview" ? nextDraft : await updateDraft(supabase, nextDraft, { step: "voice_preview" });
+        return showVoicePreview(supabase, chatId, previewDraft, { connection, messageId: callback.message?.message_id });
+      }
+      return showAddPreview(supabase, chatId, nextDraft, { connection, messageId: callback.message?.message_id });
+    }
     if (draft.mode === "add") return askNextCustomField(supabase, chatId, nextDraft, { connection, messageId: callback.message?.message_id });
     const previewDraft = await updateDraft(supabase, draft, { step: "preview" });
     return showAddPreview(supabase, chatId, previewDraft, { connection, messageId: callback.message?.message_id });
@@ -2554,6 +3416,22 @@ async function resumeDraft(
   options: { connection?: TelegramConnection | null; messageId?: number | null } = {},
 ) {
   const connection = options.connection ?? (await getConnection(supabase, chatId));
+  if (draft.mode === "add_voice" && draft.step === "wait_voice") {
+    return connection ? showVoicePrompt(supabase, chatId, connection, draft, { messageId: options.messageId }) : renderTelegramScreen({ supabase, chatId, companyId: draft.company_id, connection, screen: "voice_prompt", text: "Продиктуйте товар голосом.", rows: [], preferMessageId: options.messageId });
+  }
+  if (draft.mode === "add_voice" && (draft.step === "voice_preview" || draft.step === "preview")) return showVoicePreview(supabase, chatId, draft, { connection, messageId: options.messageId });
+  if (draft.mode === "add_voice" && (draft.step === "wait_voice_weight" || draft.step === "wait_voice_attributes")) {
+    return renderTelegramScreen({
+      supabase,
+      chatId,
+      companyId: draft.company_id,
+      connection,
+      screen: draft.step,
+      text: draft.step === "wait_voice_weight" ? "Введите вес товара." : "Введите характеристики в формате:\nцвет: черный\nразмер: 42",
+      rows: [],
+      preferMessageId: options.messageId,
+    });
+  }
   if (draft.mode === "add" && ["wait_media", "wait_name", "wait_price", "wait_stock", "wait_description"].includes(draft.step)) {
     return renderAddWizardScreen({ supabase, chatId, draft, connection, messageId: options.messageId });
   }
@@ -2764,6 +3642,7 @@ async function handleMessage(supabase: ReturnType<typeof getSupabaseAdmin>, mess
   const chatId = String(message.chat.id);
   const text = message.text?.trim() ?? "";
   const media = getMessageMedia(message);
+  const voiceMedia = getMessageVoiceMedia(message);
   if (text === "/disconnect") {
     const { error } = await supabase
       .from("telegram_connections")
@@ -2800,7 +3679,7 @@ async function handleMessage(supabase: ReturnType<typeof getSupabaseAdmin>, mess
       }
       return sendMessage(chatId, "Код неверный или истёк. Сгенерируйте новый код в CRM.");
     }
-    return sendMessage(chatId, media || text === "/addproduct" ? NOT_CONNECTED : "Отправьте код подключения из CRM.");
+    return sendMessage(chatId, media || voiceMedia || text === "/addproduct" ? NOT_CONNECTED : "Отправьте код подключения из CRM.");
   }
   if (text === "/menu" || normalize(text) === normalize("Главное меню")) {
     const responseStartedAt = Date.now();
@@ -2819,6 +3698,7 @@ async function handleMessage(supabase: ReturnType<typeof getSupabaseAdmin>, mess
   if (text === "/find") return handleMenuAction(supabase, chatId, connection, "find", undefined, true);
   if (text === "/addproduct") return handleMenuAction(supabase, chatId, connection, "add", undefined, true);
   const draft = await getActiveDraft(supabase, connection.company_id, chatId);
+  if (voiceMedia) return handleVoiceMessage(supabase, chatId, connection, draft, message);
   if (media) {
     if (!draft) return startAddWizard(supabase, chatId, connection, message, { forceNew: true });
     return handleDraftMedia(supabase, chatId, draft, message);
@@ -2839,7 +3719,7 @@ export async function processTelegramUpdate(update: TelegramUpdate) {
       : update.message?.chat.id
         ? String(update.message.chat.id)
         : undefined;
-    action = update.callback_query?.data ?? update.message?.text ?? (update.message?.photo || update.message?.video ? "media" : "unknown");
+    action = update.callback_query?.data ?? update.message?.text ?? (update.message?.voice || update.message?.audio || update.message?.video_note ? "voice" : update.message?.photo || update.message?.video ? "media" : "unknown");
 
     let callbackAnswered = false;
     if (update.callback_query) {
