@@ -2,8 +2,12 @@
 
 import { DEFAULT_COMPANY_ID } from "@/lib/constants";
 import { logAppError } from "@/lib/errors";
-import { supabaseServer } from "@/lib/supabase/server";
+import { checkRateLimit, getRequestIp, rateLimitHeaders } from "@/lib/rate-limit";
+import { supabasePublic } from "@/lib/supabase/public";
 import type { Category, CustomField, Product, ProductCustomValue, ProductMedia } from "@/types/database";
+
+const PUBLIC_PRODUCTS_RATE_LIMIT = 120;
+const PUBLIC_PRODUCTS_RATE_LIMIT_WINDOW_MS = 60_000;
 
 function getMediaType(media: ProductMedia) {
   return media.media_type;
@@ -26,10 +30,23 @@ function getCustomFieldValue(field: CustomField, value: ProductCustomValue) {
 }
 
 export async function GET(request: Request, context: { params: Promise<{ id: string }> }) {
+  const rateLimit = checkRateLimit({
+    key: `public-product:${getRequestIp(request)}`,
+    limit: PUBLIC_PRODUCTS_RATE_LIMIT,
+    windowMs: PUBLIC_PRODUCTS_RATE_LIMIT_WINDOW_MS,
+  });
+
+  if (!rateLimit.allowed) {
+    return NextResponse.json(
+      { error: "Too many requests" },
+      { status: 429, headers: rateLimitHeaders(rateLimit, PUBLIC_PRODUCTS_RATE_LIMIT) },
+    );
+  }
+
   const { id } = await context.params;
 
   const [productResult, categoriesResult, mediaResult, customFieldsResult, customValuesResult] = await Promise.all([
-    supabaseServer
+    supabasePublic
       .from("products")
       .select("*")
       .eq("company_id", DEFAULT_COMPANY_ID)
@@ -38,15 +55,15 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
       .eq("is_visible_in_api", true)
       .gt("stock", 0)
       .maybeSingle(),
-    supabaseServer.from("categories").select("*").eq("company_id", DEFAULT_COMPANY_ID),
-    supabaseServer
+    supabasePublic.from("categories").select("*").eq("company_id", DEFAULT_COMPANY_ID),
+    supabasePublic
       .from("product_media")
       .select("*")
       .eq("company_id", DEFAULT_COMPANY_ID)
       .eq("product_id", id)
       .order("sort_order", { ascending: true }),
-    supabaseServer.from("custom_fields").select("*").eq("company_id", DEFAULT_COMPANY_ID).eq("is_visible_in_api", true),
-    supabaseServer.from("product_custom_values").select("*").eq("company_id", DEFAULT_COMPANY_ID).eq("product_id", id),
+    supabasePublic.from("custom_fields").select("*").eq("company_id", DEFAULT_COMPANY_ID).eq("is_visible_in_api", true),
+    supabasePublic.from("product_custom_values").select("*").eq("company_id", DEFAULT_COMPANY_ID).eq("product_id", id),
   ]);
 
   const error =

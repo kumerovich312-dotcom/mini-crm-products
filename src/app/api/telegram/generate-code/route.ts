@@ -4,6 +4,10 @@ import { createClient } from "@supabase/supabase-js";
 import { NextResponse } from "next/server";
 
 import { getErrorMessage } from "@/lib/errors";
+import { checkRateLimit, getRequestIp, rateLimitHeaders } from "@/lib/rate-limit";
+
+const GENERATE_CODE_RATE_LIMIT = 5;
+const GENERATE_CODE_RATE_LIMIT_WINDOW_MS = 10 * 60_000;
 
 function getSupabaseAdmin() {
   const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -36,6 +40,19 @@ function generateCode() {
 
 export async function POST(request: Request) {
   try {
+    const rateLimit = checkRateLimit({
+      key: `telegram-generate-code:${getRequestIp(request)}`,
+      limit: GENERATE_CODE_RATE_LIMIT,
+      windowMs: GENERATE_CODE_RATE_LIMIT_WINDOW_MS,
+    });
+
+    if (!rateLimit.allowed) {
+      return NextResponse.json(
+        { error: "Too many requests" },
+        { status: 429, headers: rateLimitHeaders(rateLimit, GENERATE_CODE_RATE_LIMIT) },
+      );
+    }
+
     const token = getBearerToken(request);
 
     if (!token) {

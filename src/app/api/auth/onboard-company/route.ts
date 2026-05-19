@@ -3,7 +3,11 @@ import { NextResponse } from "next/server";
 
 import { createId } from "@/lib/create-id";
 import { logAppError } from "@/lib/errors";
+import { checkRateLimit, getRequestIp, rateLimitHeaders } from "@/lib/rate-limit";
 import type { Company, Profile } from "@/types/database";
+
+const ONBOARD_RATE_LIMIT = 20;
+const ONBOARD_RATE_LIMIT_WINDOW_MS = 10 * 60_000;
 
 type OnboardCompanyPayload = {
   full_name?: unknown;
@@ -64,6 +68,19 @@ function getBearerToken(request: Request) {
 
 export async function POST(request: Request) {
   try {
+    const rateLimit = checkRateLimit({
+      key: `onboard-company:${getRequestIp(request)}`,
+      limit: ONBOARD_RATE_LIMIT,
+      windowMs: ONBOARD_RATE_LIMIT_WINDOW_MS,
+    });
+
+    if (!rateLimit.allowed) {
+      return NextResponse.json(
+        { error: "Too many requests" },
+        { status: 429, headers: rateLimitHeaders(rateLimit, ONBOARD_RATE_LIMIT) },
+      );
+    }
+
     const token = getBearerToken(request);
 
     if (!token) {

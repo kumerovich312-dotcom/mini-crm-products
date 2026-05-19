@@ -2,6 +2,7 @@ import dns from "node:dns";
 import { Agent, setGlobalDispatcher } from "undici";
 import "dotenv/config";
 import Fastify from "fastify";
+import { checkRateLimit } from "./rateLimit.js";
 import type { TelegramUpdate } from "./telegram/types.js";
 
 dns.setDefaultResultOrder("ipv4first");
@@ -13,14 +14,44 @@ setGlobalDispatcher(new Agent({
   keepAliveMaxTimeout: 120000,
 }));
 
-const app = Fastify({ logger: false });
+const TELEGRAM_WEBHOOK_RATE_LIMIT = 600;
+const TELEGRAM_WEBHOOK_RATE_LIMIT_WINDOW_MS = 60_000;
+const TELEGRAM_WEBHOOK_AUTH_FAIL_RATE_LIMIT = 30;
+const TELEGRAM_WEBHOOK_AUTH_FAIL_RATE_LIMIT_WINDOW_MS = 60_000;
+
+const app = Fastify({ logger: false, trustProxy: true });
 
 app.post<{ Body: TelegramUpdate }>("/telegram/webhook", async (request, reply) => {
   const startedAt = Date.now();
+  const clientIp = request.ip || "unknown";
+  const webhookRateLimit = checkRateLimit(
+    `telegram-webhook:${clientIp}`,
+    TELEGRAM_WEBHOOK_RATE_LIMIT,
+    TELEGRAM_WEBHOOK_RATE_LIMIT_WINDOW_MS,
+  );
+
+  if (!webhookRateLimit.allowed) {
+    return reply
+      .code(429)
+      .header("Retry-After", String(webhookRateLimit.retryAfterSec))
+      .send({ error: "Too many requests" });
+  }
+
   const expectedSecret = process.env.TELEGRAM_WEBHOOK_SECRET;
   const actualSecret = request.headers["x-telegram-bot-api-secret-token"];
 
   if (!expectedSecret || actualSecret !== expectedSecret) {
+    const authFailRateLimit = checkRateLimit(
+      `telegram-webhook-auth-fail:${clientIp}`,
+      TELEGRAM_WEBHOOK_AUTH_FAIL_RATE_LIMIT,
+      TELEGRAM_WEBHOOK_AUTH_FAIL_RATE_LIMIT_WINDOW_MS,
+    );
+    if (!authFailRateLimit.allowed) {
+      return reply
+        .code(429)
+        .header("Retry-After", String(authFailRateLimit.retryAfterSec))
+        .send({ error: "Too many requests" });
+    }
     return reply.code(401).send({ error: "Unauthorized" });
   }
 
