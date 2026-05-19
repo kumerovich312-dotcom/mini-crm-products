@@ -3,7 +3,8 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import * as XLSX from "xlsx";
+import ExcelJS from "exceljs";
+import { unparse } from "papaparse";
 import {
   Bot,
   Download,
@@ -444,7 +445,7 @@ export default function ProductsPage() {
     });
   }
 
-  function exportProducts(format: ExportFormat) {
+  async function exportProducts(format: ExportFormat) {
     setPageError(null);
 
     if (filteredProducts.length === 0) {
@@ -456,17 +457,22 @@ export default function ProductsPage() {
     const fileDate = getExportDate();
 
     if (format === "csv") {
-      const worksheet = XLSX.utils.json_to_sheet(rows);
-      const csv = XLSX.utils.sheet_to_csv(worksheet);
+      const csv = unparse(rows);
       const blob = new Blob([`\uFEFF${csv}`], { type: "text/csv;charset=utf-8" });
       downloadBlob(blob, `products-export-${fileDate}.csv`);
       return;
     }
 
-    const worksheet = XLSX.utils.json_to_sheet(rows);
-    const workbook = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(workbook, worksheet, "Products");
-    XLSX.writeFile(workbook, `products-export-${fileDate}.xlsx`);
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet("Products");
+    const headers = Object.keys(rows[0] ?? {});
+    worksheet.addRow(headers);
+    rows.forEach((row) => {
+      worksheet.addRow(headers.map((header) => row[header] ?? ""));
+    });
+    const buffer = await workbook.xlsx.writeBuffer();
+    const blob = new Blob([buffer], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+    downloadBlob(blob, `products-export-${fileDate}.xlsx`);
   }
 
   return (
@@ -489,11 +495,11 @@ export default function ProductsPage() {
                 Импорт
               </Link>
             </Button>
-            <Button variant="outline" onClick={() => exportProducts("csv")}>
+            <Button variant="outline" onClick={() => void exportProducts("csv")}>
               <Download />
               Экспорт CSV
             </Button>
-            <Button variant="outline" onClick={() => exportProducts("xlsx")}>
+            <Button variant="outline" onClick={() => void exportProducts("xlsx")}>
               <Download />
               Экспорт Excel
             </Button>

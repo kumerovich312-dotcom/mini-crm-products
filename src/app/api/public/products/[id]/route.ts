@@ -58,7 +58,7 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
 
   if (error) {
     logAppError("Public product API error", error);
-    return NextResponse.json({ error: error.message }, { status: 500 });
+    return NextResponse.json({ error: "Internal server error" }, { status: 500 });
   }
 
   if (!productResult.data) {

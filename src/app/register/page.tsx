@@ -61,9 +61,15 @@ export default function RegisterPage() {
       }
 
       const user = authData.user;
+      const token = authData.session?.access_token ?? (await supabase.auth.getSession()).data.session?.access_token;
 
       if (!user) {
         setError("Пользователь создан, но Supabase не вернул user.id. Проверьте email и войдите.");
+        return;
+      }
+
+      if (!token) {
+        setError("Аккаунт создан. Подтвердите email, войдите и завершите регистрацию компании.");
         return;
       }
 
@@ -71,10 +77,9 @@ export default function RegisterPage() {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
+          authorization: `Bearer ${token}`,
         },
         body: JSON.stringify({
-          user_id: user.id,
-          email: trimmedEmail,
           full_name: fullName.trim(),
           company_name: companyName.trim(),
           sku_prefix: skuPrefix.trim(),

@@ -394,26 +394,66 @@ create policy "authenticated users can read product media files"
 on storage.objects
 for select
 to authenticated
-using (bucket_id = 'product-media');
+using (
+  bucket_id = 'product-media'
+  and exists (
+    select 1
+    from public.profiles
+    where (profiles.id = auth.uid() or profiles.user_id = auth.uid())
+      and profiles.company_id::text = (storage.foldername(name))[1]
+  )
+);
 
 create policy "authenticated users can upload product media files"
 on storage.objects
 for insert
 to authenticated
-with check (bucket_id = 'product-media');
+with check (
+  bucket_id = 'product-media'
+  and exists (
+    select 1
+    from public.profiles
+    where (profiles.id = auth.uid() or profiles.user_id = auth.uid())
+      and profiles.company_id::text = (storage.foldername(name))[1]
+  )
+);
 
 create policy "authenticated users can update product media files"
 on storage.objects
 for update
 to authenticated
-using (bucket_id = 'product-media')
-with check (bucket_id = 'product-media');
+using (
+  bucket_id = 'product-media'
+  and exists (
+    select 1
+    from public.profiles
+    where (profiles.id = auth.uid() or profiles.user_id = auth.uid())
+      and profiles.company_id::text = (storage.foldername(name))[1]
+  )
+)
+with check (
+  bucket_id = 'product-media'
+  and exists (
+    select 1
+    from public.profiles
+    where (profiles.id = auth.uid() or profiles.user_id = auth.uid())
+      and profiles.company_id::text = (storage.foldername(name))[1]
+  )
+);
 
 create policy "authenticated users can delete product media files"
 on storage.objects
 for delete
 to authenticated
-using (bucket_id = 'product-media');
+using (
+  bucket_id = 'product-media'
+  and exists (
+    select 1
+    from public.profiles
+    where (profiles.id = auth.uid() or profiles.user_id = auth.uid())
+      and profiles.company_id::text = (storage.foldername(name))[1]
+  )
+);
 
 create policy "company access custom_fields"
 on public.custom_fields

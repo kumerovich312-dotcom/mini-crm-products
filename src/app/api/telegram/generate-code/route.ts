@@ -1,3 +1,5 @@
+import { randomInt } from "node:crypto";
+
 import { createClient } from "@supabase/supabase-js";
 import { NextResponse } from "next/server";
 
@@ -27,7 +29,7 @@ function getBearerToken(request: Request) {
 }
 
 function generateCode() {
-  return Math.floor(Math.random() * 1000000)
+  return randomInt(0, 1000000)
     .toString()
     .padStart(6, "0");
 }
@@ -91,6 +93,6 @@ export async function POST(request: Request) {
       details: error,
     });
 
-    return NextResponse.json({ error: getErrorMessage(error) }, { status: 500 });
+    return NextResponse.json({ error: "Internal server error" }, { status: 500 });
   }
 }

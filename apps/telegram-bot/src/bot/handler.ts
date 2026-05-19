@@ -90,6 +90,9 @@ const CUSTOM_FIELD_CACHE_TTL_MS = 300_000;
 const RECENT_UPDATE_TTL_MS = 120_000;
 const CLEANUP_QUEUE_LIMIT = 10;
 const CALLBACK_COLD_AFTER_MS = 60_000;
+const TELEGRAM_CODE_WINDOW_MS = 10 * 60_000;
+const TELEGRAM_CODE_BLOCK_MS = 15 * 60_000;
+const TELEGRAM_CODE_MAX_ATTEMPTS = 5;
 const connectionCache = new Map<string, { value: CachedConnection | null; expiresAt: number }>();
 const categoryCache = new Map<string, { value: Category[]; expiresAt: number }>();
 const customFieldCache = new Map<string, { value: CustomField[]; expiresAt: number }>();
@@ -98,6 +101,7 @@ const screenCleanupQueue = new Map<string, number[]>();
 const chatQueues = new Map<string, Promise<void>>();
 const searchResultsCache = new Map<string, { products: Product[]; companyId: string; expiresAt: number }>();
 const productAiCache = new Map<string, ProductAiCacheItem>();
+const telegramCodeAttempts = new Map<string, { count: number; firstAttemptAt: number; blockedUntil?: number }>();
 let lastCallbackAt = 0;
 
 function logTiming(action: string, startedAt: number, chatId?: string) {
@@ -124,6 +128,37 @@ function cachedConnectionToConnection(chatId: string, cached: CachedConnection):
 
 function clearConnectionCache(chatId: string) {
   connectionCache.delete(chatId);
+}
+
+function isTelegramCodeRateLimited(chatId: string) {
+  const now = Date.now();
+  const attempts = telegramCodeAttempts.get(chatId);
+  if (!attempts) return false;
+  if (attempts.blockedUntil && attempts.blockedUntil > now) return true;
+  if (now - attempts.firstAttemptAt > TELEGRAM_CODE_WINDOW_MS) {
+    telegramCodeAttempts.delete(chatId);
+    return false;
+  }
+  return false;
+}
+
+function recordTelegramCodeFailure(chatId: string) {
+  const now = Date.now();
+  const attempts = telegramCodeAttempts.get(chatId);
+  const next = !attempts || now - attempts.firstAttemptAt > TELEGRAM_CODE_WINDOW_MS
+    ? { count: 1, firstAttemptAt: now }
+    : { ...attempts, count: attempts.count + 1 };
+  if (next.count >= TELEGRAM_CODE_MAX_ATTEMPTS) next.blockedUntil = now + TELEGRAM_CODE_BLOCK_MS;
+  telegramCodeAttempts.set(chatId, next);
+  console.warn("telegram connect code failed", {
+    chatId,
+    count: next.count,
+    blocked: Boolean(next.blockedUntil && next.blockedUntil > now),
+  });
+}
+
+function clearTelegramCodeFailures(chatId: string) {
+  telegramCodeAttempts.delete(chatId);
 }
 
 function enqueueChatWork(chatId: string | undefined, work: () => Promise<void>) {
@@ -3671,12 +3706,17 @@ async function handleMessage(supabase: ReturnType<typeof getSupabaseAdmin>, mess
   logTiming("get connection", getConnectionStartedAt, chatId);
   if (!connection) {
     if (/^[0-9]{6}$/.test(text)) {
+      if (isTelegramCodeRateLimited(chatId)) {
+        return sendMessage(chatId, "Слишком много попыток подключения. Попробуйте снова через 15 минут.");
+      }
       const connected = await connectByCode(supabase, chatId, message.from, text);
       if (connected) {
+        clearTelegramCodeFailures(chatId);
         const nextConnection = await getConnection(supabase, chatId);
         if (nextConnection) return showMainMenu(supabase, chatId, nextConnection, { forceNew: true });
         return sendMessage(chatId, "Бот успешно подключён к компании.");
       }
+      recordTelegramCodeFailure(chatId);
       return sendMessage(chatId, "Код неверный или истёк. Сгенерируйте новый код в CRM.");
     }
     return sendMessage(chatId, media || voiceMedia || text === "/addproduct" ? NOT_CONNECTED : "Отправьте код подключения из CRM.");

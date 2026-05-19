@@ -2,12 +2,10 @@ import { createClient } from "@supabase/supabase-js";
 import { NextResponse } from "next/server";
 
 import { createId } from "@/lib/create-id";
-import { getErrorMessage, logAppError } from "@/lib/errors";
+import { logAppError } from "@/lib/errors";
 import type { Company, Profile } from "@/types/database";
 
 type OnboardCompanyPayload = {
-  user_id?: unknown;
-  email?: unknown;
   full_name?: unknown;
   company_name?: unknown;
   sku_prefix?: unknown;
@@ -57,22 +55,25 @@ function validationError(message: string) {
   return NextResponse.json({ error: message }, { status: 400 });
 }
 
+function getBearerToken(request: Request) {
+  const authorization = request.headers.get("authorization") ?? "";
+  const [type, token] = authorization.split(" ");
+
+  return type?.toLowerCase() === "bearer" && token ? token : null;
+}
+
 export async function POST(request: Request) {
   try {
+    const token = getBearerToken(request);
+
+    if (!token) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
     const payload = (await request.json()) as OnboardCompanyPayload;
-    const userId = getRequiredString(payload, "user_id");
-    const email = getRequiredString(payload, "email");
     const companyName = getRequiredString(payload, "company_name");
     const skuPrefix = getRequiredString(payload, "sku_prefix");
     const fullName = typeof payload.full_name === "string" && payload.full_name.trim() ? payload.full_name.trim() : null;
-
-    if (!userId) {
-      return validationError("user_id is required.");
-    }
-
-    if (!email) {
-      return validationError("email is required.");
-    }
 
     if (!companyName) {
       return validationError("company_name is required.");
@@ -83,6 +84,19 @@ export async function POST(request: Request) {
     }
 
     const supabase = getSupabaseAdmin();
+    const { data: userData, error: userError } = await supabase.auth.getUser(token);
+
+    if (userError || !userData.user) {
+      return NextResponse.json({ error: userError?.message ?? "Unauthorized" }, { status: 401 });
+    }
+
+    const userId = userData.user.id;
+    const email = userData.user.email;
+
+    if (!email) {
+      return validationError("User email is required.");
+    }
+
     const existingProfileResult = await supabase.from("profiles").select("*").eq("user_id", userId).maybeSingle();
 
     if (existingProfileResult.error) {
@@ -147,6 +161,6 @@ export async function POST(request: Request) {
   } catch (error) {
     logAppError("Onboard company API error", error);
 
-    return NextResponse.json({ error: getErrorMessage(error) }, { status: 500 });
+    return NextResponse.json({ error: "Internal server error" }, { status: 500 });
   }
 }

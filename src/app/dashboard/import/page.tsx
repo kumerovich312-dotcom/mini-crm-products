@@ -1,6 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import ExcelJS from "exceljs";
+import { parse as parseCsv } from "papaparse";
 import {
   AlertTriangle,
   ArrowLeft,
@@ -12,7 +14,6 @@ import {
   Play,
   UploadCloud,
 } from "lucide-react";
-import * as XLSX from "xlsx";
 
 import { PageHeader } from "@/components/page-header";
 import { Badge } from "@/components/ui/badge";
@@ -60,6 +61,8 @@ const standardFields = [
 ];
 
 const selectClass = selectClassName;
+const MAX_IMPORT_FILE_SIZE_BYTES = 10 * 1024 * 1024;
+const MAX_IMPORT_ROWS = 5000;
 
 function formatFileSize(size: number) {
   if (size < 1024 * 1024) {
@@ -90,6 +93,39 @@ function generateSkuDigits(length: number) {
   return Math.floor(Math.random() * max)
     .toString()
     .padStart(length, "0");
+}
+
+function cellToString(value: unknown) {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "object") {
+    if ("text" in value && typeof value.text === "string") return value.text;
+    if ("result" in value) return cellToString(value.result);
+    if ("richText" in value && Array.isArray(value.richText)) {
+      return value.richText.map((item) => typeof item?.text === "string" ? item.text : "").join("");
+    }
+  }
+  return String(value).trim();
+}
+
+async function parseImportFile(file: File) {
+  if (/\.csv$/i.test(file.name)) {
+    const csv = await file.text();
+    const result = parseCsv<string[]>(csv, { skipEmptyLines: true });
+    if (result.errors.length > 0) throw new Error(result.errors[0]?.message ?? "CSV parse error.");
+    return result.data.map((row) => row.map(cellToString));
+  }
+
+  const data = await file.arrayBuffer();
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(data);
+  const sheet = workbook.worksheets[0];
+  if (!sheet) return [];
+  const rows: string[][] = [];
+  sheet.eachRow({ includeEmpty: true }, (row) => {
+    const values = Array.isArray(row.values) ? row.values.slice(1) : [];
+    rows.push(values.map(cellToString));
+  });
+  return rows;
 }
 
 function guessMapping(columns: string[], customFields: CustomField[]) {
@@ -247,18 +283,20 @@ export default function ImportPage() {
     setValidationErrors([]);
     setResult(null);
 
-    if (!/\.(xlsx|xls|csv)$/i.test(file.name)) {
-      setPageError("Поддерживаются только .xlsx, .xls и .csv файлы.");
+    if (!/\.(xlsx|csv)$/i.test(file.name)) {
+      setPageError("Поддерживаются только .xlsx и .csv файлы.");
+      return;
+    }
+
+    if (file.size > MAX_IMPORT_FILE_SIZE_BYTES) {
+      setPageError("Файл слишком большой. Максимальный размер импорта: 10 MB.");
       return;
     }
 
     setIsBusy(true);
 
     try {
-      const data = await file.arrayBuffer();
-      const workbook = XLSX.read(data, { type: "array" });
-      const sheet = workbook.Sheets[workbook.SheetNames[0]];
-      const rawRows = XLSX.utils.sheet_to_json<string[]>(sheet, { header: 1, defval: "" });
+      const rawRows = await parseImportFile(file);
       const header = (rawRows[0] ?? []).map((value) => String(value).trim()).filter(Boolean);
       const parsedRows = rawRows
         .slice(1)
@@ -269,6 +307,11 @@ export default function ImportPage() {
           }, {}),
         )
         .filter((row) => Object.values(row).some((value) => value.trim()));
+
+      if (parsedRows.length > MAX_IMPORT_ROWS) {
+        setPageError(`Слишком много строк. Максимум для одного импорта: ${MAX_IMPORT_ROWS}.`);
+        return;
+      }
 
       if (header.length === 0 || parsedRows.length === 0) {
         setPageError("Файл пустой или не содержит строк для импорта.");
@@ -650,7 +693,7 @@ export default function ImportPage() {
             <Info className="size-5" />
           </div>
           <p className="text-sm text-muted-foreground">
-            Импорт принимает .xlsx, .xls и .csv. Фото и видео в этом этапе не импортируются.
+            Импорт принимает .xlsx и .csv. Фото и видео в этом этапе не импортируются.
           </p>
         </CardContent>
       </Card>
@@ -701,7 +744,7 @@ export default function ImportPage() {
               ref={inputRef}
               className="hidden"
               type="file"
-              accept=".xlsx,.xls,.csv"
+              accept=".xlsx,.csv"
               onChange={(event) => void chooseFile(event.target.files?.[0])}
             />
             <div
@@ -716,7 +759,7 @@ export default function ImportPage() {
                 <UploadCloud className="size-6" />
               </div>
               <h3 className="mt-4 text-sm font-semibold">Перетащите Excel/CSV файл сюда</h3>
-              <p className="mt-1 text-sm text-muted-foreground">Поддерживаются .xlsx, .xls и .csv</p>
+              <p className="mt-1 text-sm text-muted-foreground">Поддерживаются .xlsx и .csv</p>
               <Button className="mt-4" type="button" onClick={() => inputRef.current?.click()} disabled={isBusy}>
                 {isBusy ? <Loader2 className="animate-spin" /> : <FileSpreadsheet />}
                 Выбрать файл
